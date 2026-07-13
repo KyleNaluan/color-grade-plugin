@@ -101,9 +101,10 @@ The ExtendScript layer is not automated; verify by hand:
       `grade_<layerId>.json` (theme, knobs, measured stats). Confirm the Apply
       Color LUT effect's Choose LUT field actually resolved to the written
       `.cube` (scriptable file property, verify by hand each release).
-- [ ] The graded clip's stats are measured **after** its Correct stack: flag
-      the clip V-Log first, then Grade - the analyzed stats and resulting look
-      reflect the decoded (Rec.709) footage, not the raw log signal.
+- [ ] The graded clip's stats are measured **after** its Correct stack: choose
+      **V-Log** in the Footage dropdown and **Apply correction** first, then
+      Grade - the analyzed stats and resulting look reflect the decoded
+      (Rec.709) footage, not the raw log signal.
 - [ ] Re-applying a grade (same or different Theme) reuses the one Grade [cg]
       adjustment layer and repoints its Apply Color LUT, rather than stacking a
       second adjustment layer.
