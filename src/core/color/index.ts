@@ -3,6 +3,7 @@ export * from './matrices.js';
 export * from './lab.js';
 export * from './vlog.js';
 export * from './rec709.js';
+export * from './decode.js';
 
 import type { LogProfile } from './types.js';
 import { VLOG } from './vlog.js';

@@ -91,6 +91,25 @@ body {
   gap: 10px;
 }
 
+.correct-profile {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.vlog-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: fit-content;
+  cursor: pointer;
+}
+
+.correct-stack-error {
+  color: #e07a7a;
+  margin: 0;
+}
+
 .profile-select {
   display: flex;
   flex-direction: column;

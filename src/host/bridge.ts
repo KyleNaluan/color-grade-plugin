@@ -13,8 +13,21 @@ export interface SelectionSnapshot {
   compName: string | null;
   /** Name of the selected layer, or null when zero layers are selected. */
   layerName: string | null;
+  /**
+   * Stable AE layer id of the selected layer, or null when zero layers are
+   * selected. Unlike the name it survives renames and disambiguates
+   * same-named layers, so it is the target identity threaded through
+   * setCorrectProfile to guard against a mid-flight selection change.
+   */
+  layerId: number | null;
   /** How many layers are selected in the active comp (0 when no comp). */
   selectedCount: number;
+}
+
+/** Result of applying a Correct-stack profile change to the selected layer. */
+export interface CorrectStackResult {
+  /** Path the Decode LUT .cube was written to, or null when standard (no decode). */
+  decodeLutPath: string | null;
 }
 
 export interface Bridge {
@@ -35,6 +48,25 @@ export interface Bridge {
    * AE DOM / render-queue op only - no color math crosses this boundary.
    */
   renderFrame(time: number): Promise<RenderedFrameRef>;
+
+  /**
+   * Apply the Correct stack's V-Log/standard flag to the selected layer.
+   * `isLog: true` writes `decodeLutCube` (a baked .cube's text, produced by
+   * the panel via core's bakeDecodeLut) into the Project-state folder and
+   * ensures Apply Color LUT then Lumetri, both `[cg]`-tagged, in that order.
+   * `isLog: false` removes/disables the Decode LUT effect, leaving Lumetri.
+   * AE DOM op only - the LUT bytes are computed entirely on the panel side.
+   *
+   * `targetLayerId` is the stable id of the layer the panel intended to mutate,
+   * captured when the toggle fired. The ExtendScript side re-resolves the layer
+   * by this id and refuses if the selection changed out from under the call, so
+   * a slow bake/round-trip can never land the stack on a different clip.
+   */
+  setCorrectProfile(
+    isLog: boolean,
+    decodeLutCube: string | null,
+    targetLayerId: number,
+  ): Promise<CorrectStackResult>;
 }
 
 /** Raised when the ExtendScript side returns an error or garbage. */

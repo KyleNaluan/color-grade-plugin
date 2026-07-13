@@ -10,16 +10,18 @@ export type SelectionState =
   | { kind: 'loading' }
   | { kind: 'no-comp' }
   | { kind: 'no-selection'; compName: string }
-  | { kind: 'layer'; compName: string; layerName: string; selectedCount: number }
+  | { kind: 'layer'; compName: string; layerName: string; layerId: number; selectedCount: number }
   | { kind: 'error'; message: string };
 
 export function toSelectionState(snapshot: SelectionSnapshot): SelectionState {
   if (snapshot.compName === null) return { kind: 'no-comp' };
-  if (snapshot.layerName === null) return { kind: 'no-selection', compName: snapshot.compName };
+  if (snapshot.layerName === null || snapshot.layerId === null)
+    return { kind: 'no-selection', compName: snapshot.compName };
   return {
     kind: 'layer',
     compName: snapshot.compName,
     layerName: snapshot.layerName,
+    layerId: snapshot.layerId,
     selectedCount: snapshot.selectedCount,
   };
 }

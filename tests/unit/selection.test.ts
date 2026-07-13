@@ -24,9 +24,15 @@ function fakeBridge(script: Array<SelectionSnapshot | Error>): SelectionBridge {
   };
 }
 
-const layer = (compName: string, layerName: string | null, selectedCount = layerName ? 1 : 0): SelectionSnapshot => ({
+const layer = (
+  compName: string,
+  layerName: string | null,
+  selectedCount = layerName ? 1 : 0,
+  layerId: number | null = layerName ? 1 : null,
+): SelectionSnapshot => ({
   compName,
   layerName,
+  layerId,
   selectedCount,
 });
 
@@ -49,6 +55,7 @@ describe('createSelectionWatcher', () => {
       kind: 'layer',
       compName: 'Main Comp',
       layerName: 'Interview A',
+      layerId: 1,
       selectedCount: 1,
     });
   });
@@ -74,7 +81,7 @@ describe('createSelectionWatcher', () => {
   it('reports no-comp and no-selection states', async () => {
     const { states } = collect(
       fakeBridge([
-        { compName: null, layerName: null, selectedCount: 0 },
+        { compName: null, layerName: null, layerId: null, selectedCount: 0 },
         layer('Main Comp', null),
       ]),
     );
@@ -142,7 +149,7 @@ describe('createSelectionWatcher', () => {
 
 describe('toSelectionState', () => {
   it('maps a comp with no selection', () => {
-    expect(toSelectionState({ compName: 'C', layerName: null, selectedCount: 0 })).toEqual({
+    expect(toSelectionState({ compName: 'C', layerName: null, layerId: null, selectedCount: 0 })).toEqual({
       kind: 'no-selection',
       compName: 'C',
     });
@@ -152,13 +159,13 @@ describe('toSelectionState', () => {
 describe('describeTarget', () => {
   it('shows the target clip name', () => {
     expect(
-      describeTarget({ kind: 'layer', compName: 'C', layerName: 'Clip 7', selectedCount: 1 }),
+      describeTarget({ kind: 'layer', compName: 'C', layerName: 'Clip 7', layerId: 7, selectedCount: 1 }),
     ).toBe('Target: Clip 7');
   });
 
   it('flags multi-selection', () => {
     expect(
-      describeTarget({ kind: 'layer', compName: 'C', layerName: 'Clip 7', selectedCount: 3 }),
+      describeTarget({ kind: 'layer', compName: 'C', layerName: 'Clip 7', layerId: 7, selectedCount: 3 }),
     ).toBe('Target: Clip 7 (+2 more selected)');
   });
 
