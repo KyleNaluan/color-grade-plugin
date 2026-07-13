@@ -11,12 +11,16 @@ const pct = (x: number) => `${(x * 100).toFixed(2)}%`;
 export function StatsView({ result }: { result: AnalyzeResult }) {
   const s = result.stats;
   const p = s.lumaPercentiles;
+  const sampled = result.width !== result.sourceWidth || result.height !== result.sourceHeight;
+  const dims = sampled
+    ? `${result.sourceWidth}×${result.sourceHeight} (sampled ${result.width}×${result.height})`
+    : `${result.sourceWidth}×${result.sourceHeight}`;
   return (
     <div class="stats" data-testid="footage-stats">
       <header class="stats-head">
         <strong>Footage stats</strong>
         <span class="stats-meta">
-          {result.width}×{result.height} · {result.bitDepthOfSource}-bit · {result.profileName} · t={f3(result.time)}s
+          {dims} · {result.bitDepthOfSource}-bit · {result.profileName} · t={f3(result.time)}s
         </span>
       </header>
       <dl class="stats-grid">

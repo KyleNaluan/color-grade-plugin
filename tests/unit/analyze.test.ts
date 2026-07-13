@@ -33,6 +33,9 @@ describe('analyzeCurrentFrame', () => {
     expect(result.time).toBe(1.5);
     expect(result.width).toBe(64);
     expect(result.height).toBe(48);
+    // Fixture is within the downsample budget, so source dims match sampled dims.
+    expect(result.sourceWidth).toBe(64);
+    expect(result.sourceHeight).toBe(48);
     expect(result.bitDepthOfSource).toBe(16);
     expect(result.profileName).toBe(PROFILES['rec709']!.name);
 

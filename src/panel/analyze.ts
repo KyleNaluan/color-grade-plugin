@@ -17,6 +17,9 @@ export interface AnalyzeResult {
   /** Dimensions actually measured (after any downsample for speed). */
   width: number;
   height: number;
+  /** Full source-frame dimensions before any downsample for speed. */
+  sourceWidth: number;
+  sourceHeight: number;
   /** Bit depth of the render the frame came from (16 TIFF / 8 PNG). */
   bitDepthOfSource: number;
   /** Comp time (seconds) that was analyzed. */
@@ -36,12 +39,15 @@ export async function analyzeCurrentFrame(
 ): Promise<AnalyzeResult> {
   const time = await bridge.getCurrentTime();
   if (time === null) throw new Error('No active comp to analyze');
-  const frame = downsampleFrame(await frameSource.getFrame(time));
+  const source = await frameSource.getFrame(time);
+  const frame = downsampleFrame(source);
   const decoded = decodeToRec709(frame.data, profile);
   return {
     stats: computeStats(decoded),
     width: frame.width,
     height: frame.height,
+    sourceWidth: source.width,
+    sourceHeight: source.height,
     bitDepthOfSource: frame.bitDepthOfSource,
     time,
     profileName: profile.name,

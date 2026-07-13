@@ -17,9 +17,14 @@ function decodeTiffFrame(bytes: Uint8Array): Frame {
   const ifds = decodeTiff(bytes);
   const img = ifds[0];
   if (!img) throw new Error('TIFF frame contained no image');
-  const { width, height, components, bitsPerSample } = img;
+  const { width, height, components, bitsPerSample, sampleFormat } = img;
   if (components < 3) {
     throw new Error(`expected RGB(A) TIFF, got ${components} component(s)`);
+  }
+  if (sampleFormat !== 1 || (bitsPerSample !== 8 && bitsPerSample !== 16)) {
+    throw new Error(
+      `unsupported TIFF sample format: ${bitsPerSample}-bit sampleFormat ${sampleFormat} (expected 8- or 16-bit unsigned integer)`,
+    );
   }
   const bitDepth = bitsPerSample === 16 ? 16 : 8;
   return {
