@@ -3,7 +3,13 @@
  * `evalScript` and decodes the JSON envelope. This is the only module that
  * touches the CEP runtime; everything above it sees the `Bridge` interface.
  */
-import { type Bridge, BridgeError, type SelectionSnapshot, parseBridgeResult } from './bridge';
+import {
+  type Bridge,
+  BridgeError,
+  type CorrectStackResult,
+  type SelectionSnapshot,
+  parseBridgeResult,
+} from './bridge';
 import type { RenderedFrameRef } from './frameSource';
 
 /** The subset of the injected CEP API the bridge needs. */
@@ -48,6 +54,15 @@ export function createCepBridge(): Bridge {
     },
     async renderFrame(time: number): Promise<RenderedFrameRef> {
       return parseBridgeResult<RenderedFrameRef>(await evalScript(`CG_renderFrame(${time})`));
+    },
+    async setCorrectProfile(
+      isLog: boolean,
+      decodeLutCube: string | null,
+    ): Promise<CorrectStackResult> {
+      const cubeArg = decodeLutCube === null ? 'null' : JSON.stringify(decodeLutCube);
+      return parseBridgeResult<CorrectStackResult>(
+        await evalScript(`CG_setCorrectProfile(${isLog}, ${cubeArg})`),
+      );
     },
   };
 }

@@ -1,7 +1,7 @@
 import type { LogProfile, Vec3 } from '../color/types.js';
-import { mat3MulVec } from '../color/matrices.js';
 import { linearRec709ToLab } from '../color/lab.js';
-import { rec709Encode, rec709Decode } from '../color/rec709.js';
+import { rec709Decode } from '../color/rec709.js';
+import { decodePixelToRec709 } from '../color/decode.js';
 
 /**
  * Footage stats / target stats share this schema so the engine matches stat-to-stat.
@@ -82,30 +82,13 @@ function percentile(sorted: Float32Array, p: number): number {
  */
 export function decodeToRec709(pixels: Float32Array, profile: LogProfile): Float32Array {
   const out = new Float32Array(pixels.length);
-  const m = profile.gamutToRec709;
-  const isIdentity = profile.name === 'Rec.709';
   for (let i = 0; i < pixels.length; i += 3) {
-    if (isIdentity) {
-      out[i] = pixels[i]!;
-      out[i + 1] = pixels[i + 1]!;
-      out[i + 2] = pixels[i + 2]!;
-      continue;
-    }
-    const lin: Vec3 = [
-      profile.decode(pixels[i]!),
-      profile.decode(pixels[i + 1]!),
-      profile.decode(pixels[i + 2]!),
-    ];
-    const [r, g, b] = mat3MulVec(m, lin);
-    out[i] = clamp01(rec709Encode(Math.max(0, r)));
-    out[i + 1] = clamp01(rec709Encode(Math.max(0, g)));
-    out[i + 2] = clamp01(rec709Encode(Math.max(0, b)));
+    const rgb = decodePixelToRec709([pixels[i]!, pixels[i + 1]!, pixels[i + 2]!], profile);
+    out[i] = rgb[0];
+    out[i + 1] = rgb[1];
+    out[i + 2] = rgb[2];
   }
   return out;
-}
-
-function clamp01(x: number): number {
-  return x < 0 ? 0 : x > 1 ? 1 : x;
 }
 
 /** Encoded Rec.709 RGB pixel -> LAB. */

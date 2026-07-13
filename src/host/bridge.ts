@@ -17,6 +17,12 @@ export interface SelectionSnapshot {
   selectedCount: number;
 }
 
+/** Result of applying a Correct-stack profile change to the selected layer. */
+export interface CorrectStackResult {
+  /** Path the Decode LUT .cube was written to, or null when standard (no decode). */
+  decodeLutPath: string | null;
+}
+
 export interface Bridge {
   /** Query the active comp and its selected layer. AE DOM read only. */
   getSelection(): Promise<SelectionSnapshot>;
@@ -35,6 +41,16 @@ export interface Bridge {
    * AE DOM / render-queue op only - no color math crosses this boundary.
    */
   renderFrame(time: number): Promise<RenderedFrameRef>;
+
+  /**
+   * Apply the Correct stack's V-Log/standard flag to the selected layer.
+   * `isLog: true` writes `decodeLutCube` (a baked .cube's text, produced by
+   * the panel via core's bakeDecodeLut) into the Project-state folder and
+   * ensures Apply Color LUT then Lumetri, both `[cg]`-tagged, in that order.
+   * `isLog: false` removes/disables the Decode LUT effect, leaving Lumetri.
+   * AE DOM op only - the LUT bytes are computed entirely on the panel side.
+   */
+  setCorrectProfile(isLog: boolean, decodeLutCube: string | null): Promise<CorrectStackResult>;
 }
 
 /** Raised when the ExtendScript side returns an error or garbage. */

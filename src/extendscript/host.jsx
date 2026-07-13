@@ -210,3 +210,110 @@ function CG_renderFrame(time) {
     return CG_fail(err && err.message ? err.message : err);
   }
 }
+
+/*
+ * --- Correct stack: V-Log/standard toggle (Managed effects) ---
+ *
+ * Decode LUT via Apply Color LUT (matchName 'ADBE Apply Color LUT2'), then
+ * Lumetri Color (matchName 'ADBE Lumetri'). Both get a ' [cg]' marker
+ * appended to their display name so the panel/user can identify Managed
+ * effects (see CONTEXT.md). All color math (the LUT contents) is computed on
+ * the panel side; this file only wires up AE DOM effect/file operations.
+ */
+
+var CG_MANAGED_MARKER = ' [cg]';
+var CG_DECODE_LUT_MATCH_NAME = 'ADBE Apply Color LUT2';
+var CG_LUMETRI_MATCH_NAME = 'ADBE Lumetri';
+
+/** Find a Managed ([cg]-tagged) effect of the given matchName on a layer, or null. */
+function CG_findManagedEffect(layer, matchName) {
+  var effects = layer.property('ADBE Effect Parade');
+  for (var i = 1; i <= effects.numProperties; i++) {
+    var fx = effects.property(i);
+    if (fx.matchName === matchName && fx.name.indexOf('[cg]') !== -1) return fx;
+  }
+  return null;
+}
+
+/** Ensure a Managed Lumetri Color effect exists on the layer; return it. */
+function CG_ensureLumetri(layer) {
+  var existing = CG_findManagedEffect(layer, CG_LUMETRI_MATCH_NAME);
+  if (existing) return existing;
+  var fx = layer.property('ADBE Effect Parade').addProperty(CG_LUMETRI_MATCH_NAME);
+  fx.name = 'Lumetri Color' + CG_MANAGED_MARKER;
+  return fx;
+}
+
+/**
+ * Ensure a Managed Apply Color LUT effect exists, points at `lutFile`, and
+ * sits directly before Lumetri in the stack (Decode LUT then Lumetri).
+ */
+function CG_ensureDecodeLut(layer, lutFile) {
+  var effects = layer.property('ADBE Effect Parade');
+  var fx = CG_findManagedEffect(layer, CG_DECODE_LUT_MATCH_NAME);
+  if (!fx) {
+    fx = effects.addProperty(CG_DECODE_LUT_MATCH_NAME);
+    fx.name = 'Apply Color LUT' + CG_MANAGED_MARKER;
+    var lumetri = CG_findManagedEffect(layer, CG_LUMETRI_MATCH_NAME);
+    if (lumetri) fx.moveTo(lumetri.propertyIndex);
+  }
+  // Apply Color LUT's sole property is the LUT file picker.
+  fx.property(1).setValue(lutFile);
+  return fx;
+}
+
+/** Remove the Managed Decode LUT effect from the layer, if present. */
+function CG_removeDecodeLut(layer) {
+  var existing = CG_findManagedEffect(layer, CG_DECODE_LUT_MATCH_NAME);
+  if (existing) existing.remove();
+}
+
+/**
+ * The `.colorgrade/` Project-state folder next to the .aep, creating it if
+ * needed. Returns null when the project has never been saved (no .aep path
+ * to sit next to yet).
+ */
+function CG_projectStateFolder() {
+  if (!app.project || !app.project.file) return null;
+  var folder = new Folder(app.project.file.parent.fsName + '/.colorgrade');
+  if (!folder.exists) folder.create();
+  return folder;
+}
+
+/**
+ * Flag the selected layer V-Log or standard, building/updating its Correct
+ * stack. V-Log: writes `decodeLutCube` into the Project-state folder and
+ * ensures Apply Color LUT (pointed at that file) then Lumetri, both `[cg]`-
+ * tagged. Standard: removes the Managed Decode LUT effect, leaving Lumetri.
+ * Returns { decodeLutPath } (null when standard).
+ */
+function CG_setCorrectProfile(isLog, decodeLutCube) {
+  try {
+    var comp = CG_activeComp();
+    if (comp === null) return CG_fail('no active comp');
+    var selected = comp.selectedLayers;
+    if (selected.length === 0) return CG_fail('no layer selected');
+    var layer = selected[0];
+
+    CG_ensureLumetri(layer);
+
+    var lutPath = null;
+    if (isLog) {
+      if (!decodeLutCube) return CG_fail('missing decode LUT contents for V-Log');
+      var folder = CG_projectStateFolder();
+      if (folder === null) return CG_fail('save the project before flagging V-Log clips');
+      var file = new File(folder.fsName + '/decode_' + layer.id + '.cube');
+      if (!file.open('w')) return CG_fail('could not open decode LUT file for writing');
+      file.write(decodeLutCube);
+      file.close();
+      CG_ensureDecodeLut(layer, file);
+      lutPath = file.fsName;
+    } else {
+      CG_removeDecodeLut(layer);
+    }
+
+    return CG_ok({ decodeLutPath: lutPath });
+  } catch (err) {
+    return CG_fail(err && err.message ? err.message : err);
+  }
+}

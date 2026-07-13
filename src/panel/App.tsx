@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'preact/hooks';
-import type { Bridge } from '../host/bridge';
+import type { Bridge, CorrectStackResult } from '../host/bridge';
 import type { FrameSource } from '../host/frameSource';
 import { PROFILES } from '../core/color/index.js';
 import {
@@ -8,6 +8,7 @@ import {
   describeTarget,
 } from './selection';
 import { analyzeCurrentFrame, type AnalyzeResult } from './analyze';
+import { setCorrectProfile } from './correctStack';
 import { StatsView } from './StatsView';
 
 type Tab = 'correct' | 'grade';
@@ -16,6 +17,12 @@ type AnalyzeState =
   | { kind: 'idle' }
   | { kind: 'running' }
   | { kind: 'done'; result: AnalyzeResult }
+  | { kind: 'error'; message: string };
+
+type CorrectStackState =
+  | { kind: 'idle' }
+  | { kind: 'applying' }
+  | { kind: 'done'; result: CorrectStackResult }
   | { kind: 'error'; message: string };
 
 function useSelection(bridge: Bridge): SelectionState {
@@ -37,8 +44,11 @@ export function App({ bridge, frameSource }: { bridge: Bridge; frameSource: Fram
   const selection = useSelection(bridge);
   const [profileKey, setProfileKey] = useState<string>('rec709');
   const [analyze, setAnalyze] = useState<AnalyzeState>({ kind: 'idle' });
+  const [isLog, setIsLog] = useState(false);
+  const [correctStack, setCorrectStack] = useState<CorrectStackState>({ kind: 'idle' });
 
   const canAnalyze = selection.kind === 'layer' && analyze.kind !== 'running';
+  const canToggleLog = selection.kind === 'layer' && correctStack.kind !== 'applying';
 
   const runAnalysis = async () => {
     setAnalyze({ kind: 'running' });
@@ -47,6 +57,18 @@ export function App({ bridge, frameSource }: { bridge: Bridge; frameSource: Fram
       setAnalyze({ kind: 'done', result });
     } catch (err) {
       setAnalyze({ kind: 'error', message: err instanceof Error ? err.message : String(err) });
+    }
+  };
+
+  const toggleLog = async () => {
+    const next = !isLog;
+    setCorrectStack({ kind: 'applying' });
+    try {
+      const result = await setCorrectProfile(bridge, next, PROFILES['vlog']!);
+      setIsLog(next);
+      setCorrectStack({ kind: 'done', result });
+    } catch (err) {
+      setCorrectStack({ kind: 'error', message: err instanceof Error ? err.message : String(err) });
     }
   };
 
@@ -70,6 +92,23 @@ export function App({ bridge, frameSource }: { bridge: Bridge; frameSource: Fram
       <main class="tab-body">
         {tab === 'correct' ? (
           <section class="analyze">
+            <div class="correct-profile">
+              <label class="vlog-toggle">
+                <input
+                  type="checkbox"
+                  checked={isLog}
+                  disabled={!canToggleLog}
+                  data-testid="vlog-toggle"
+                  onChange={toggleLog}
+                />
+                V-Log
+              </label>
+              {correctStack.kind === 'error' && (
+                <p class="correct-stack-error" data-testid="correct-stack-error">
+                  Correct stack failed: {correctStack.message}
+                </p>
+              )}
+            </div>
             <div class="analyze-controls">
               <label class="profile-select">
                 Footage
