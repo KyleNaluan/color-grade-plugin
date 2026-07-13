@@ -268,6 +268,15 @@ function CG_removeDecodeLut(layer) {
   if (existing) existing.remove();
 }
 
+/** Guard-delete the panel's staged scratch .cube, ignoring any delete error. */
+function CG_deleteStagedLut(decodeLutPath) {
+  if (!decodeLutPath) return;
+  try {
+    var temp = new File(decodeLutPath);
+    if (temp.exists) temp.remove();
+  } catch (rmErr) {}
+}
+
 /**
  * The `.colorgrade/` Project-state folder next to the .aep, creating it if
  * needed. Returns null when the project has never been saved (no .aep path
@@ -290,39 +299,42 @@ function CG_projectStateFolder() {
  * when standard).
  *
  * All can-fail validation runs before any layer mutation, so a failure path
- * never leaves an orphan Managed effect behind.
+ * never leaves an orphan Managed effect behind. The panel's staged scratch
+ * .cube is always deleted before returning (success or failure), so a failed
+ * V-Log attempt never leaves a multi-megabyte orphan in userData.
  */
 function CG_setCorrectProfile(isLog, decodeLutPath) {
   try {
-    var comp = CG_activeComp();
-    if (comp === null) return CG_fail('no active comp');
-    var selected = comp.selectedLayers;
-    if (selected.length === 0) return CG_fail('no layer selected');
-    var layer = selected[0];
+    try {
+      var comp = CG_activeComp();
+      if (comp === null) return CG_fail('no active comp');
+      var selected = comp.selectedLayers;
+      if (selected.length === 0) return CG_fail('no layer selected');
+      var layer = selected[0];
 
-    var lutPath = null;
-    if (isLog) {
-      if (!decodeLutPath) return CG_fail('missing decode LUT for V-Log');
-      var folder = CG_projectStateFolder();
-      if (folder === null) return CG_fail('save the project before flagging V-Log clips');
-      var temp = new File(decodeLutPath);
-      if (!temp.exists) return CG_fail('decode LUT temp file not found: ' + decodeLutPath);
-      var dest = new File(folder.fsName + '/decode_' + layer.id + '.cube');
-      if (dest.exists) dest.remove();
-      if (!temp.copy(dest)) return CG_fail('could not copy decode LUT into project-state folder');
-      try {
-        temp.remove();
-      } catch (rmErr) {}
+      var lutPath = null;
+      if (isLog) {
+        if (!decodeLutPath) return CG_fail('missing decode LUT for V-Log');
+        var folder = CG_projectStateFolder();
+        if (folder === null) return CG_fail('save the project before flagging V-Log clips');
+        var temp = new File(decodeLutPath);
+        if (!temp.exists) return CG_fail('decode LUT temp file not found: ' + decodeLutPath);
+        var dest = new File(folder.fsName + '/decode_' + layer.id + '.cube');
+        if (dest.exists) dest.remove();
+        if (!temp.copy(dest)) return CG_fail('could not copy decode LUT into project-state folder');
 
-      CG_ensureLumetri(layer);
-      CG_ensureDecodeLut(layer, dest);
-      lutPath = dest.fsName;
-    } else {
-      CG_ensureLumetri(layer);
-      CG_removeDecodeLut(layer);
+        CG_ensureLumetri(layer);
+        CG_ensureDecodeLut(layer, dest);
+        lutPath = dest.fsName;
+      } else {
+        CG_ensureLumetri(layer);
+        CG_removeDecodeLut(layer);
+      }
+
+      return CG_ok({ decodeLutPath: lutPath });
+    } finally {
+      if (isLog) CG_deleteStagedLut(decodeLutPath);
     }
-
-    return CG_ok({ decodeLutPath: lutPath });
   } catch (err) {
     return CG_fail(err && err.message ? err.message : err);
   }
