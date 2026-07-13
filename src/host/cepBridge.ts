@@ -15,10 +15,20 @@ import type { RenderedFrameRef } from './frameSource';
 /** The subset of the injected CEP API the bridge needs. */
 interface AdobeCep {
   evalScript(script: string, callback: (result: string) => void): void;
+  /** Absolute path of a CEP SystemPath (e.g. 'userData'), used for scratch files. */
+  getSystemPath(type: string): string;
+}
+
+/** Minimal shape of the injected `cep.fs` API used to stage the Decode LUT. */
+interface CepFs {
+  writeFile(path: string, data: string): { err: number };
 }
 
 /** CEP's sentinel result when the ExtendScript call itself failed. */
 const EVAL_SCRIPT_ERROR = 'EvalScript error.';
+
+/** `cep.fs` error code for "no error". */
+const CEP_NO_ERROR = 0;
 
 function getAdobeCep(): AdobeCep {
   const cep = (globalThis as { __adobe_cep__?: AdobeCep }).__adobe_cep__;
@@ -26,6 +36,31 @@ function getAdobeCep(): AdobeCep {
     throw new BridgeError('CEP runtime not available (panel not running inside CEP?)');
   }
   return cep;
+}
+
+function getCepFs(): CepFs {
+  const cep = (globalThis as { cep?: { fs?: CepFs } }).cep;
+  if (!cep || !cep.fs) {
+    throw new BridgeError('CEP fs API not available (panel not running inside CEP?)');
+  }
+  return cep.fs;
+}
+
+/**
+ * Stage the baked .cube text in a temp file and return its path, so only the
+ * path (not the multi-megabyte LUT text) crosses the `evalScript` boundary -
+ * the same out-of-band transport the render path uses. ExtendScript moves the
+ * file into the Project-state folder and deletes this scratch copy.
+ */
+function stageDecodeLutCube(cubeText: string): string {
+  const dir = getAdobeCep().getSystemPath('userData');
+  const stamp = `${Date.now()}_${Math.floor(Math.random() * 1_000_000)}`;
+  const path = `${dir}/cg_decode_${stamp}.cube`;
+  const result = getCepFs().writeFile(path, cubeText);
+  if (result.err !== CEP_NO_ERROR) {
+    throw new BridgeError(`cep.fs.writeFile failed (err ${result.err}) for ${path}`);
+  }
+  return path;
 }
 
 function evalScript(script: string): Promise<string> {
@@ -59,9 +94,9 @@ export function createCepBridge(): Bridge {
       isLog: boolean,
       decodeLutCube: string | null,
     ): Promise<CorrectStackResult> {
-      const cubeArg = decodeLutCube === null ? 'null' : JSON.stringify(decodeLutCube);
+      const pathArg = decodeLutCube === null ? 'null' : JSON.stringify(stageDecodeLutCube(decodeLutCube));
       return parseBridgeResult<CorrectStackResult>(
-        await evalScript(`CG_setCorrectProfile(${isLog}, ${cubeArg})`),
+        await evalScript(`CG_setCorrectProfile(${isLog}, ${pathArg})`),
       );
     },
   };

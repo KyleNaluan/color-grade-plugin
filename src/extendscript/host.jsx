@@ -282,12 +282,17 @@ function CG_projectStateFolder() {
 
 /**
  * Flag the selected layer V-Log or standard, building/updating its Correct
- * stack. V-Log: writes `decodeLutCube` into the Project-state folder and
- * ensures Apply Color LUT (pointed at that file) then Lumetri, both `[cg]`-
- * tagged. Standard: removes the Managed Decode LUT effect, leaving Lumetri.
- * Returns { decodeLutPath } (null when standard).
+ * stack. V-Log: moves the LUT text the panel already wrote to `decodeLutPath`
+ * (a temp file - the .cube is transferred out-of-band, not inlined into this
+ * script) into the Project-state folder and ensures Apply Color LUT (pointed
+ * at that file) then Lumetri, both `[cg]`-tagged. Standard: removes the
+ * Managed Decode LUT effect, leaving Lumetri. Returns { decodeLutPath } (null
+ * when standard).
+ *
+ * All can-fail validation runs before any layer mutation, so a failure path
+ * never leaves an orphan Managed effect behind.
  */
-function CG_setCorrectProfile(isLog, decodeLutCube) {
+function CG_setCorrectProfile(isLog, decodeLutPath) {
   try {
     var comp = CG_activeComp();
     if (comp === null) return CG_fail('no active comp');
@@ -295,20 +300,25 @@ function CG_setCorrectProfile(isLog, decodeLutCube) {
     if (selected.length === 0) return CG_fail('no layer selected');
     var layer = selected[0];
 
-    CG_ensureLumetri(layer);
-
     var lutPath = null;
     if (isLog) {
-      if (!decodeLutCube) return CG_fail('missing decode LUT contents for V-Log');
+      if (!decodeLutPath) return CG_fail('missing decode LUT for V-Log');
       var folder = CG_projectStateFolder();
       if (folder === null) return CG_fail('save the project before flagging V-Log clips');
-      var file = new File(folder.fsName + '/decode_' + layer.id + '.cube');
-      if (!file.open('w')) return CG_fail('could not open decode LUT file for writing');
-      file.write(decodeLutCube);
-      file.close();
-      CG_ensureDecodeLut(layer, file);
-      lutPath = file.fsName;
+      var temp = new File(decodeLutPath);
+      if (!temp.exists) return CG_fail('decode LUT temp file not found: ' + decodeLutPath);
+      var dest = new File(folder.fsName + '/decode_' + layer.id + '.cube');
+      if (dest.exists) dest.remove();
+      if (!temp.copy(dest)) return CG_fail('could not copy decode LUT into project-state folder');
+      try {
+        temp.remove();
+      } catch (rmErr) {}
+
+      CG_ensureLumetri(layer);
+      CG_ensureDecodeLut(layer, dest);
+      lutPath = dest.fsName;
     } else {
+      CG_ensureLumetri(layer);
       CG_removeDecodeLut(layer);
     }
 
