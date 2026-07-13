@@ -64,6 +64,13 @@ The ExtendScript layer is not automated; verify by hand:
 - [ ] Renaming/removing the `CG 16-bit TIFF` template still lets analysis run via
       the PNG fallback, and repeated failing analyzes leave no orphaned
       `cg_frame_*.tif` files in the OS temp folder.
+- [ ] On a comp with a **non-zero Start Timecode** (Composition Settings, e.g. a
+      timecode-offset comp with a large `displayStartTime`), both **Analyze
+      frame** and **Apply grade** render successfully - no "render produced no
+      file" error and no "timeSpanStart of 0 seconds ... outside of range defined
+      by comp displayStartTime" warning. This is the authoritative check for the
+      displayStartTime render fix (the render queue's `timeSpanStart` now shifts
+      by `displayStartTime` instead of assuming 0).
 - [ ] The Correct tab has a **single** footage-profile selector (Footage
       dropdown: Rec.709 / V-Log / ...) plus an **Apply correction** button - no
       separate "V-Log" checkbox. The dropdown is the one source of truth: it
@@ -76,7 +83,10 @@ The ExtendScript layer is not automated; verify by hand:
       LUT [cg]** then **Lumetri Color [cg]**, in that order. This is the
       authoritative check for the `cep.fs.writeFile` err-1 fix: confirm the
       Decode LUT actually writes (no "Correct stack failed: cep.fs.writeFile
-      failed (err 1) ..." error surfaces) and the stack applies. Confirm the
+      failed (err 1) ..." error surfaces) and the stack applies. The root cause
+      was that `getSystemPath('userData')` returns a `file://` URI on Windows
+      (e.g. `file:///C:/Users/.../AppData/Roaming`) which `cep.fs.writeFile`
+      rejects; `stageTempFile` now normalizes it to a native path. Confirm the
       Apply Color LUT effect's Choose LUT field actually resolved to the written
       file (its scriptable file property is not fully documented by Adobe -
       verify by hand each release) and that a flat V-Log clip visibly

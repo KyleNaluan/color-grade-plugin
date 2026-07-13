@@ -12,6 +12,7 @@ import {
   parseBridgeResult,
 } from './bridge';
 import type { RenderedFrameRef } from './frameSource';
+import { systemPathToNative } from './cepPath';
 
 /** The subset of the injected CEP API the bridge needs. */
 interface AdobeCep {
@@ -22,7 +23,7 @@ interface AdobeCep {
 
 /** Minimal shape of the injected `cep.fs` API used to stage the Decode LUT. */
 interface CepFs {
-  writeFile(path: string, data: string, encoding?: number): { err: number };
+  writeFile(path: string, data: string): { err: number };
   deleteFile(path: string): { err: number };
 }
 
@@ -31,22 +32,6 @@ const EVAL_SCRIPT_ERROR = 'EvalScript error.';
 
 /** `cep.fs` error code for "no error". */
 const CEP_NO_ERROR = 0;
-
-/**
- * CEP's `cep.encoding.UTF8` constant (0). `cep.fs.writeFile`'s third argument
- * is the encoding; when it is omitted the native layer has been observed to
- * pick no encoder and fail large writes with the generic ERR_UNKNOWN (err 1) -
- * exactly the failure the Correct stack's ~7MB 65-point Decode LUT hit on a
- * real Windows AE (the Grade stack's smaller 33-point LUT never repro'd it).
- * We read the constant from the runtime so we track the host's own value, and
- * fall back to 0 (its documented value across CEP versions) if absent.
- */
-const CEP_UTF8_ENCODING = 0;
-
-function getCepUtf8Encoding(): number {
-  const encoding = (globalThis as { cep?: { encoding?: { UTF8?: number } } }).cep?.encoding?.UTF8;
-  return typeof encoding === 'number' ? encoding : CEP_UTF8_ENCODING;
-}
 
 function getAdobeCep(): AdobeCep {
   const cep = (globalThis as { __adobe_cep__?: AdobeCep }).__adobe_cep__;
@@ -72,12 +57,13 @@ function getCepFs(): CepFs {
  * scratch copy.
  */
 function stageTempFile(text: string, ext: string): string {
-  const dir = getAdobeCep().getSystemPath('userData');
+  // getSystemPath returns a `file://` URI on Windows (file:///C:/...); cep.fs
+  // requires a plain native path, so normalize before building the path. This
+  // (not encoding/size) is what caused the Windows-AE writeFile err 1.
+  const dir = systemPathToNative(getAdobeCep().getSystemPath('userData'));
   const stamp = `${Date.now()}_${Math.floor(Math.random() * 1_000_000)}`;
   const path = `${dir}/cg_${stamp}${ext}`;
-  // Pass the encoding explicitly - see CEP_UTF8_ENCODING: omitting it is the
-  // leading cause of the large-Decode-LUT ERR_UNKNOWN (err 1) writeFile failure.
-  const result = getCepFs().writeFile(path, text, getCepUtf8Encoding());
+  const result = getCepFs().writeFile(path, text);
   if (result.err !== CEP_NO_ERROR) {
     throw new BridgeError(`cep.fs.writeFile failed (err ${result.err}) for ${path}`);
   }
