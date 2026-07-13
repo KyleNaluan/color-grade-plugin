@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ExtensionManifest
+  Version="12.0"
+  ExtensionBundleId="com.kylenaluan.colorgrade"
+  ExtensionBundleVersion="0.0.1"
+  ExtensionBundleName="Color Grade"
+  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <ExtensionList>
+    <Extension Id="com.kylenaluan.colorgrade.panel" Version="0.0.1" />
+  </ExtensionList>
+  <ExecutionEnvironment>
+    <HostList>
+      <!-- After Effects only; 24.0 is the first CEP 12 host release. -->
+      <Host Name="AEFT" Version="[24.0,99.9]" />
+    </HostList>
+    <LocaleList>
+      <Locale Code="All" />
+    </LocaleList>
+    <RequiredRuntimeList>
+      <RequiredRuntime Name="CSXS" Version="12.0" />
+    </RequiredRuntimeList>
+  </ExecutionEnvironment>
+  <DispatchInfoList>
+    <Extension Id="com.kylenaluan.colorgrade.panel">
+      <DispatchInfo>
+        <Resources>
+          <MainPath>./panel/index.html</MainPath>
+          <ScriptPath>./host/host.jsx</ScriptPath>
+        </Resources>
+        <Lifecycle>
+          <AutoVisible>true</AutoVisible>
+        </Lifecycle>
+        <UI>
+          <Type>Panel</Type>
+          <Menu>Color Grade</Menu>
+          <Geometry>
+            <Size>
+              <Height>500</Height>
+              <Width>360</Width>
+            </Size>
+            <MinSize>
+              <Height>300</Height>
+              <Width>280</Width>
+            </MinSize>
+          </Geometry>
+        </UI>
+      </DispatchInfo>
+    </Extension>
+  </DispatchInfoList>
+</ExtensionManifest>

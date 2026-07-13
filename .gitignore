@@ -1,3 +1,4 @@
 tests/fixtures/frames/
 out/
 node_modules/
+dist/

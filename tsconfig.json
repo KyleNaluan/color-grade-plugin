@@ -3,6 +3,8 @@
     "target": "ES2022",
     "module": "ESNext",
     "moduleResolution": "bundler",
+    "jsx": "react-jsx",
+    "jsxImportSource": "preact",
     "strict": true,
     "noUncheckedIndexedAccess": true,
     "skipLibCheck": true,
