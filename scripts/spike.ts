@@ -56,6 +56,7 @@ const stats = computeStats(decoded);
 
 printStats('footage stats (post-decode Rec.709)', stats);
 printStats('theme target stats', theme.targetStats);
+printOverrides(theme);
 
 const transform = buildTransform(stats, theme, { strength });
 
@@ -89,6 +90,30 @@ if (profile.name !== 'Rec.709') {
 
 function clamp01(x: number): number {
   return x < 0 ? 0 : x > 1 ? 1 : x;
+}
+
+function printOverrides(t: typeof theme): void {
+  const ov = t.overrides;
+  console.log(`\ntheme overrides (authored taste)`);
+  if (!ov) {
+    console.log('  (none)');
+    return;
+  }
+  const curve = (pts: Array<[number, number]>) => pts.map(([x, y]) => `${x}→${y}`).join('  ');
+  if (ov.shadowTint) console.log(`  shadowTint    a ${ov.shadowTint[0]}  b ${ov.shadowTint[1]}`);
+  if (ov.highlightTint) console.log(`  highlightTint a ${ov.highlightTint[0]}  b ${ov.highlightTint[1]}`);
+  if (ov.chromaGain !== undefined) console.log(`  chromaGain    ${ov.chromaGain}`);
+  if (ov.toneCurve) console.log(`  toneCurve     ${curve(ov.toneCurve)}`);
+  for (const ch of ['r', 'g', 'b'] as const) {
+    const pts = ov.channelCurves?.[ch];
+    if (pts) console.log(`  ${ch}Curve        ${curve(pts)}`);
+  }
+  const cs = ov.chromaShape;
+  if (cs) {
+    if (cs.byLuma) console.log(`  chromaByLuma  ${curve(cs.byLuma)}`);
+    if (cs.vibrance !== undefined) console.log(`  vibrance      ${cs.vibrance}`);
+    if (cs.softLimit !== undefined) console.log(`  chromaLimit   ${cs.softLimit} (soft)`);
+  }
 }
 
 function printStats(label: string, s: FootageStats): void {

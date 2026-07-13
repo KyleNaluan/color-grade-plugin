@@ -7,6 +7,19 @@ export interface MonotoneCurve {
 }
 
 export function makeMonotoneCurve(xsIn: number[], ysIn: number[]): MonotoneCurve {
+  return makeCurve(xsIn, ysIn, true);
+}
+
+/**
+ * Shape-preserving PCHIP without forcing y to be monotone: local extrema get a
+ * zero tangent, so the curve never overshoots its control points. Used for
+ * authored shapes like a chroma-by-luma multiplier that peaks in the mids.
+ */
+export function makeShapeCurve(xsIn: number[], ysIn: number[]): MonotoneCurve {
+  return makeCurve(xsIn, ysIn, false);
+}
+
+function makeCurve(xsIn: number[], ysIn: number[], forceMonotoneY: boolean): MonotoneCurve {
   if (xsIn.length !== ysIn.length || xsIn.length < 2) {
     throw new Error('makeMonotoneCurve: need >= 2 matching points');
   }
@@ -17,7 +30,7 @@ export function makeMonotoneCurve(xsIn: number[], ysIn: number[]): MonotoneCurve
   for (const [x, y] of pts.slice(1)) {
     if (x > xs[xs.length - 1]! + 1e-6) {
       xs.push(x);
-      ys.push(Math.max(y, ys[ys.length - 1]!)); // keep y monotone too
+      ys.push(forceMonotoneY ? Math.max(y, ys[ys.length - 1]!) : y);
     }
   }
   const n = xs.length;

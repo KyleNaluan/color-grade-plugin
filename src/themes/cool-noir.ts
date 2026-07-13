@@ -18,6 +18,23 @@ export const coolNoir: Theme = {
   overrides: {
     shadowTint: [0, -7],
     chromaGain: 0.85,
+    // Crushed toe, restrained highlights: the noir contrast lives down low.
+    toneCurve: [
+      [0, 0],
+      [0.2, 0.15],
+      [0.5, 0.48],
+      [1, 0.96],
+    ],
+    chromaShape: {
+      // Mute what little chroma survives, hardest in the shadows.
+      byLuma: [
+        [0, 0.7],
+        [0.5, 0.95],
+        [1, 0.85],
+      ],
+      vibrance: -0.25,
+      softLimit: 40,
+    },
   },
   knobs: {
     strength: { default: 0.75 },
