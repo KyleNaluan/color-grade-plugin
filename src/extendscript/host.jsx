@@ -224,6 +224,7 @@ function CG_renderFrame(time) {
 
 var CG_MANAGED_MARKER = ' [cg]';
 var CG_DECODE_LUT_MATCH_NAME = 'ADBE Apply Color LUT2';
+var CG_APPLY_COLOR_LUT_MATCH_NAME = 'ADBE Apply Color LUT2';
 var CG_LUMETRI_MATCH_NAME = 'ADBE Lumetri';
 
 /** Find a Managed ([cg]-tagged) effect of the given matchName on a layer, or null. */
@@ -351,6 +352,114 @@ function CG_setCorrectProfile(isLog, decodeLutPath, targetLayerId) {
       return CG_ok({ decodeLutPath: lutPath });
     } finally {
       if (isLog) CG_deleteStagedLut(decodeLutPath);
+    }
+  } catch (err) {
+    return CG_fail(err && err.message ? err.message : err);
+  }
+}
+
+/*
+ * --- Grade: baked .cube on a Managed adjustment layer ---
+ *
+ * The grade is one Apply Color LUT effect (matchName 'ADBE Apply Color LUT2')
+ * on a single Managed ([cg]) adjustment layer at the top of the comp, so it
+ * grades every clip below it. The LUT contents are computed on the panel side;
+ * this file only wires up AE DOM layer/effect/file operations.
+ */
+
+/** The Managed ([cg]-tagged) adjustment layer in `comp`, or null if none. */
+function CG_findManagedGradeLayer(comp) {
+  for (var i = 1; i <= comp.numLayers; i++) {
+    var layer = comp.layer(i);
+    if (layer.adjustmentLayer && layer.name.indexOf('[cg]') !== -1) return layer;
+  }
+  return null;
+}
+
+/**
+ * Ensure the single Managed grade adjustment layer exists at the top of the
+ * comp; return it. Created as a full-comp adjustment solid so it affects every
+ * clip below.
+ */
+function CG_ensureGradeLayer(comp) {
+  var existing = CG_findManagedGradeLayer(comp);
+  if (existing) return existing;
+  var layer = comp.layers.addSolid(
+    [1, 1, 1],
+    'Grade' + CG_MANAGED_MARKER,
+    comp.width,
+    comp.height,
+    comp.pixelAspect
+  );
+  layer.adjustmentLayer = true;
+  layer.moveToBeginning();
+  return layer;
+}
+
+/** Ensure a Managed Apply Color LUT effect on `layer` pointed at `lutFile`. */
+function CG_ensureGradeLut(layer, lutFile) {
+  var fx = CG_findManagedEffect(layer, CG_APPLY_COLOR_LUT_MATCH_NAME);
+  if (!fx) {
+    fx = layer.property('ADBE Effect Parade').addProperty(CG_APPLY_COLOR_LUT_MATCH_NAME);
+    fx.name = 'Apply Color LUT' + CG_MANAGED_MARKER;
+  }
+  // Apply Color LUT's sole property is the LUT file picker.
+  fx.property(1).setValue(lutFile);
+  return fx;
+}
+
+/**
+ * Apply a baked grade to the active comp. The panel already analyzed the
+ * post-Correct frame, built the transform toward the chosen Theme, and baked
+ * the grade into the temp file at `gradeLutPath` (transferred out-of-band, not
+ * inlined into this script), with the recipe inputs in `recipePath`. Both are
+ * moved into the Project-state folder (named after the analyzed clip) and the
+ * single Managed grade adjustment layer's Apply Color LUT is pointed at the
+ * .cube. Returns { gradeLutPath, recipePath } of the persisted files.
+ *
+ * `analyzedLayerId` is the clip whose frame was analyzed; the call refuses if
+ * that clip is no longer in the comp, so a stale recipe never lands. All
+ * can-fail validation (comp, clip, saved project, temp files, copies) runs
+ * before any comp mutation, so a failure path never leaves an orphan Managed
+ * layer or effect behind. The panel's staged scratch files are always deleted
+ * before returning (success or failure).
+ */
+function CG_applyGrade(gradeLutPath, recipePath, analyzedLayerId) {
+  try {
+    try {
+      var comp = CG_activeComp();
+      if (comp === null) return CG_fail('no active comp');
+      var analyzed = CG_findLayerById(comp, analyzedLayerId);
+      if (analyzed === null) {
+        return CG_fail('the analyzed clip is no longer in the comp - re-analyze and try again');
+      }
+      if (!gradeLutPath) return CG_fail('missing grade LUT');
+      if (!recipePath) return CG_fail('missing grade recipe');
+      var folder = CG_projectStateFolder();
+      if (folder === null) return CG_fail('save the project before grading');
+      var tempCube = new File(gradeLutPath);
+      if (!tempCube.exists) return CG_fail('grade LUT temp file not found: ' + gradeLutPath);
+      var tempRecipe = new File(recipePath);
+      if (!tempRecipe.exists) return CG_fail('grade recipe temp file not found: ' + recipePath);
+
+      var destCube = new File(folder.fsName + '/grade_' + analyzed.id + '.cube');
+      if (destCube.exists) destCube.remove();
+      if (!tempCube.copy(destCube)) {
+        return CG_fail('could not copy grade LUT into project-state folder');
+      }
+      var destRecipe = new File(folder.fsName + '/grade_' + analyzed.id + '.json');
+      if (destRecipe.exists) destRecipe.remove();
+      if (!tempRecipe.copy(destRecipe)) {
+        return CG_fail('could not copy grade recipe into project-state folder');
+      }
+
+      var gradeLayer = CG_ensureGradeLayer(comp);
+      CG_ensureGradeLut(gradeLayer, destCube);
+
+      return CG_ok({ gradeLutPath: destCube.fsName, recipePath: destRecipe.fsName });
+    } finally {
+      CG_deleteStagedLut(gradeLutPath);
+      CG_deleteStagedLut(recipePath);
     }
   } catch (err) {
     return CG_fail(err && err.message ? err.message : err);

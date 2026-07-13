@@ -30,6 +30,14 @@ export interface CorrectStackResult {
   decodeLutPath: string | null;
 }
 
+/** Result of applying a grade to the active comp's Managed adjustment layer. */
+export interface GradeResult {
+  /** Path the grade .cube was written to in the Project-state folder. */
+  gradeLutPath: string;
+  /** Path the recipe-inputs JSON was written to alongside it. */
+  recipePath: string;
+}
+
 export interface Bridge {
   /** Query the active comp and its selected layer. AE DOM read only. */
   getSelection(): Promise<SelectionSnapshot>;
@@ -67,6 +75,27 @@ export interface Bridge {
     decodeLutCube: string | null,
     targetLayerId: number,
   ): Promise<CorrectStackResult>;
+
+  /**
+   * Apply a baked grade to the active comp. The panel has already analyzed the
+   * post-Correct frame, built the transform toward the chosen Theme with its
+   * default Knobs, and baked the grade into `gradeLutCube` (.cube text), with
+   * `recipeJson` capturing the recipe inputs (theme, knobs, measured stats).
+   * This writes both into the Project-state folder (named after the analyzed
+   * clip) and ensures a single Managed (`[cg]`) adjustment layer at the top of
+   * the comp carrying an Apply Color LUT effect pointed at the grade .cube.
+   * AE DOM op only - all color math happened on the panel side, and the .cube
+   * and recipe cross out-of-band as temp files, never inlined into evalScript.
+   *
+   * `analyzedLayerId` is the id of the clip whose frame was analyzed: it names
+   * the persisted recipe/.cube and is re-resolved so the call refuses if that
+   * clip vanished mid-flight.
+   */
+  applyGrade(
+    gradeLutCube: string,
+    recipeJson: string,
+    analyzedLayerId: number,
+  ): Promise<GradeResult>;
 }
 
 /** Raised when the ExtendScript side returns an error or garbage. */

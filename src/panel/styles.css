@@ -146,6 +146,58 @@ body {
   color: #e07a7a;
 }
 
+.grade {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.grade-controls {
+  display: flex;
+  align-items: flex-end;
+  gap: 10px;
+}
+
+.theme-select {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  color: #9a9a9a;
+}
+
+.theme-select select {
+  font: inherit;
+  padding: 3px 4px;
+  background: #1f1f1f;
+  color: #e6e6e6;
+  border: 1px solid #454545;
+  border-radius: 3px;
+}
+
+.grade-btn {
+  font: inherit;
+  padding: 5px 12px;
+  background: #4a90d9;
+  color: #fff;
+  border: none;
+  border-radius: 3px;
+  cursor: pointer;
+}
+
+.grade-btn:disabled {
+  background: #3a3a3a;
+  color: #777;
+  cursor: default;
+}
+
+.grade-error {
+  color: #e07a7a;
+}
+
+.grade-done {
+  color: #7ac47a;
+}
+
 .stats {
   border: 1px solid #383838;
   border-radius: 4px;
