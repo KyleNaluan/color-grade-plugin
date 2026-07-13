@@ -17,13 +17,16 @@ import type { Bridge, CorrectStackResult } from '../host/bridge';
 /**
  * Apply the given V-Log/standard flag to the selected layer's Correct stack.
  * `logProfile` is only consulted (and only baked into a LUT) when `isLog`.
+ * `targetLayerId` is the stable id of the layer the caller intends to mutate,
+ * threaded through so the bridge can refuse if the selection moved mid-flight.
  */
 export async function setCorrectProfile(
   bridge: Pick<Bridge, 'setCorrectProfile'>,
   isLog: boolean,
   logProfile: LogProfile,
+  targetLayerId: number,
 ): Promise<CorrectStackResult> {
-  if (!isLog) return bridge.setCorrectProfile(false, null);
+  if (!isLog) return bridge.setCorrectProfile(false, null, targetLayerId);
   const cubeText = writeCube(bakeDecodeLut(logProfile));
-  return bridge.setCorrectProfile(true, cubeText);
+  return bridge.setCorrectProfile(true, cubeText, targetLayerId);
 }

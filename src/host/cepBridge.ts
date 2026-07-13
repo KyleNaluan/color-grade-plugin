@@ -22,6 +22,7 @@ interface AdobeCep {
 /** Minimal shape of the injected `cep.fs` API used to stage the Decode LUT. */
 interface CepFs {
   writeFile(path: string, data: string): { err: number };
+  deleteFile(path: string): { err: number };
 }
 
 /** CEP's sentinel result when the ExtendScript call itself failed. */
@@ -63,6 +64,19 @@ function stageDecodeLutCube(cubeText: string): string {
   return path;
 }
 
+/**
+ * Best-effort delete of a staged scratch .cube. ExtendScript deletes it once
+ * its body runs, but if `evalScript` rejects before that (dispatch/parse
+ * failure) the multi-megabyte file would leak, so the panel cleans up too.
+ */
+function unstageDecodeLutCube(path: string): void {
+  try {
+    getCepFs().deleteFile(path);
+  } catch {
+    // nothing more we can do; never let cleanup mask the original failure
+  }
+}
+
 function evalScript(script: string): Promise<string> {
   return new Promise((resolve, reject) => {
     try {
@@ -93,11 +107,18 @@ export function createCepBridge(): Bridge {
     async setCorrectProfile(
       isLog: boolean,
       decodeLutCube: string | null,
+      targetLayerId: number,
     ): Promise<CorrectStackResult> {
-      const pathArg = decodeLutCube === null ? 'null' : JSON.stringify(stageDecodeLutCube(decodeLutCube));
-      return parseBridgeResult<CorrectStackResult>(
-        await evalScript(`CG_setCorrectProfile(${isLog}, ${pathArg})`),
-      );
+      const stagedPath = decodeLutCube === null ? null : stageDecodeLutCube(decodeLutCube);
+      const pathArg = stagedPath === null ? 'null' : JSON.stringify(stagedPath);
+      try {
+        return parseBridgeResult<CorrectStackResult>(
+          await evalScript(`CG_setCorrectProfile(${isLog}, ${pathArg}, ${targetLayerId})`),
+        );
+      } catch (err) {
+        if (stagedPath !== null) unstageDecodeLutCube(stagedPath);
+        throw err;
+      }
     },
   };
 }

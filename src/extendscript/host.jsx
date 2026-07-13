@@ -64,6 +64,7 @@ function CG_getSelection() {
     return CG_ok({
       compName: comp.name,
       layerName: selected.length > 0 ? selected[0].name : null,
+      layerId: selected.length > 0 ? selected[0].id : null,
       selectedCount: selected.length
     });
   } catch (err) {
@@ -262,6 +263,14 @@ function CG_ensureDecodeLut(layer, lutFile) {
   return fx;
 }
 
+/** The layer in `comp` whose stable id matches `id`, or null if none. */
+function CG_findLayerById(comp, id) {
+  for (var i = 1; i <= comp.numLayers; i++) {
+    if (comp.layer(i).id === id) return comp.layer(i);
+  }
+  return null;
+}
+
 /** Remove the Managed Decode LUT effect from the layer, if present. */
 function CG_removeDecodeLut(layer) {
   var existing = CG_findManagedEffect(layer, CG_DECODE_LUT_MATCH_NAME);
@@ -298,19 +307,27 @@ function CG_projectStateFolder() {
  * Managed Decode LUT effect, leaving Lumetri. Returns { decodeLutPath } (null
  * when standard).
  *
+ * The layer to mutate is resolved by `targetLayerId` (the id the panel captured
+ * when the toggle fired), not by whatever happens to be selected now. If that
+ * layer is gone or the selection moved off it mid-flight, the call refuses
+ * rather than mutating the wrong clip.
+ *
  * All can-fail validation runs before any layer mutation, so a failure path
  * never leaves an orphan Managed effect behind. The panel's staged scratch
  * .cube is always deleted before returning (success or failure), so a failed
  * V-Log attempt never leaves a multi-megabyte orphan in userData.
  */
-function CG_setCorrectProfile(isLog, decodeLutPath) {
+function CG_setCorrectProfile(isLog, decodeLutPath, targetLayerId) {
   try {
     try {
       var comp = CG_activeComp();
       if (comp === null) return CG_fail('no active comp');
       var selected = comp.selectedLayers;
       if (selected.length === 0) return CG_fail('no layer selected');
-      var layer = selected[0];
+      var layer = CG_findLayerById(comp, targetLayerId);
+      if (layer === null || selected[0].id !== targetLayerId) {
+        return CG_fail('selection changed before the Correct stack could be applied - try again');
+      }
 
       var lutPath = null;
       if (isLog) {
