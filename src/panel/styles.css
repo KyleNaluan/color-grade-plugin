@@ -93,21 +93,31 @@ body {
 
 .correct-profile {
   display: flex;
-  flex-direction: column;
-  gap: 4px;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 10px;
 }
 
-.vlog-toggle {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  width: fit-content;
+.correct-btn {
+  font: inherit;
+  padding: 5px 12px;
+  background: #4a90d9;
+  color: #fff;
+  border: none;
+  border-radius: 3px;
   cursor: pointer;
+}
+
+.correct-btn:disabled {
+  background: #3a3a3a;
+  color: #777;
+  cursor: default;
 }
 
 .correct-stack-error {
   color: #e07a7a;
   margin: 0;
+  flex-basis: 100%;
 }
 
 .profile-select {

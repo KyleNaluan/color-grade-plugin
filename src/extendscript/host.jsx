@@ -158,7 +158,12 @@ function CG_renderFrameToTiff(comp, time) {
     }
   }
   try {
-    rqItem.timeSpanStart = time;
+    // `time` is comp-internal (0-based, as returned by comp.time), but the
+    // render queue's timeSpanStart lives in the comp's displayStartTime domain:
+    // for a timecode-offset comp (displayStartTime != 0) a bare `time` of 0
+    // falls outside the render range and produces no frame. Shift into that
+    // domain so the requested frame renders regardless of displayStartTime.
+    rqItem.timeSpanStart = comp.displayStartTime + time;
     rqItem.timeSpanDuration = comp.frameDuration; // exactly one frame
     var om = rqItem.outputModule(1);
     om.applyTemplate(CG_TIFF_TEMPLATE);
@@ -183,6 +188,8 @@ function CG_renderFrameToTiff(comp, time) {
 /** Render one frame at `time` to 8-bit PNG (fallback path). */
 function CG_renderFrameToPng(comp, time) {
   var file = CG_tempFramePath('.png');
+  // saveFrameToPng takes comp-internal time (0-based), so - unlike the render
+  // queue's timeSpanStart - no displayStartTime shift is applied here.
   comp.saveFrameToPng(time, file);
   return file;
 }

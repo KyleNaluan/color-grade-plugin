@@ -12,5 +12,13 @@ export default defineConfig({
     outDir: '../../dist/panel',
     emptyOutDir: true,
     target: 'chrome99',
+    // The panel is a locally-installed CEP extension, so bundle size is
+    // irrelevant, but readable output matters: minification renames local
+    // functions (e.g. systemPathToNative), which makes it impossible to verify
+    // by name that a fix actually shipped in dist/ and hides symbols from CEF
+    // DevTools stack traces. Keep the panel unminified for verifiability and
+    // debuggability. (`vite build` always recompiles from source; node_modules/
+    // .vite is only the dev dep-prebundle cache and never feeds a prod build.)
+    minify: false,
   },
 });

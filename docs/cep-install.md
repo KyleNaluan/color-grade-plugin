@@ -64,21 +64,45 @@ The ExtendScript layer is not automated; verify by hand:
 - [ ] Renaming/removing the `CG 16-bit TIFF` template still lets analysis run via
       the PNG fallback, and repeated failing analyzes leave no orphaned
       `cg_frame_*.tif` files in the OS temp folder.
-- [ ] On a saved project, selecting a layer and checking the Correct tab's
-      **V-Log** toggle creates a `.colorgrade/` folder next to the .aep
-      containing `decode_<layerId>.cube`, and the layer's Effect Controls show
-      **Apply Color LUT [cg]** then **Lumetri Color [cg]**, in that order.
-      Confirm the Apply Color LUT effect's Choose LUT field actually resolved
-      to the written file (its scriptable file property is not fully
-      documented by Adobe - verify by hand each release) and that a flat
-      V-Log clip visibly normalizes toward Rec.709.
-- [ ] Unchecking V-Log on that layer removes the Apply Color LUT effect and
-      leaves Lumetri Color [cg] in place; the .cube file is left on disk
-      (still tracked in `.colorgrade/` for a future toggle back).
-      Re-checking V-Log re-adds Apply Color LUT immediately above Lumetri.
-- [ ] With no project ever saved (no .aep path yet), checking V-Log surfaces
-      a clear "save the project" error instead of failing silently.
-- [ ] With zero layers selected, the V-Log toggle is disabled.
+- [ ] On a comp with a **non-zero Start Timecode** (Composition Settings, e.g. a
+      timecode-offset comp with a large `displayStartTime`), both **Analyze
+      frame** and **Apply grade** render successfully - no "render produced no
+      file" error and no "timeSpanStart of 0 seconds ... outside of range defined
+      by comp displayStartTime" warning. This is the authoritative check for the
+      displayStartTime render fix (the render queue's `timeSpanStart` now shifts
+      by `displayStartTime` instead of assuming 0).
+- [ ] The Correct tab has a **single** footage-profile selector (Footage
+      dropdown: Rec.709 / V-Log / ...) plus an **Apply correction** button - no
+      separate "V-Log" checkbox. The dropdown is the one source of truth: it
+      picks the profile the **Analyze frame** step decodes by AND the profile
+      the Correct stack applies.
+- [ ] On a saved project, selecting a layer, choosing **V-Log** in the Footage
+      dropdown, and clicking **Apply correction** creates a `.colorgrade/`
+      folder next to the .aep containing `decode_<layerId>.cube` (the ~7MB
+      65-point Decode LUT), and the layer's Effect Controls show **Apply Color
+      LUT [cg]** then **Lumetri Color [cg]**, in that order. This is the
+      authoritative check for the `cep.fs.writeFile` err-1 fix: confirm the
+      Decode LUT actually writes (no "Correct stack failed: cep.fs.writeFile
+      failed (err 1) ..." error surfaces) and the stack applies. The root cause
+      was that `getSystemPath('userData')` returns a `file://` URI on Windows
+      (e.g. `file:///C:/Users/.../AppData/Roaming`) which `cep.fs.writeFile`
+      rejects; `stageTempFile` now normalizes it to a native path. Confirm the
+      Apply Color LUT effect's Choose LUT field actually resolved to the written
+      file (its scriptable file property is not fully documented by Adobe -
+      verify by hand each release) and that a flat V-Log clip visibly
+      normalizes toward Rec.709.
+- [ ] Switching the Footage dropdown back to **Rec.709** (standard) and clicking
+      **Apply correction** removes the Apply Color LUT effect and leaves Lumetri
+      Color [cg] in place; the .cube file is left on disk (still tracked in
+      `.colorgrade/` for a future re-apply). Choosing **V-Log** and applying
+      again re-adds Apply Color LUT immediately above Lumetri.
+- [ ] With no project ever saved (no .aep path yet), applying a V-Log
+      correction surfaces a clear "save the project" error instead of failing
+      silently.
+- [ ] Selecting a different layer resets the Footage dropdown to Rec.709 (the
+      selector is per-clip; it never carries a prior clip's format over).
+- [ ] With zero layers selected, the Footage dropdown and Apply correction
+      button are disabled.
 - [ ] On a saved project, selecting a clip on the **Grade** tab, picking a
       Theme, and clicking **Apply grade** creates a Managed **Grade [cg]**
       adjustment layer at the top of the comp with an **Apply Color LUT [cg]**
@@ -87,9 +111,10 @@ The ExtendScript layer is not automated; verify by hand:
       `grade_<layerId>.json` (theme, knobs, measured stats). Confirm the Apply
       Color LUT effect's Choose LUT field actually resolved to the written
       `.cube` (scriptable file property, verify by hand each release).
-- [ ] The graded clip's stats are measured **after** its Correct stack: flag
-      the clip V-Log first, then Grade - the analyzed stats and resulting look
-      reflect the decoded (Rec.709) footage, not the raw log signal.
+- [ ] The graded clip's stats are measured **after** its Correct stack: choose
+      **V-Log** in the Footage dropdown and **Apply correction** first, then
+      Grade - the analyzed stats and resulting look reflect the decoded
+      (Rec.709) footage, not the raw log signal.
 - [ ] Re-applying a grade (same or different Theme) reuses the one Grade [cg]
       adjustment layer and repoints its Apply Color LUT, rather than stacking a
       second adjustment layer.

@@ -12,6 +12,7 @@ import {
   parseBridgeResult,
 } from './bridge';
 import type { RenderedFrameRef } from './frameSource';
+import { systemPathToNative } from './cepPath';
 
 /** The subset of the injected CEP API the bridge needs. */
 interface AdobeCep {
@@ -56,7 +57,10 @@ function getCepFs(): CepFs {
  * scratch copy.
  */
 function stageTempFile(text: string, ext: string): string {
-  const dir = getAdobeCep().getSystemPath('userData');
+  // getSystemPath returns a `file://` URI on Windows (file:///C:/...); cep.fs
+  // requires a plain native path, so normalize before building the path. This
+  // (not encoding/size) is what caused the Windows-AE writeFile err 1.
+  const dir = systemPathToNative(getAdobeCep().getSystemPath('userData'));
   const stamp = `${Date.now()}_${Math.floor(Math.random() * 1_000_000)}`;
   const path = `${dir}/cg_${stamp}${ext}`;
   const result = getCepFs().writeFile(path, text);
