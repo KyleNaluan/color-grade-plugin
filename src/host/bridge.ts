@@ -96,6 +96,16 @@ export interface Bridge {
     recipeJson: string,
     analyzedLayerId: number,
   ): Promise<GradeResult>;
+
+  /**
+   * Enable or disable the single Managed (`[cg]`) grade adjustment layer.
+   * Returns `true` when such a layer existed and was toggled, `false` when none
+   * exists (a no-op, e.g. before the first grade). The panel disables the grade
+   * layer around the analysis render so a re-grade measures post-Correct pixels
+   * rather than pixels that already have the current grade's LUT applied. AE DOM
+   * op only - no color math crosses this boundary.
+   */
+  setGradeLayerEnabled(enabled: boolean): Promise<boolean>;
 }
 
 /** Raised when the ExtendScript side returns an error or garbage. */

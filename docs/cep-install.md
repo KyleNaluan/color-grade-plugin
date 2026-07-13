@@ -93,6 +93,13 @@ The ExtendScript layer is not automated; verify by hand:
 - [ ] Re-applying a grade (same or different Theme) reuses the one Grade [cg]
       adjustment layer and repoints its Apply Color LUT, rather than stacking a
       second adjustment layer.
+- [ ] On a **re-grade**, the analyzed stats reflect the post-Correct (ungraded)
+      pixels: re-applying the *same* Theme does not compound or darken the look,
+      because the Grade [cg] layer is disabled during the analysis render and
+      re-enabled afterward.
+- [ ] A re-grade with new `.cube` contents at the same `grade_<layerId>.cube`
+      path visually refreshes the look (Apply Color LUT may cache the LUT by
+      path - confirm the new grade actually takes effect on screen).
 - [ ] Applying a grade leaves no `cg_*.cube`/`cg_*.json` scratch files in the
       CEP `userData` folder afterward (staged temp files are cleaned up).
 - [ ] With no project ever saved, Apply grade surfaces a clear "save the

@@ -144,5 +144,8 @@ export function createCepBridge(): Bridge {
         throw err;
       }
     },
+    async setGradeLayerEnabled(enabled: boolean): Promise<boolean> {
+      return parseBridgeResult<boolean>(await evalScript(`CG_setGradeLayerEnabled(${enabled})`));
+    },
   };
 }

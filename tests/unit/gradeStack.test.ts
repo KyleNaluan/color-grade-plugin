@@ -9,7 +9,7 @@ import { bakeGradeLut } from '../../src/core/lut/gradeLut.js';
 import { REC709 } from '../../src/core/color/rec709.js';
 import { THEMES } from '../../src/themes/index.js';
 import type { Bridge, GradeResult } from '../../src/host/bridge';
-import type { FrameFileReader, RenderedFrameRef } from '../../src/host/frameSource';
+import type { FrameFileReader, FrameSource, RenderedFrameRef } from '../../src/host/frameSource';
 
 const FIXTURES = join(__dirname, '..', 'fixtures', 'frame-source');
 const theme = THEMES['teal-orange']!;
@@ -23,7 +23,13 @@ const nodeReader: FrameFileReader = {
 const fixtureSource = (name = 'synthetic.tif', format: RenderedFrameRef['format'] = 'tiff') =>
   createFileFrameSource(() => ({ path: join(FIXTURES, name), format }), nodeReader);
 
-type GradeBridge = Pick<Bridge, 'getCurrentTime' | 'applyGrade'>;
+type GradeBridge = Pick<Bridge, 'getCurrentTime' | 'applyGrade' | 'setGradeLayerEnabled'>;
+
+interface FakeBridge extends GradeBridge {
+  calls: Array<[string, string, number]>;
+  /** Ordered log of every bridge event, to assert the analysis sequencing. */
+  events: string[];
+}
 
 function fakeBridge(
   time: number | null,
@@ -31,16 +37,25 @@ function fakeBridge(
     gradeLutPath: '/proj/.colorgrade/grade_42.cube',
     recipePath: '/proj/.colorgrade/grade_42.json',
   },
-): GradeBridge & { calls: Array<[string, string, number]> } {
+  /** Whether a Managed [cg] grade layer already exists (re-grade). */
+  hasGradeLayer = false,
+): FakeBridge {
   const calls: Array<[string, string, number]> = [];
+  const events: string[] = [];
   return {
     calls,
+    events,
     async getCurrentTime() {
+      events.push('getCurrentTime');
       return time;
     },
     async applyGrade(gradeLutCube, recipeJson, analyzedLayerId) {
       calls.push([gradeLutCube, recipeJson, analyzedLayerId]);
       return result;
+    },
+    async setGradeLayerEnabled(enabled: boolean) {
+      events.push(`setGradeLayerEnabled(${enabled})`);
+      return hasGradeLayer;
     },
   };
 }
@@ -69,6 +84,48 @@ describe('applyThemeGrade (panel logic against a fake bridge + file FrameSource)
 
     const recipe = JSON.parse(recipeJson);
     expect(recipe).toEqual(application.recipe);
+  });
+
+  it('on re-grade, disables the grade layer BEFORE analysis and re-enables it AFTER', async () => {
+    // hasGradeLayer=true: setGradeLayerEnabled reports a live grade layer.
+    const bridge = fakeBridge(1.5, undefined, true);
+    await applyThemeGrade(bridge, fixtureSource(), theme, 42);
+    expect(bridge.events).toEqual([
+      'setGradeLayerEnabled(false)',
+      'getCurrentTime',
+      'setGradeLayerEnabled(true)',
+    ]);
+  });
+
+  it('on first grade (no grade layer), does NOT re-enable after analysis', async () => {
+    // hasGradeLayer=false: the disable call is a no-op, so no restore is issued.
+    const bridge = fakeBridge(1.5, undefined, false);
+    await applyThemeGrade(bridge, fixtureSource(), theme, 42);
+    expect(bridge.events).toEqual(['setGradeLayerEnabled(false)', 'getCurrentTime']);
+  });
+
+  it('restores the grade layer even when analysis throws mid-flight', async () => {
+    const events: string[] = [];
+    const throwingSource: FrameSource = {
+      async getFrame() {
+        throw new Error('render failed');
+      },
+    };
+    const bridge: GradeBridge = {
+      async getCurrentTime() {
+        return 1.5;
+      },
+      applyGrade: vi.fn(),
+      async setGradeLayerEnabled(enabled: boolean) {
+        events.push(`setGradeLayerEnabled(${enabled})`);
+        return true;
+      },
+    };
+    await expect(applyThemeGrade(bridge, throwingSource, theme, 42)).rejects.toThrow(
+      /render failed/,
+    );
+    expect(events).toEqual(['setGradeLayerEnabled(false)', 'setGradeLayerEnabled(true)']);
+    expect(bridge.applyGrade).not.toHaveBeenCalled();
   });
 
   it('persists reproducible recipe inputs (theme, default knobs, stats, profile)', async () => {
@@ -104,6 +161,9 @@ describe('applyThemeGrade (panel logic against a fake bridge + file FrameSource)
       applyGrade: vi.fn(async () => {
         throw new Error('save the project before grading');
       }),
+      async setGradeLayerEnabled() {
+        return false;
+      },
     };
     await expect(applyThemeGrade(bridge, fixtureSource(), theme, 42)).rejects.toThrow(
       /save the project/,

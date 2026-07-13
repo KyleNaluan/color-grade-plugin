@@ -224,7 +224,7 @@ function CG_renderFrame(time) {
 
 var CG_MANAGED_MARKER = ' [cg]';
 var CG_DECODE_LUT_MATCH_NAME = 'ADBE Apply Color LUT2';
-var CG_APPLY_COLOR_LUT_MATCH_NAME = 'ADBE Apply Color LUT2';
+var CG_APPLY_COLOR_LUT_MATCH_NAME = CG_DECODE_LUT_MATCH_NAME;
 var CG_LUMETRI_MATCH_NAME = 'ADBE Lumetri';
 
 /** Find a Managed ([cg]-tagged) effect of the given matchName on a layer, or null. */
@@ -374,6 +374,25 @@ function CG_findManagedGradeLayer(comp) {
     if (layer.adjustmentLayer && layer.name.indexOf('[cg]') !== -1) return layer;
   }
   return null;
+}
+
+/**
+ * Enable/disable the single Managed ([cg]) grade adjustment layer. Returns a
+ * scalar `true` when such a layer existed and was toggled, `false` when none
+ * exists (a no-op). The panel disables the grade layer around the analysis
+ * render so a re-grade measures post-Correct pixels, not already-graded ones.
+ */
+function CG_setGradeLayerEnabled(enabled) {
+  try {
+    var comp = CG_activeComp();
+    if (comp === null) return CG_okRaw(false);
+    var layer = CG_findManagedGradeLayer(comp);
+    if (layer === null) return CG_okRaw(false);
+    layer.enabled = enabled;
+    return CG_okRaw(true);
+  } catch (err) {
+    return CG_fail(err && err.message ? err.message : err);
+  }
 }
 
 /**

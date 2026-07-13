@@ -75,14 +75,23 @@ export function buildGradeRecipe(theme: Theme, analysis: AnalyzeResult): GradeRe
  * active, the frame cannot be acquired, or the bridge rejects.
  */
 export async function applyThemeGrade(
-  bridge: Pick<Bridge, 'getCurrentTime' | 'applyGrade'>,
+  bridge: Pick<Bridge, 'getCurrentTime' | 'applyGrade' | 'setGradeLayerEnabled'>,
   frameSource: FrameSource,
   theme: Theme,
   analyzedLayerId: number,
 ): Promise<GradeApplication> {
-  // Identity (Rec.709) decode: the rendered frame is already post-Correct, so
-  // measuring it directly gives post-decode stats without a second decode.
-  const analysis = await analyzeCurrentFrame(bridge, frameSource, REC709);
+  // Disable any existing Managed [cg] grade layer so the analysis render
+  // measures post-Correct pixels, not pixels the current grade already altered.
+  // The finally re-enables it even if analysis throws.
+  const hadGradeLayer = await bridge.setGradeLayerEnabled(false);
+  let analysis: AnalyzeResult;
+  try {
+    // Identity (Rec.709) decode: the rendered frame is already post-Correct, so
+    // measuring it directly gives post-decode stats without a second decode.
+    analysis = await analyzeCurrentFrame(bridge, frameSource, REC709);
+  } finally {
+    if (hadGradeLayer) await bridge.setGradeLayerEnabled(true);
+  }
   const cubeText = writeCube(bakeGradeLut(analysis.stats, theme));
   const recipe = buildGradeRecipe(theme, analysis);
   const result = await bridge.applyGrade(cubeText, JSON.stringify(recipe, null, 2), analyzedLayerId);
