@@ -36,7 +36,7 @@ The spike also established that a look's identity must come mostly from authored
 8. As a colorist, I want a re-roll and a reset on the Grade tab, so that I can re-run analysis or return to the ungraded state easily.
 9. As someone filming people, I want skin-tone protection to attenuate the grade near the vectorscope skin line, so that Themes never turn faces orange or teal.
 10. As someone filming people, I want skin-tone protection to activate only when skin is actually present (above ~2% presence), so that skin-free shots get the full look.
-11. As someone filming people, I want a skin protection knob (0-100%, default ~70%), so that I control the trade-off between look fidelity and skin safety.
+11. As someone filming people, I want a skin protection knob (0-100%, per-theme default ~75%), so that I control the trade-off between look fidelity and skin safety.
 12. As a careful grader, I want clipping warnings surfaced by the auto-grade, so that I know when the look crushes shadows or blows highlights.
 13. As a careful grader, I want Snapshot scopes (waveform, vectorscope, histogram) available on both tabs, so that I can judge the image objectively while correcting and grading.
 14. As a careful grader, I want a before/after toggle in a persistent footer, so that I can compare the graded and ungraded image with one click.

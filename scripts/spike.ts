@@ -9,7 +9,9 @@
  *   <frame>__<theme>-grade.cube    grade LUT (input: corrected/decoded Rec.709)
  *   vlog-decode.cube               decode LUT (V-Log -> Rec.709), when profile is vlog
  *   <frame>__<theme>-combined.cube convenience LUT (decode + grade in one), vlog only
- * plus a stats printout.
+ * plus a stats printout and a grade-impact report (skin hue/chroma shift and
+ * overall cast magnitude/direction; see `scripts/lib/gradeImpact.ts`), the
+ * numeric evidence for theme-tuning decisions.
  */
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { basename, join } from 'node:path';
@@ -19,6 +21,7 @@ import { buildTransform } from '../src/core/engine/engine.js';
 import { bakeLut, writeCube } from '../src/core/lut/cube.js';
 import { THEMES } from '../src/themes/index.js';
 import { loadTiff, downsample } from './lib/loadTiff.js';
+import { computeGradeImpact } from './lib/gradeImpact.js';
 import type { Vec3 } from '../src/core/color/types.js';
 import { mat3MulVec } from '../src/core/color/matrices.js';
 import { rec709Encode } from '../src/core/color/rec709.js';
@@ -59,6 +62,9 @@ printStats('theme target stats', theme.targetStats);
 printOverrides(theme);
 
 const transform = buildTransform(stats, theme, { strength });
+
+const impact = computeGradeImpact(decoded, transform);
+printImpact(impact, stats);
 
 const gradeLut = bakeLut(transform, 33, `${theme.name} grade for ${stem}`);
 const gradePath = join(outDir, `${stem}__${theme.name}-grade.cube`);
@@ -114,6 +120,24 @@ function printOverrides(t: typeof theme): void {
     if (cs.vibrance !== undefined) console.log(`  vibrance      ${cs.vibrance}`);
     if (cs.softLimit !== undefined) console.log(`  chromaLimit   ${cs.softLimit} (soft)`);
   }
+}
+
+function printImpact(impact: ReturnType<typeof computeGradeImpact>, srcStats: FootageStats): void {
+  const f = (x: number) => x.toFixed(2);
+  console.log(`\ngrade impact (evidence for tuning decisions)`);
+  console.log(
+    `  cast       magnitude ${f(impact.castMagnitude)} LAB units, direction ${f(impact.castDirectionDeg)}deg` +
+      (impact.castMagnitude > 15 ? '  (STRONG - check for garish cast)' : '  (modest)'),
+  );
+  if (srcStats.skinPresence > 0.02) {
+    console.log(
+      `  skin       hue shift ${f(impact.skinHueShiftDeg)}deg, chroma shift ${f(impact.skinChromaShiftPct)}%, weight ${(impact.skinWeightTotal * 100).toFixed(2)}%` +
+        (Math.abs(impact.skinHueShiftDeg) > 8 ? '  (CHECK skin protection)' : '  (protection holding)'),
+    );
+  } else {
+    console.log(`  skin       presence below threshold (${(srcStats.skinPresence * 100).toFixed(2)}%), protection inactive`);
+  }
+  printStats('graded output stats', impact.outStats);
 }
 
 function printStats(label: string, s: FootageStats): void {
