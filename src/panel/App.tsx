@@ -63,7 +63,7 @@ export function App({ bridge }: { bridge: Bridge }) {
             Scopes
           </button>
           <span class="analyzed" title="Analyzed-clip indicator (coming soon)">
-            Analyzed: —
+            Analyzed: -
           </span>
         </span>
       </footer>
