@@ -8,8 +8,8 @@ import {
   MID_HIGHLIGHT_SPLIT,
   type FootageStats,
 } from '../analysis/stats.js';
-import { makeMonotoneCurve, type MonotoneCurve } from './monotoneCurve.js';
-import type { Theme } from './theme.js';
+import { makeMonotoneCurve, makeShapeCurve, type MonotoneCurve } from './monotoneCurve.js';
+import type { CurvePoint, Theme } from './theme.js';
 
 /**
  * A grade transform: maps one gamma-encoded Rec.709 RGB pixel to another.
@@ -101,15 +101,45 @@ export function buildTransform(src: FootageStats, theme: Theme, opts: EngineOpti
   const ov = theme.overrides ?? {};
   const chromaGain = ov.chromaGain ?? 1;
 
+  // Authored curves: monotone per-channel tone shapes, evaluated on the
+  // stat-matched signal, then clamped so authored points outside [0,1] cannot
+  // push the encoded signal out of range.
+  const identityCurve: MonotoneCurve = (x) => x;
+  const makeToneOverride = (pts: CurvePoint[] | undefined): MonotoneCurve => {
+    if (!pts || pts.length < 2) return identityCurve;
+    const c = makeMonotoneCurve(pts.map((p) => p[0]), pts.map((p) => p[1]));
+    return (x) => clamp01(c(x));
+  };
+  const masterCurve = makeToneOverride(ov.toneCurve);
+  const rCurve = makeToneOverride(ov.channelCurves?.r);
+  const gCurve = makeToneOverride(ov.channelCurves?.g);
+  const bCurve = makeToneOverride(ov.channelCurves?.b);
+
+  // Authored chroma shaping.
+  const shape = ov.chromaShape ?? {};
+  const chromaByLuma: MonotoneCurve =
+    shape.byLuma && shape.byLuma.length >= 2
+      ? (() => {
+          const c = makeShapeCurve(shape.byLuma.map((p) => p[0]), shape.byLuma.map((p) => p[1]));
+          return (y) => Math.max(0, c(y));
+        })()
+      : () => 1;
+  const vibrance = shape.vibrance ?? 0;
+  // e-folding chroma for the vibrance falloff: low-chroma pixels get the full
+  // effect, pixels beyond ~2-3x this are left mostly alone.
+  const VIBRANCE_FALLOFF = 25; // LAB chroma units
+  const softLimit = shape.softLimit;
+
   return (rgb: Vec3): Vec3 => {
     const rIn = clamp01(rgb[0]);
     const gIn = clamp01(rgb[1]);
     const bIn = clamp01(rgb[2]);
 
-    // 1. Tone: master curve per channel (matches luma percentiles, keeps color ratios).
-    const r1 = toneCurve(rIn);
-    const g1 = toneCurve(gIn);
-    const b1 = toneCurve(bIn);
+    // 1. Tone: stat-matching curve per channel (matches luma percentiles,
+    //    keeps color ratios), then the authored master + per-channel curves.
+    const r1 = rCurve(masterCurve(toneCurve(rIn)));
+    const g1 = gCurve(masterCurve(toneCurve(gIn)));
+    const b1 = bCurve(masterCurve(toneCurve(bIn)));
 
     // 2. Color in LAB.
     const labIn = linearRec709ToLab([rec709Decode(rIn), rec709Decode(gIn), rec709Decode(bIn)]);
@@ -130,6 +160,21 @@ export function buildTransform(src: FootageStats, theme: Theme, opts: EngineOpti
     if (ov.highlightTint) {
       a += ov.highlightTint[0] * wh;
       bb += ov.highlightTint[1] * wh;
+    }
+
+    // 3b. Authored chroma shaping on the final chroma vector.
+    let chroma = Math.hypot(a, bb);
+    if (chroma > 1e-6) {
+      let target = chroma * chromaByLuma(y1);
+      if (vibrance !== 0) {
+        target *= Math.max(0, 1 + vibrance * Math.exp(-chroma / VIBRANCE_FALLOFF));
+      }
+      if (softLimit !== undefined && softLimit > 0) {
+        target = softLimit * Math.tanh(target / softLimit);
+      }
+      const k = target / chroma;
+      a *= k;
+      bb *= k;
     }
 
     const linOut = labToLinearRec709([lab[0], a, bb]);

@@ -84,6 +84,96 @@ describe('damped color transfer', () => {
   });
 });
 
+describe('expanded overrides', () => {
+  const stats = computeStats(syntheticFootage(5000));
+  const base = THEMES['teal-orange']!;
+  /** Same theme with the given overrides replacing the authored ones. */
+  const withOverrides = (overrides: NonNullable<typeof base.overrides>) => ({ ...base, overrides });
+
+  it('authored tone curve shifts mids in the authored direction', () => {
+    const lifted = withOverrides({ toneCurve: [[0, 0], [0.5, 0.65], [1, 1]] });
+    const flat = withOverrides({});
+    const grey: Vec3 = [0.4, 0.4, 0.4];
+    const outLifted = buildTransform(stats, lifted, { strength: 1, skinProtection: 0 })(grey);
+    const outFlat = buildTransform(stats, flat, { strength: 1, skinProtection: 0 })(grey);
+    const lum = (p: Vec3) => (p[0] + p[1] + p[2]) / 3;
+    expect(lum(outLifted)).toBeGreaterThan(lum(outFlat));
+  });
+
+  it('per-channel red curve warms neutral input, moving red most', () => {
+    const redBoost = withOverrides({ channelCurves: { r: [[0, 0], [0.5, 0.6], [1, 1]] } });
+    const none = withOverrides({});
+    const grey: Vec3 = [0.4, 0.4, 0.4];
+    const boosted = buildTransform(stats, redBoost, { strength: 1, skinProtection: 0 })(grey);
+    const plain = buildTransform(stats, none, { strength: 1, skinProtection: 0 })(grey);
+    const dR = boosted[0] - plain[0];
+    expect(dR).toBeGreaterThan(0);
+    // The curve feeds the LAB color stage, so the chroma stages spread part of
+    // the warm push into G/B - but the authored channel must dominate.
+    expect(dR).toBeGreaterThan(2 * Math.abs(boosted[1] - plain[1]));
+    expect(dR).toBeGreaterThan(2 * Math.abs(boosted[2] - plain[2]));
+  });
+
+  it('vibrance boosts low-chroma pixels proportionally more than saturated ones', () => {
+    const vib = withOverrides({ chromaShape: { vibrance: 0.5 } });
+    const none = withOverrides({});
+    const chromaOf = (p: Vec3) => {
+      // Approximate chroma via max-min channel spread in encoded RGB.
+      return Math.max(...p) - Math.min(...p);
+    };
+    const muted: Vec3 = [0.5, 0.47, 0.45];
+    const saturated: Vec3 = [0.9, 0.4, 0.1];
+    const gain = (px: Vec3) => {
+      const withVib = buildTransform(stats, vib, { strength: 1, skinProtection: 0 })(px);
+      const plain = buildTransform(stats, none, { strength: 1, skinProtection: 0 })(px);
+      return chromaOf(withVib) / Math.max(chromaOf(plain), 1e-6);
+    };
+    expect(gain(muted)).toBeGreaterThan(gain(saturated));
+    expect(gain(muted)).toBeGreaterThan(1);
+  });
+
+  it('chroma-by-luma curve mutes highlights when authored to', () => {
+    const muteHi = withOverrides({ chromaShape: { byLuma: [[0, 1], [0.5, 1], [1, 0.3]] } });
+    const none = withOverrides({});
+    const brightWarm: Vec3 = [0.95, 0.85, 0.7];
+    const spread = (p: Vec3) => Math.max(...p) - Math.min(...p);
+    const mutedOut = buildTransform(stats, muteHi, { strength: 1, skinProtection: 0 })(brightWarm);
+    const plainOut = buildTransform(stats, none, { strength: 1, skinProtection: 0 })(brightWarm);
+    expect(spread(mutedOut)).toBeLessThan(spread(plainOut));
+  });
+
+  it('soft chroma limit reduces the most saturated output', () => {
+    const limited = withOverrides({ chromaShape: { softLimit: 20 } });
+    const none = withOverrides({});
+    const saturated: Vec3 = [0.95, 0.2, 0.05];
+    const spread = (p: Vec3) => Math.max(...p) - Math.min(...p);
+    const lim = buildTransform(stats, limited, { strength: 1, skinProtection: 0 })(saturated);
+    const plain = buildTransform(stats, none, { strength: 1, skinProtection: 0 })(saturated);
+    expect(spread(lim)).toBeLessThan(spread(plain));
+  });
+
+  it('extreme authored overrides still keep output in [0,1]', () => {
+    const extreme = withOverrides({
+      toneCurve: [[0, 0.2], [0.5, 0.9], [1, 1.2]],
+      channelCurves: { r: [[0, -0.2], [1, 1.3]], b: [[0, 0], [0.3, 0.9], [1, 1]] },
+      chromaShape: { byLuma: [[0, 3], [0.5, 0.1], [1, 2]], vibrance: 1, softLimit: 200 },
+      chromaGain: 2,
+      shadowTint: [30, -30],
+      highlightTint: [-30, 30],
+    });
+    const t = buildTransform(stats, extreme, { strength: 1, skinProtection: 0 });
+    for (let r = 0; r <= 4; r++)
+      for (let g = 0; g <= 4; g++)
+        for (let b = 0; b <= 4; b++) {
+          const out = t([r / 4, g / 4, b / 4]);
+          for (let c = 0; c < 3; c++) {
+            expect(out[c]).toBeGreaterThanOrEqual(0);
+            expect(out[c]).toBeLessThanOrEqual(1);
+          }
+        }
+  });
+});
+
 describe('skin wedge', () => {
   it('weights a canonical skin tone highly and a blue sky at zero', () => {
     // LAB of a typical skin patch (~L 65, hue ~45deg).

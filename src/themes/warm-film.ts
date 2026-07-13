@@ -19,6 +19,24 @@ export const warmFilm: Theme = {
     shadowTint: [2, 4],
     highlightTint: [3, 9],
     chromaGain: 0.95,
+    // Film print shape: gently lifted toe, soft highlight shoulder.
+    toneCurve: [
+      [0, 0.02],
+      [0.25, 0.27],
+      [0.5, 0.51],
+      [0.75, 0.73],
+      [1, 0.97],
+    ],
+    chromaShape: {
+      // Muted highlights, near-full chroma through the mids.
+      byLuma: [
+        [0, 0.9],
+        [0.5, 1],
+        [1, 0.8],
+      ],
+      // Soft ceiling keeps saturated reds/oranges from going neon.
+      softLimit: 55,
+    },
   },
   knobs: {
     strength: { default: 0.8 },

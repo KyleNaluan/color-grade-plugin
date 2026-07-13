@@ -3,6 +3,7 @@ import { bakeLut, writeCube, parseCube, sampleLut } from '../../src/core/lut/cub
 import { buildTransform } from '../../src/core/engine/engine.js';
 import { computeStats } from '../../src/core/analysis/stats.js';
 import { tealOrange } from '../../src/themes/teal-orange.js';
+import { THEMES } from '../../src/themes/index.js';
 import type { Vec3 } from '../../src/core/color/types.js';
 
 /** Deterministic pseudo-random pixels so the property test is reproducible. */
@@ -57,6 +58,30 @@ describe('LUT bake -> write -> parse round trip', () => {
       const direct = transform(p);
       const viaLut = sampleLut(reparsed, p);
       for (let c = 0; c < 3; c++) expect(Math.abs(viaLut[c]! - direct[c]!)).toBeLessThan(0.05);
+    }
+  });
+
+  // Every theme now carries expanded overrides (authored curves + chroma
+  // shaping); round-trip each one so those code paths survive .cube text.
+  it.each(Object.keys(THEMES))('round-trips a transform using %s expanded overrides', (name) => {
+    const theme = THEMES[name]!;
+    const t = buildTransform(stats, theme, { strength: 1 });
+    const rt = parseCube(writeCube(bakeLut(t, 17, name)));
+    let seed = 11;
+    const rand = () => ((seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff);
+    for (let k = 0; k < 200; k++) {
+      const g: Vec3 = [
+        Math.floor(rand() * 17) / 16,
+        Math.floor(rand() * 17) / 16,
+        Math.floor(rand() * 17) / 16,
+      ];
+      const direct = t(g);
+      const viaLut = sampleLut(rt, g);
+      for (let c = 0; c < 3; c++) {
+        expect(viaLut[c]).toBeGreaterThanOrEqual(0);
+        expect(viaLut[c]).toBeLessThanOrEqual(1);
+        expect(Math.abs(viaLut[c]! - direct[c]!)).toBeLessThan(1e-4);
+      }
     }
   });
 
