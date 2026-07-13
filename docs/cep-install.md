@@ -62,7 +62,8 @@ The ExtendScript layer is not automated; verify by hand:
 - [ ] The 16-bit TIFF path leaves no `cg_frame_*.tif`/`.png` files in the OS temp
       folder afterward (temporary renders are cleaned up).
 - [ ] Renaming/removing the `CG 16-bit TIFF` template still lets analysis run via
-      the PNG fallback.
+      the PNG fallback, and repeated failing analyzes leave no orphaned
+      `cg_frame_*.tif` files in the OS temp folder.
 
 ## Debugging
 

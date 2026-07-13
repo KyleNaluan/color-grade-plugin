@@ -119,6 +119,28 @@ function CG_resolveRenderedFile(requested) {
   return requested;
 }
 
+/**
+ * Guard-delete a temp render target and any frame-numbered siblings AE may have
+ * written for it. Used on the failure path only; each remove is isolated so a
+ * delete failure never masks the original render error.
+ */
+function CG_deleteFrameFiles(requested) {
+  try {
+    if (requested.exists) requested.remove();
+  } catch (removeErr) {}
+  try {
+    var stem = requested.name.replace(/\.[^.]+$/, '');
+    var siblings = requested.parent.getFiles(stem + '*');
+    if (siblings) {
+      for (var k = 0; k < siblings.length; k++) {
+        try {
+          siblings[k].remove();
+        } catch (siblingErr) {}
+      }
+    }
+  } catch (globErr) {}
+}
+
 /** Render one frame at `time` to 16-bit TIFF via the render queue. */
 function CG_renderFrameToTiff(comp, time) {
   var requested = CG_tempFramePath('.tif');
@@ -141,6 +163,9 @@ function CG_renderFrameToTiff(comp, time) {
     om.applyTemplate(CG_TIFF_TEMPLATE);
     om.file = requested;
     rq.render();
+  } catch (renderErr) {
+    CG_deleteFrameFiles(requested);
+    throw renderErr;
   } finally {
     rqItem.remove();
     for (var j = 0; j < suspended.length; j++) {
