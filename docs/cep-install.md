@@ -79,6 +79,32 @@ The ExtendScript layer is not automated; verify by hand:
 - [ ] With no project ever saved (no .aep path yet), checking V-Log surfaces
       a clear "save the project" error instead of failing silently.
 - [ ] With zero layers selected, the V-Log toggle is disabled.
+- [ ] On a saved project, selecting a clip on the **Grade** tab, picking a
+      Theme, and clicking **Apply grade** creates a Managed **Grade [cg]**
+      adjustment layer at the top of the comp with an **Apply Color LUT [cg]**
+      effect, and the picture visibly takes on the Theme's look. The
+      `.colorgrade/` folder gains `grade_<layerId>.cube` and its recipe
+      `grade_<layerId>.json` (theme, knobs, measured stats). Confirm the Apply
+      Color LUT effect's Choose LUT field actually resolved to the written
+      `.cube` (scriptable file property, verify by hand each release).
+- [ ] The graded clip's stats are measured **after** its Correct stack: flag
+      the clip V-Log first, then Grade - the analyzed stats and resulting look
+      reflect the decoded (Rec.709) footage, not the raw log signal.
+- [ ] Re-applying a grade (same or different Theme) reuses the one Grade [cg]
+      adjustment layer and repoints its Apply Color LUT, rather than stacking a
+      second adjustment layer.
+- [ ] On a **re-grade**, the analyzed stats reflect the post-Correct (ungraded)
+      pixels: re-applying the *same* Theme does not compound or darken the look,
+      because the Grade [cg] layer is disabled during the analysis render and
+      re-enabled afterward.
+- [ ] A re-grade with new `.cube` contents at the same `grade_<layerId>.cube`
+      path visually refreshes the look (Apply Color LUT may cache the LUT by
+      path - confirm the new grade actually takes effect on screen).
+- [ ] Applying a grade leaves no `cg_*.cube`/`cg_*.json` scratch files in the
+      CEP `userData` folder afterward (staged temp files are cleaned up).
+- [ ] With no project ever saved, Apply grade surfaces a clear "save the
+      project" error instead of failing silently. With zero layers selected,
+      the Apply grade button is disabled.
 
 ## Debugging
 

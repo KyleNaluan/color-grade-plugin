@@ -7,6 +7,7 @@ import {
   type Bridge,
   BridgeError,
   type CorrectStackResult,
+  type GradeResult,
   type SelectionSnapshot,
   parseBridgeResult,
 } from './bridge';
@@ -48,16 +49,17 @@ function getCepFs(): CepFs {
 }
 
 /**
- * Stage the baked .cube text in a temp file and return its path, so only the
- * path (not the multi-megabyte LUT text) crosses the `evalScript` boundary -
- * the same out-of-band transport the render path uses. ExtendScript moves the
- * file into the Project-state folder and deletes this scratch copy.
+ * Stage a payload (baked .cube text, recipe JSON, ...) in a temp file and
+ * return its path, so only the path - not the multi-megabyte body - crosses the
+ * `evalScript` boundary, the same out-of-band transport the render path uses.
+ * ExtendScript moves the file into the Project-state folder and deletes this
+ * scratch copy.
  */
-function stageDecodeLutCube(cubeText: string): string {
+function stageTempFile(text: string, ext: string): string {
   const dir = getAdobeCep().getSystemPath('userData');
   const stamp = `${Date.now()}_${Math.floor(Math.random() * 1_000_000)}`;
-  const path = `${dir}/cg_decode_${stamp}.cube`;
-  const result = getCepFs().writeFile(path, cubeText);
+  const path = `${dir}/cg_${stamp}${ext}`;
+  const result = getCepFs().writeFile(path, text);
   if (result.err !== CEP_NO_ERROR) {
     throw new BridgeError(`cep.fs.writeFile failed (err ${result.err}) for ${path}`);
   }
@@ -65,11 +67,11 @@ function stageDecodeLutCube(cubeText: string): string {
 }
 
 /**
- * Best-effort delete of a staged scratch .cube. ExtendScript deletes it once
- * its body runs, but if `evalScript` rejects before that (dispatch/parse
- * failure) the multi-megabyte file would leak, so the panel cleans up too.
+ * Best-effort delete of a staged scratch file. ExtendScript deletes it once its
+ * body runs, but if `evalScript` rejects before that (dispatch/parse failure)
+ * the file would leak, so the panel cleans up too.
  */
-function unstageDecodeLutCube(path: string): void {
+function unstageTempFile(path: string): void {
   try {
     getCepFs().deleteFile(path);
   } catch {
@@ -109,16 +111,41 @@ export function createCepBridge(): Bridge {
       decodeLutCube: string | null,
       targetLayerId: number,
     ): Promise<CorrectStackResult> {
-      const stagedPath = decodeLutCube === null ? null : stageDecodeLutCube(decodeLutCube);
+      const stagedPath = decodeLutCube === null ? null : stageTempFile(decodeLutCube, '.cube');
       const pathArg = stagedPath === null ? 'null' : JSON.stringify(stagedPath);
       try {
         return parseBridgeResult<CorrectStackResult>(
           await evalScript(`CG_setCorrectProfile(${isLog}, ${pathArg}, ${targetLayerId})`),
         );
       } catch (err) {
-        if (stagedPath !== null) unstageDecodeLutCube(stagedPath);
+        if (stagedPath !== null) unstageTempFile(stagedPath);
         throw err;
       }
+    },
+    async applyGrade(
+      gradeLutCube: string,
+      recipeJson: string,
+      analyzedLayerId: number,
+    ): Promise<GradeResult> {
+      // Both the .cube and its recipe cross out-of-band as temp files, so the
+      // multi-megabyte LUT text never inlines into the evalScript string.
+      const cubePath = stageTempFile(gradeLutCube, '.cube');
+      let recipePath: string | null = null;
+      try {
+        recipePath = stageTempFile(recipeJson, '.json');
+        return parseBridgeResult<GradeResult>(
+          await evalScript(
+            `CG_applyGrade(${JSON.stringify(cubePath)}, ${JSON.stringify(recipePath)}, ${analyzedLayerId})`,
+          ),
+        );
+      } catch (err) {
+        unstageTempFile(cubePath);
+        if (recipePath !== null) unstageTempFile(recipePath);
+        throw err;
+      }
+    },
+    async setGradeLayerEnabled(enabled: boolean): Promise<boolean> {
+      return parseBridgeResult<boolean>(await evalScript(`CG_setGradeLayerEnabled(${enabled})`));
     },
   };
 }
