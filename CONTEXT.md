@@ -44,7 +44,7 @@ The engine computes the transform that moves measured footage stats toward the t
 
 ## Overrides
 
-Hand-authored artistic nudges a theme applies after stat matching (e.g. fixed curve shapes, shadow tints) - taste the target stats cannot express.
+Hand-authored artistic nudges a theme applies after stat matching (e.g. authored tone/per-channel curves, shadow/highlight tints, chroma shaping) - taste the target stats cannot express.
 
 ## Knobs
 
