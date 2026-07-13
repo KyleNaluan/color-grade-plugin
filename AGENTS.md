@@ -4,10 +4,11 @@ This file is the project's committed home for project-intrinsic agent knowledge:
 
 - Domain vocabulary lives in `CONTEXT.md`; use those terms verbatim. Product context: PRD in issue #1 and `docs/prd.md`; ADRs in `docs/adr/`.
 - Layout: `src/core` (pure color math), `src/themes` (data-only looks), `src/panel` (Preact UI), `src/host` (typed bridge boundary + CEP impl), `src/extendscript` (ES3 `host.jsx`, AE DOM ops only, zero color math).
+- Pixel access goes through the `FrameSource` interface (`src/host/frameSource.ts`, ADR 0001): comp time in, normalized Float32 pixels out - consumers never learn the acquisition method. v1 backend is render-to-file (`renderFrameSource.ts` + `cepFrameFileIO.ts` + ExtendScript `CG_renderFrame`, 16-bit TIFF primary / PNG fallback, decoders in `frameFile.ts`). Tests use the file-backed `fileFrameSource.ts` fed with fixtures, so pixel consumers run without a host.
 - Commands: `npm test` (Vitest), `npm run lint` (core-purity check), `npm run typecheck`, `npm run build` (Vite + `scripts/assemble-cep.mjs` -> installable CEP extension in `dist/`; install steps in `docs/cep-install.md`). Theme-tuning loop: `npm run spike -- <frame.tif> <theme>` (see `scripts/spike.ts` header).
 - Themes are data only (target stats + authored overrides + knobs); all look logic lives in `src/core/engine/engine.ts`. Strength 0 must stay exact identity and output bounded in [0,1] - tests enforce both.
 - `src/core` purity is enforced by `scripts/check-core-purity.ts` (custom checker, not eslint: typescript-eslint's peer range rejects this repo's TypeScript 7). Core may only import relative modules inside `src/core`.
-- Golden tests read local-only fixture frames (`tests/fixtures/frames/`, gitignored personal footage) and must keep skipping cleanly when the directory is empty; full suite counts differ with/without fixtures. Local copies live at `~/projects/color-grade-plugin/tests/fixtures/frames/`.
+- Golden tests read local-only fixture frames (`tests/fixtures/frames/`, gitignored personal footage) and must keep skipping cleanly when the directory is empty; full suite counts differ with/without fixtures. Local copies live at `~/projects/color-grade-plugin/tests/fixtures/frames/`. Distinct from those: `tests/fixtures/frame-source/` holds small committed synthetic frames (TIFF + PNG) for the FrameSource/analyze tests - regenerate via `scripts/gen-frame-fixtures.ts`.
 - The ExtendScript layer is untestable by design; changes there go through the manual smoke checklist in `docs/cep-install.md`.
 
 ## Maintaining this file

@@ -4,6 +4,7 @@
  * touches the CEP runtime; everything above it sees the `Bridge` interface.
  */
 import { type Bridge, BridgeError, type SelectionSnapshot, parseBridgeResult } from './bridge';
+import type { RenderedFrameRef } from './frameSource';
 
 /** The subset of the injected CEP API the bridge needs. */
 interface AdobeCep {
@@ -41,6 +42,12 @@ export function createCepBridge(): Bridge {
   return {
     async getSelection(): Promise<SelectionSnapshot> {
       return parseBridgeResult<SelectionSnapshot>(await evalScript('CG_getSelection()'));
+    },
+    async getCurrentTime(): Promise<number | null> {
+      return parseBridgeResult<number | null>(await evalScript('CG_getCurrentTime()'));
+    },
+    async renderFrame(time: number): Promise<RenderedFrameRef> {
+      return parseBridgeResult<RenderedFrameRef>(await evalScript(`CG_renderFrame(${time})`));
     },
   };
 }

@@ -78,3 +78,87 @@ body {
 .analyzed {
   color: #8a8a8a;
 }
+
+.analyze {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.analyze-controls {
+  display: flex;
+  align-items: flex-end;
+  gap: 10px;
+}
+
+.profile-select {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  color: #9a9a9a;
+}
+
+.profile-select select {
+  font: inherit;
+  padding: 3px 4px;
+  background: #1f1f1f;
+  color: #e6e6e6;
+  border: 1px solid #454545;
+  border-radius: 3px;
+}
+
+.analyze-btn {
+  font: inherit;
+  padding: 5px 12px;
+  background: #4a90d9;
+  color: #fff;
+  border: none;
+  border-radius: 3px;
+  cursor: pointer;
+}
+
+.analyze-btn:disabled {
+  background: #3a3a3a;
+  color: #777;
+  cursor: default;
+}
+
+.analyze-error {
+  color: #e07a7a;
+}
+
+.stats {
+  border: 1px solid #383838;
+  border-radius: 4px;
+  background: #222;
+}
+
+.stats-head {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 8px 10px;
+  border-bottom: 1px solid #383838;
+}
+
+.stats-meta {
+  color: #8a8a8a;
+  font-size: 11px;
+}
+
+.stats-grid {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 4px 10px;
+  margin: 0;
+  padding: 8px 10px;
+}
+
+.stats-grid dt {
+  color: #9a9a9a;
+}
+
+.stats-grid dd {
+  margin: 0;
+  font-variant-numeric: tabular-nums;
+}

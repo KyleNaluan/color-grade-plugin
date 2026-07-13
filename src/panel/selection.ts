@@ -59,7 +59,10 @@ function statesEqual(a: SelectionState, b: SelectionState): boolean {
  * the next tick is scheduled only after the previous query settles, so a
  * slow bridge cannot pile up requests or deliver answers out of order.
  */
-export function createSelectionWatcher(bridge: Bridge, intervalMs = 500): SelectionWatcher {
+export function createSelectionWatcher(
+  bridge: Pick<Bridge, 'getSelection'>,
+  intervalMs = 500,
+): SelectionWatcher {
   let state: SelectionState = { kind: 'loading' };
   let listeners: Array<(state: SelectionState) => void> = [];
   let running = false;

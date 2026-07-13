@@ -24,6 +24,7 @@
     "vitest": "^4.1.10"
   },
   "dependencies": {
+    "fast-png": "^6.4.0",
     "preact": "^10.29.7",
     "tiff": "^7.1.3"
   },
