@@ -1,0 +1,23 @@
+{
+  "name": "color-grade-plugin",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/KyleNaluan/color-grade-plugin.git"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "spike": "tsx scripts/spike.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^26.1.1",
+    "tsx": "^4.23.1",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.10"
+  },
+  "dependencies": {
+    "tiff": "^7.1.3"
+  }
+}
