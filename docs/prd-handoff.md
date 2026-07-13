@@ -60,4 +60,9 @@ An engine spike is running first: `core/` only, run from Node against exported S
 
 Record the outcome here before the PRD pass:
 
-- [ ] Spike result: (fill in - if grades look generic, expand the overrides layer and treat theme authoring as a bigger workstream in the PRD; if good, themes stay thin data files)
+- [x] Spike result (2026-07-12): Mixed, leaning "expand theme authoring".
+  Stat-matching works when the footage and theme are tonally compatible: cool-noir on the lowlight/night frames produced genuinely keepable grades.
+  It fails when the theme's color bias opposes the footage's (warm theme on cool footage and vice versa): the full LAB mean transfer pushes a heavy global cast with odd colors, and grades read as too strong.
+  Conclusion for the PRD: themes stay data files, but theme authoring is a bigger workstream than "thin target stats".
+  The engine needs (a) footage-aware damping of the a/b mean transfer (move partway toward the target as a function of the distance, instead of full Reinhard transfer), and (b) a richer overrides layer so a look's identity comes mostly from authored overrides (tints, curve shapes, chroma shaping) with stat matching handling tone/normalization.
+  Per-theme tuning against footage families should be treated as real, budgeted work in the PRD.
