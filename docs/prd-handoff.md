@@ -78,7 +78,7 @@ Record the outcome here before the PRD pass:
 The gate is closed; implementation continues in new sessions, not the spike session.
 
 1. Generate the PRD from this handoff (idea.md + CONTEXT.md + ADRs + the spike verdict above).
-2. Generate issues from the PRD for a parallel workflow - issues should be sliceable along the existing seams: `core/` (pure, already spiked and tested), `themes/` (authoring/tuning, real work per the verdict), `panel/`, `host/`/`extendescript` bridge, and the FrameSource render-to-file backend.
+2. Generate issues from the PRD for a parallel workflow - issues should be sliceable along the existing seams: `core/` (pure, already spiked and tested), `themes/` (authoring/tuning, real work per the verdict), `panel/`, `host/`/`extendscript` bridge, and the FrameSource render-to-file backend.
 3. Notes for issue generation:
    - The spike code in `src/core/` and `src/themes/` is a working first cut with 37 passing tests, not throwaway - issues should build on it (refine, don't rewrite).
    - The engine's damped color transfer and the expanded-overrides direction (spike verdict) should be reflected as explicit issues, not folded silently into "engine work".
