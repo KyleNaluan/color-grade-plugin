@@ -55,7 +55,7 @@ Adjusting a knob recomputes the transform and rebakes the LUT from cached stats 
 ## Skin-tone protection
 
 A LUT-construction step: within a soft-edged wedge around the vectorscope skin line in chroma space, the theme transform is attenuated toward identity.
-Activates only when skin presence exceeds a threshold (~2% of pixels near the skin line), and is user-tunable via a protection knob (0-100%, default ~70%; 0% yields the pure theme).
+Activates only when skin presence exceeds a threshold (~2% of pixels near the skin line), and is user-tunable via a protection knob (0-100%, per-theme default ~75%; 0% yields the pure theme).
 Corrective pinning (pulling drifted skin tones back to the skin line) is deliberately deferred as a possible future addition.
 
 ## Project-state folder
