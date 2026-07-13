@@ -12,7 +12,9 @@ import {
  * in the script; the last entry repeats once the script is exhausted.
  * Entries may be snapshots or Errors (rejected calls).
  */
-function fakeBridge(script: Array<SelectionSnapshot | Error>): Bridge {
+type SelectionBridge = Pick<Bridge, 'getSelection'>;
+
+function fakeBridge(script: Array<SelectionSnapshot | Error>): SelectionBridge {
   let calls = 0;
   return {
     getSelection() {
@@ -32,7 +34,7 @@ describe('createSelectionWatcher', () => {
   beforeEach(() => vi.useFakeTimers());
   afterEach(() => vi.useRealTimers());
 
-  const collect = (bridge: Bridge) => {
+  const collect = (bridge: SelectionBridge) => {
     const watcher = createSelectionWatcher(bridge, 500);
     const states: SelectionState[] = [];
     watcher.subscribe((s) => states.push(s));
@@ -95,7 +97,7 @@ describe('createSelectionWatcher', () => {
   it('does not spawn overlapping polls on start/stop/start while a poll is in flight', async () => {
     let resolveInFlight: ((snap: SelectionSnapshot) => void) | undefined;
     let pending = 0;
-    const bridge: Bridge = {
+    const bridge: SelectionBridge = {
       getSelection() {
         pending += 1;
         return new Promise<SelectionSnapshot>((resolve) => {

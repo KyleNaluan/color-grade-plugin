@@ -5,6 +5,7 @@
  * depends on the `Bridge` interface, never on CEP directly, so it can be
  * tested against a scripted fake.
  */
+import type { RenderedFrameRef } from './frameSource';
 
 /** What is selected in the active comp right now. */
 export interface SelectionSnapshot {
@@ -19,6 +20,21 @@ export interface SelectionSnapshot {
 export interface Bridge {
   /** Query the active comp and its selected layer. AE DOM read only. */
   getSelection(): Promise<SelectionSnapshot>;
+
+  /**
+   * The active comp's current-time indicator, in seconds, or null when no
+   * comp is active. The panel uses this to analyze "the current frame".
+   */
+  getCurrentTime(): Promise<number | null>;
+
+  /**
+   * Render the active comp at `time` (seconds) to a temporary file and return
+   * a reference to it. The ExtendScript side renders 16-bit TIFF as the
+   * primary path and falls back to 8-bit PNG, reporting which it produced; the
+   * caller reads the file back through a `FrameFileStore` and deletes it.
+   * AE DOM / render-queue op only - no color math crosses this boundary.
+   */
+  renderFrame(time: number): Promise<RenderedFrameRef>;
 }
 
 /** Raised when the ExtendScript side returns an error or garbage. */
