@@ -92,6 +92,39 @@ describe('createSelectionWatcher', () => {
     expect(states.at(-1)).toMatchObject({ kind: 'layer', layerName: 'Interview A' });
   });
 
+  it('does not spawn overlapping polls on start/stop/start while a poll is in flight', async () => {
+    let resolveInFlight: ((snap: SelectionSnapshot) => void) | undefined;
+    let pending = 0;
+    const bridge: Bridge = {
+      getSelection() {
+        pending += 1;
+        return new Promise<SelectionSnapshot>((resolve) => {
+          if (!resolveInFlight) resolveInFlight = resolve;
+          else resolve(layer('Main Comp', 'Interview A'));
+        });
+      },
+    };
+    const getSelection = vi.spyOn(bridge, 'getSelection');
+    const watcher = createSelectionWatcher(bridge, 500);
+    watcher.start();
+    expect(pending).toBe(1);
+
+    watcher.stop();
+    watcher.start();
+
+    resolveInFlight!(layer('Main Comp', 'Interview A'));
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(500);
+
+    const callsPerInterval: number[] = [];
+    for (let i = 0; i < 4; i++) {
+      const before = getSelection.mock.calls.length;
+      await vi.advanceTimersByTimeAsync(500);
+      callsPerInterval.push(getSelection.mock.calls.length - before);
+    }
+    expect(callsPerInterval).toEqual([1, 1, 1, 1]);
+  });
+
   it('stops polling after stop()', async () => {
     const bridge = fakeBridge([layer('Main Comp', 'Interview A')]);
     const getSelection = vi.spyOn(bridge, 'getSelection');

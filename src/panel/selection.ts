@@ -63,6 +63,7 @@ export function createSelectionWatcher(bridge: Bridge, intervalMs = 500): Select
   let state: SelectionState = { kind: 'loading' };
   let listeners: Array<(state: SelectionState) => void> = [];
   let running = false;
+  let generation = 0;
   let timer: ReturnType<typeof setTimeout> | undefined;
 
   const setState = (next: SelectionState) => {
@@ -71,13 +72,18 @@ export function createSelectionWatcher(bridge: Bridge, intervalMs = 500): Select
     for (const listener of listeners) listener(state);
   };
 
-  const tick = async () => {
+  const tick = async (myGeneration: number) => {
     try {
-      setState(toSelectionState(await bridge.getSelection()));
+      const snapshot = await bridge.getSelection();
+      if (myGeneration !== generation) return;
+      setState(toSelectionState(snapshot));
     } catch (err) {
+      if (myGeneration !== generation) return;
       setState({ kind: 'error', message: err instanceof Error ? err.message : String(err) });
     }
-    if (running) timer = setTimeout(tick, intervalMs);
+    if (running && myGeneration === generation) {
+      timer = setTimeout(() => void tick(myGeneration), intervalMs);
+    }
   };
 
   return {
@@ -92,10 +98,12 @@ export function createSelectionWatcher(bridge: Bridge, intervalMs = 500): Select
     start() {
       if (running) return;
       running = true;
-      void tick();
+      generation += 1;
+      void tick(generation);
     },
     stop() {
       running = false;
+      generation += 1;
       if (timer !== undefined) clearTimeout(timer);
       timer = undefined;
     },
