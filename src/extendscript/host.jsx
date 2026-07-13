@@ -122,16 +122,32 @@ function CG_resolveRenderedFile(requested) {
 /** Render one frame at `time` to 16-bit TIFF via the render queue. */
 function CG_renderFrameToTiff(comp, time) {
   var requested = CG_tempFramePath('.tif');
-  var rqItem = app.project.renderQueue.items.add(comp);
+  var rq = app.project.renderQueue;
+  var rqItem = rq.items.add(comp);
+  // Unqueue every OTHER queued item so render() only renders our frame item;
+  // remember them so they can be restored afterward.
+  var suspended = [];
+  for (var i = 1; i <= rq.numItems; i++) {
+    var other = rq.item(i);
+    if (other !== rqItem && other.status === RQItemStatus.QUEUED) {
+      suspended.push(other);
+      other.render = false;
+    }
+  }
   try {
     rqItem.timeSpanStart = time;
     rqItem.timeSpanDuration = comp.frameDuration; // exactly one frame
     var om = rqItem.outputModule(1);
     om.applyTemplate(CG_TIFF_TEMPLATE);
     om.file = requested;
-    app.project.renderQueue.render();
+    rq.render();
   } finally {
     rqItem.remove();
+    for (var j = 0; j < suspended.length; j++) {
+      try {
+        suspended[j].render = true;
+      } catch (restoreErr) {}
+    }
   }
   return CG_resolveRenderedFile(requested);
 }
