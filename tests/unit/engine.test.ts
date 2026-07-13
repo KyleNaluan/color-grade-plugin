@@ -65,6 +65,25 @@ describe('engine transform', () => {
   });
 });
 
+describe('damped color transfer', () => {
+  it('caps the mean a/b shift when the target opposes the footage (warm theme on cool footage)', () => {
+    const theme = THEMES['warm-film']!;
+    // Fake strongly cool footage stats: mean b far below the warm target.
+    const coolStats = {
+      ...computeStats(syntheticFootage(5000)),
+      lab: { mean: [45, -5, -25] as Vec3, std: [20, 8, 8] as Vec3 },
+    };
+    const t = buildTransform(coolStats, theme, { strength: 1, skinProtection: 0 });
+    // Neutral grey must not be dragged the full ~38 LAB units toward the target;
+    // the tanh soft clamp bounds the shift to ~10 units.
+    const grey: Vec3 = [0.45, 0.45, 0.45];
+    const out = t(grey);
+    // Rough check in RGB: the warm push on grey should be visible but modest.
+    expect(out[0] - out[2]).toBeGreaterThan(0); // warmer, not cooler
+    expect(out[0] - out[2]).toBeLessThan(0.15); // but nowhere near a full cast
+  });
+});
+
 describe('skin wedge', () => {
   it('weights a canonical skin tone highly and a blue sky at zero', () => {
     // LAB of a typical skin patch (~L 65, hue ~45deg).

@@ -76,10 +76,20 @@ export function buildTransform(src: FootageStats, theme: Theme, opts: EngineOpti
 
   const toneCurve = buildToneCurve(src, tgt);
 
-  // Reinhard-style stat transfer in a/b, with std ratios clamped so degenerate
-  // (near-neutral) footage cannot explode chroma.
-  const kA = clamp(tgt.lab.std[1] / Math.max(tgt.lab.std[1] * 0.1, src.lab.std[1], 1e-3), 0.4, 2.2);
-  const kB = clamp(tgt.lab.std[2] / Math.max(tgt.lab.std[2] * 0.1, src.lab.std[2], 1e-3), 0.4, 2.2);
+  // Damped stat transfer in a/b: the target LAB mean is an attractor, not a
+  // destination. The mean shift magnitude is soft-clamped (tanh) so a theme
+  // whose color bias opposes the footage's cannot drag the whole image across
+  // neutral as one full-distance global cast - the spike's main failure mode.
+  const MAX_MEAN_SHIFT = 10; // LAB units
+  const dA = tgt.lab.mean[1] - src.lab.mean[1];
+  const dB = tgt.lab.mean[2] - src.lab.mean[2];
+  const dist = Math.hypot(dA, dB);
+  const damp = dist > 1e-6 ? (MAX_MEAN_SHIFT * Math.tanh(dist / MAX_MEAN_SHIFT)) / dist : 1;
+  const shiftA = dA * damp;
+  const shiftB = dB * damp;
+  // Std ratios clamped tighter than before so chroma spread changes stay gentle.
+  const kA = clamp(tgt.lab.std[1] / Math.max(tgt.lab.std[1] * 0.1, src.lab.std[1], 1e-3), 0.6, 1.8);
+  const kB = clamp(tgt.lab.std[2] / Math.max(tgt.lab.std[2] * 0.1, src.lab.std[2], 1e-3), 0.6, 1.8);
 
   // Per-tonal-band chroma scale toward target band chroma.
   const bandScale: Vec3 = [
@@ -104,8 +114,8 @@ export function buildTransform(src: FootageStats, theme: Theme, opts: EngineOpti
     // 2. Color in LAB.
     const labIn = linearRec709ToLab([rec709Decode(rIn), rec709Decode(gIn), rec709Decode(bIn)]);
     const lab = linearRec709ToLab([rec709Decode(r1), rec709Decode(g1), rec709Decode(b1)]);
-    let a = (lab[1] - src.lab.mean[1]) * kA + tgt.lab.mean[1];
-    let bb = (lab[2] - src.lab.mean[2]) * kB + tgt.lab.mean[2];
+    let a = (lab[1] - src.lab.mean[1]) * kA + src.lab.mean[1] + shiftA;
+    let bb = (lab[2] - src.lab.mean[2]) * kB + src.lab.mean[2] + shiftB;
 
     // 3. Per-band chroma scaling + overrides.
     const y1 = luma709(r1, g1, b1);

@@ -66,3 +66,6 @@ Record the outcome here before the PRD pass:
   Conclusion for the PRD: themes stay data files, but theme authoring is a bigger workstream than "thin target stats".
   The engine needs (a) footage-aware damping of the a/b mean transfer (move partway toward the target as a function of the distance, instead of full Reinhard transfer), and (b) a richer overrides layer so a look's identity comes mostly from authored overrides (tints, curve shapes, chroma shaping) with stat matching handling tone/normalization.
   Per-theme tuning against footage families should be treated as real, budgeted work in the PRD.
+
+  Iteration 2 (same day): engine updated with distance-damped color transfer - the LAB mean shift is soft-clamped (tanh, ~10 LAB units max) so opposed footage/theme pairs get a modest push instead of a full-distance global cast, and std ratios are clamped tighter (0.6-1.8).
+  Regenerated .cube set awaiting a second AE evaluation pass; result to be appended here.
