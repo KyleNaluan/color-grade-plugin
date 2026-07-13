@@ -167,12 +167,14 @@ function CG_renderFrameToTiff(comp, time) {
     CG_deleteFrameFiles(requested);
     throw renderErr;
   } finally {
-    rqItem.remove();
     for (var j = 0; j < suspended.length; j++) {
       try {
         suspended[j].render = true;
       } catch (restoreErr) {}
     }
+    try {
+      rqItem.remove();
+    } catch (removeErr) {}
   }
   return CG_resolveRenderedFile(requested);
 }
