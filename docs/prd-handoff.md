@@ -68,4 +68,7 @@ Record the outcome here before the PRD pass:
   Per-theme tuning against footage families should be treated as real, budgeted work in the PRD.
 
   Iteration 2 (same day): engine updated with distance-damped color transfer - the LAB mean shift is soft-clamped (tanh, ~10 LAB units max) so opposed footage/theme pairs get a modest push instead of a full-distance global cast, and std ratios are clamped tighter (0.6-1.8).
-  Regenerated .cube set awaiting a second AE evaluation pass; result to be appended here.
+  Second AE evaluation pass (2026-07-12): damping is a clear improvement - opposed-temperature grades are noticeably less bad but still off.
+  Accepted as-is for now: Kyle does not plan to use drastic temperature-change grades on his footage, so cross-temperature robustness is not a v1 quality gate.
+  Final verdict for the PRD: stat matching produces a keepable starting grade when footage and theme are tonally compatible (cool-noir on lowlight/night was genuinely good).
+  Themes stay data files, but the PRD should (a) budget theme authoring/tuning as real work, (b) keep the expanded overrides layer as the main carrier of a look's identity, and (c) treat cross-temperature matching as a known limitation, revisited only if it starts hurting real usage.
