@@ -1,13 +1,23 @@
 /*
- * ColorGrade.cpp - Phase 1 native Color Grade effect: a SmartFX LUT-apply effect.
+ * ColorGrade.cpp - native Color Grade effect: a SmartFX LUT-apply effect.
  *
  * Registers in AE 2025, drags onto a layer, and applies a baked 3D LUT to pixels
  * through the ported trilinear sampleLut (lut/CubeLut.h). CPU Smart Render is the
  * mandatory path; the DirectX GPU path (HAS_HLSL) accelerates it - see ColorGradeGPU.inc.
  *
- * LUT source (param): "Embedded (Teal-Orange)" uses the compiled-in default; "External
- * .cube file" loads from the env var CG_LUT_PATH, else <pluginDir>/ColorGrade_LUT.cube,
- * falling back to the embedded LUT on any failure (so render never fails for a bad path).
+ * LUT source (param):
+ *   - "Auto (Theme + Analysis)" bakes the grade LUT in-effect from the ported
+ *     engine: buildTransform(recipe source stats, selected theme + chroma-gain
+ *     override, {strength, skinProtection sliders}) baked at CG_GRADE_LUT_SIZE.
+ *     The grade recipe (measured stats + the full typed knob space) is persisted
+ *     as an arb-data param (see the PF_Cmd_ARBITRARY_CALLBACK handler); AE stores
+ *     it in the project. Analysis that populates real footage stats is a later
+ *     phase - the default recipe seeds neutral placeholder stats.
+ *   - "Embedded (Teal-Orange)" uses the compiled-in default LUT.
+ *   - "External .cube file" loads from env CG_LUT_PATH, else <pluginDir>/ColorGrade_LUT.cube,
+ *     falling back to the embedded LUT on any failure (so render never fails for a bad path).
+ * The Auto path bakes strength into the LUT (post-LUT blend = 1.0); the embedded/
+ * external paths blend by the strength slider, preserving Phase 1 behaviour.
  */
 
 // cuda_runtime.h must precede ColorGrade.h: it defines MAJOR_VERSION/MINOR_VERSION macros
@@ -24,6 +34,7 @@
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <cstring>
 #include <new>
 
 // Debug-only path tracer: prints to the debugger / DebugView so the active render
@@ -90,6 +101,187 @@ static void ResolveLut(A_long source, cg::Lut3D& dst) {
     dst = cg::EmbeddedLut();
 }
 
+/* ===================== Auto bake (theme + engine) ======================== */
+
+// Map the theme popup (1-based) to a ported built-in theme.
+static cg::core::Theme ThemeFromPopup(A_long themePopup) {
+    switch (themePopup) {
+        case CG_THEME_WARM: return cg::core::warmFilmTheme();
+        case CG_THEME_COOL: return cg::core::coolNoirTheme();
+        case CG_THEME_TEAL:
+        default: return cg::core::tealOrangeTheme();
+    }
+}
+
+// Bake the Auto-mode grade LUT natively: the popup theme supplies the look, the
+// arb-data recipe supplies the measured source stats, and the sliders drive the
+// engine knobs (strength / skinProtection as EngineOptions, chroma-gain as a
+// relative multiplier on the theme's authored chromaGain). This is the in-effect
+// counterpart to the TS bakeGradeLut; the cross-engine golden harness proves the
+// two agree. The chromaGain arg is the slider fraction (slider/100), so 100% (=1.0)
+// preserves each theme's authored chromaGain exactly and the slider scales from there.
+static void BakeAutoLut(A_long themePopup, double strength01, double skin01, double chromaGain,
+                        const cg::core::RecipeData& recipe, cg::Lut3D& dst) {
+    cg::core::Theme theme = ThemeFromPopup(themePopup);
+    cg::core::ThemeOverrides ov = theme.overrides.value_or(cg::core::ThemeOverrides{});
+    const double authored = ov.chromaGain.value_or(1.0);
+    ov.chromaGain = authored * chromaGain;  // slider scales the theme's authored gain
+    theme.overrides = ov;
+
+    cg::core::FootageStats src = cg::core::statsFromData(recipe.sourceStats);
+    cg::core::EngineOptions opts;
+    opts.strength = strength01;
+    opts.skinProtection = skin01;
+    dst = cg::core::bakeGradeLut(src, theme, opts, CG_GRADE_LUT_SIZE);
+}
+
+/* ========================== Arb-data (recipe) ============================ */
+//
+// The grade recipe is a flat POD (cg::core::RecipeData). AE persists it in the
+// project and hands it back at render time. All the arb callbacks reduce to a
+// byte copy because the struct has no pointers; the refcon guard rejects a blob
+// meant for a different param, and NEW/UNFLATTEN seed/validate the magic+version.
+// Pattern mirrors the SDK ColorGrid sample's arb handler.
+
+using cg::core::RecipeData;
+
+// Allocate a default recipe handle: the teal-orange theme over neutral placeholder
+// source stats (its own target stats), until in-effect analysis populates real ones.
+static PF_Err CreateDefaultRecipe(PF_InData* in_data, PF_ArbitraryH* arbPH) {
+    PF_Err err = PF_Err_NONE;
+    PF_Handle arbH = PF_NEW_HANDLE(sizeof(RecipeData));
+    if (!arbH) return PF_Err_OUT_OF_MEMORY;
+    RecipeData* p = reinterpret_cast<RecipeData*>(PF_LOCK_HANDLE(arbH));
+    if (!p) {
+        err = PF_Err_OUT_OF_MEMORY;
+    } else {
+        cg::core::Theme th = cg::core::tealOrangeTheme();
+        RecipeData def = cg::core::recipeFromTheme(th, th.targetStats);
+        std::memcpy(p, &def, sizeof(RecipeData));
+        *arbPH = arbH;
+        PF_UNLOCK_HANDLE(arbH);
+    }
+    return err;
+}
+
+static PF_Err HandleArbitrary(PF_InData* in_data, PF_OutData* out_data, PF_ArbParamsExtra* extra) {
+    PF_Err err = PF_Err_NONE;
+    switch (extra->which_function) {
+        case PF_Arbitrary_NEW_FUNC:
+            if (extra->u.new_func_params.refconPV != CG_ARB_REFCON) return PF_Err_INTERNAL_STRUCT_DAMAGED;
+            err = CreateDefaultRecipe(in_data, extra->u.new_func_params.arbPH);
+            break;
+        case PF_Arbitrary_DISPOSE_FUNC:
+            if (extra->u.dispose_func_params.refconPV != CG_ARB_REFCON) return PF_Err_INTERNAL_STRUCT_DAMAGED;
+            PF_DISPOSE_HANDLE(extra->u.dispose_func_params.arbH);
+            break;
+        case PF_Arbitrary_COPY_FUNC: {
+            if (extra->u.copy_func_params.refconPV != CG_ARB_REFCON) return PF_Err_INTERNAL_STRUCT_DAMAGED;
+            err = CreateDefaultRecipe(in_data, extra->u.copy_func_params.dst_arbPH);
+            if (!err) {
+                RecipeData* srcP = reinterpret_cast<RecipeData*>(PF_LOCK_HANDLE(extra->u.copy_func_params.src_arbH));
+                RecipeData* dstP = reinterpret_cast<RecipeData*>(PF_LOCK_HANDLE(*extra->u.copy_func_params.dst_arbPH));
+                if (srcP && dstP) std::memcpy(dstP, srcP, sizeof(RecipeData));
+                PF_UNLOCK_HANDLE(extra->u.copy_func_params.src_arbH);
+                PF_UNLOCK_HANDLE(*extra->u.copy_func_params.dst_arbPH);
+            }
+            break;
+        }
+        case PF_Arbitrary_FLAT_SIZE_FUNC:
+            *(extra->u.flat_size_func_params.flat_data_sizePLu) = sizeof(RecipeData);
+            break;
+        case PF_Arbitrary_FLATTEN_FUNC:
+            if (extra->u.flatten_func_params.buf_sizeLu >= sizeof(RecipeData)) {
+                RecipeData* srcP = reinterpret_cast<RecipeData*>(PF_LOCK_HANDLE(extra->u.flatten_func_params.arbH));
+                if (srcP) std::memcpy(extra->u.flatten_func_params.flat_dataPV, srcP, sizeof(RecipeData));
+                PF_UNLOCK_HANDLE(extra->u.flatten_func_params.arbH);
+            }
+            break;
+        case PF_Arbitrary_UNFLATTEN_FUNC: {
+            PF_Handle handle = PF_NEW_HANDLE(sizeof(RecipeData));
+            if (!handle) return PF_Err_OUT_OF_MEMORY;
+            RecipeData* dstP = reinterpret_cast<RecipeData*>(PF_LOCK_HANDLE(handle));
+            if (dstP) {
+                // Only trust a blob whose size matches; otherwise (foreign/older/grown
+                // struct) it is unusable, so reseed to the default recipe. Never leave
+                // *arbPH unset - AE must always receive a valid handle.
+                bool usable = extra->u.unflatten_func_params.buf_sizeLu == sizeof(RecipeData);
+                if (usable) {
+                    std::memcpy(dstP, extra->u.unflatten_func_params.flat_dataPV, sizeof(RecipeData));
+                    usable = dstP->magic == cg::core::RECIPE_MAGIC && dstP->version == cg::core::RECIPE_VERSION;
+                }
+                if (!usable) {
+                    cg::core::Theme th = cg::core::tealOrangeTheme();
+                    RecipeData def = cg::core::recipeFromTheme(th, th.targetStats);
+                    std::memcpy(dstP, &def, sizeof(RecipeData));
+                }
+            }
+            *(extra->u.unflatten_func_params.arbPH) = handle;
+            PF_UNLOCK_HANDLE(handle);
+            break;
+        }
+        case PF_Arbitrary_INTERP_FUNC:
+            // No meaningful tween for a grade recipe; snap to the left keyframe.
+            err = CreateDefaultRecipe(in_data, extra->u.interp_func_params.interpPH);
+            if (!err) {
+                RecipeData* lP = reinterpret_cast<RecipeData*>(PF_LOCK_HANDLE(extra->u.interp_func_params.left_arbH));
+                RecipeData* iP = reinterpret_cast<RecipeData*>(PF_LOCK_HANDLE(*extra->u.interp_func_params.interpPH));
+                if (lP && iP) std::memcpy(iP, lP, sizeof(RecipeData));
+                PF_UNLOCK_HANDLE(extra->u.interp_func_params.left_arbH);
+                PF_UNLOCK_HANDLE(*extra->u.interp_func_params.interpPH);
+            }
+            break;
+        case PF_Arbitrary_COMPARE_FUNC: {
+            RecipeData* aP = reinterpret_cast<RecipeData*>(PF_LOCK_HANDLE(extra->u.compare_func_params.a_arbH));
+            RecipeData* bP = reinterpret_cast<RecipeData*>(PF_LOCK_HANDLE(extra->u.compare_func_params.b_arbH));
+            *extra->u.compare_func_params.compareP =
+                (aP && bP && std::memcmp(aP, bP, sizeof(RecipeData)) == 0) ? PF_ArbCompare_EQUAL
+                                                                          : PF_ArbCompare_NOT_EQUAL;
+            PF_UNLOCK_HANDLE(extra->u.compare_func_params.a_arbH);
+            PF_UNLOCK_HANDLE(extra->u.compare_func_params.b_arbH);
+            break;
+        }
+        case PF_Arbitrary_PRINT_SIZE_FUNC:
+            *extra->u.print_size_func_params.print_sizePLu = 0;  // no text representation
+            break;
+        case PF_Arbitrary_PRINT_FUNC:
+        case PF_Arbitrary_SCAN_FUNC:
+            break;  // binary-only arb data: no text print/scan
+    }
+    return err;
+}
+
+/* ==================== Render-data resolution (shared) ==================== */
+
+// Copy the grade recipe out of its arb handle (falling back to the default
+// recipe if the handle is missing), so callers can checkin the param safely.
+static RecipeData RecipeFromHandle(PF_InData* in_data, PF_ArbitraryH h) {
+    if (h) {
+        RecipeData* rp = reinterpret_cast<RecipeData*>(PF_LOCK_HANDLE(h));
+        if (rp) {
+            RecipeData copy = *rp;
+            PF_UNLOCK_HANDLE(h);
+            return copy;
+        }
+    }
+    cg::core::Theme th = cg::core::tealOrangeTheme();
+    return cg::core::recipeFromTheme(th, th.targetStats);
+}
+
+// Resolve the LUT + post-blend for a frame from the resolved param values. Auto
+// bakes natively (strength baked in); embedded/external keep the Phase 1 blend.
+static void ResolveRenderData(PF_InData* in_data, A_long source, A_long themePopup,
+                              double strength01, double skin01, double chromaGain,
+                              const RecipeData& recipe, CG_RenderData& d) {
+    if (source == CG_SRC_AUTO) {
+        BakeAutoLut(themePopup, strength01, skin01, chromaGain, recipe, d.lut);
+        d.applyStrength = 1.0f;
+    } else {
+        ResolveLut(source, d.lut);
+        d.applyStrength = static_cast<float>(strength01);
+    }
+}
+
 /* =============================== Setup =================================== */
 
 static PF_Err About(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef*[], PF_LayerDef*) {
@@ -124,6 +316,17 @@ static PF_Err ParamsSetup(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef*
     PF_Err err = PF_Err_NONE;
     PF_ParamDef def;
 
+    // Order must match the CG_* param enum (after CG_INPUT).
+    // SUPERVISE so AE sends PF_Cmd_USER_CHANGED_PARAM when the theme changes; that
+    // handler resets the Strength/Skin sliders to the new theme's authored knobs.
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_POPUPX("Theme",
+                  3 /* num choices */,
+                  CG_THEME_TEAL,
+                  CG_THEME_CHOICES,
+                  PF_ParamFlag_SUPERVISE,
+                  CG_THEME);
+
     AEFX_CLR_STRUCT(def);
     PF_ADD_FLOAT_SLIDERX("Strength",
                          CG_STRENGTH_MIN, CG_STRENGTH_MAX,
@@ -133,14 +336,65 @@ static PF_Err ParamsSetup(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef*
                          CG_STRENGTH);
 
     AEFX_CLR_STRUCT(def);
+    PF_ADD_FLOAT_SLIDERX("Skin Protection",
+                         CG_SKIN_MIN, CG_SKIN_MAX,
+                         CG_SKIN_MIN, CG_SKIN_MAX,
+                         CG_SKIN_DFLT,
+                         1, PF_ValueDisplayFlag_PERCENT, 0,
+                         CG_SKIN_PROTECTION);
+
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_FLOAT_SLIDERX("Chroma Gain",
+                         CG_CHROMA_MIN, CG_CHROMA_MAX,
+                         CG_CHROMA_MIN, CG_CHROMA_SLIDER_MAX,
+                         CG_CHROMA_DFLT,
+                         1, PF_ValueDisplayFlag_PERCENT, 0,
+                         CG_CHROMA_GAIN);
+
+    AEFX_CLR_STRUCT(def);
     PF_ADD_POPUP("LUT Source",
-                 2 /* num choices */,
-                 CG_SRC_EMBEDDED,
+                 3 /* num choices */,
+                 CG_SRC_AUTO,
                  CG_LUT_SOURCE_CHOICES,
                  CG_LUT_SOURCE);
 
+    // Grade recipe: measured stats + full typed knob space, persisted as arb-data.
+    // No custom UI (data only, seeded from the theme); AE stores it in the project.
+    AEFX_CLR_STRUCT(def);
+    ERR(CreateDefaultRecipe(in_data, &def.u.arb_d.dephault));
+    if (!err) {
+        // Data-only arb param: ui_width/height MUST be 0 and PF_PUI_NO_ECW_UI set,
+        // or AE warns "no custom ui outflag, but param has ui_width/height..."
+        // (25::37) and "Unsupported effect control!". NO_ECW_UI needs no
+        // PF_OutFlag_CUSTOM_UI (SDK AE_Effect.h) - the recipe is set programmatically.
+        PF_ADD_ARBITRARY2("Grade Recipe",
+                          0, 0,
+                          PF_ParamFlag_CANNOT_TIME_VARY,
+                          PF_PUI_NO_ECW_UI,
+                          def.u.arb_d.dephault,
+                          CG_ARB_ID,
+                          CG_ARB_REFCON);
+    }
+
     out_data->num_params = CG_NUM_PARAMS;
     return err;
+}
+
+// The Theme popup is a supervised preset selector: switching it snaps the Strength
+// and Skin Protection sliders to the newly-selected theme's authored knob defaults.
+// This intentionally overwrites any manual Strength/Skin adjustments (captain's
+// decision - a theme is a preset). The Chroma Gain slider is untouched: it is a
+// relative multiplier (100% = the theme's authored chromaGain), so it needs no reset.
+static PF_Err UserChangedParam(PF_InData* in_data, PF_OutData* out_data,
+                               PF_ParamDef* params[], PF_UserChangedParamExtra* extra) {
+    if (extra->param_index == CG_THEME) {
+        cg::core::Theme theme = ThemeFromPopup(params[CG_THEME]->u.pd.value);
+        params[CG_STRENGTH]->u.fs_d.value = theme.knobs.strengthDefault * 100.0;
+        params[CG_STRENGTH]->uu.change_flags |= PF_ChangeFlag_CHANGED_VALUE;
+        params[CG_SKIN_PROTECTION]->u.fs_d.value = theme.knobs.skinProtectionDefault * 100.0;
+        params[CG_SKIN_PROTECTION]->uu.change_flags |= PF_ChangeFlag_CHANGED_VALUE;
+    }
+    return PF_Err_NONE;
 }
 
 /* ========================= Per-pixel LUT apply =========================== */
@@ -157,7 +411,7 @@ static inline void ApplyLut(const cg::Lut3D& lut, float strength,
 
 static PF_Err FilterImage32(void* refcon, A_long, A_long, PF_PixelFloat* inP, PF_PixelFloat* outP) {
     CG_RenderData* d = reinterpret_cast<CG_RenderData*>(refcon);
-    ApplyLut(d->lut, d->strength, inP->red, inP->green, inP->blue, outP->red, outP->green, outP->blue);
+    ApplyLut(d->lut, d->applyStrength, inP->red, inP->green, inP->blue, outP->red, outP->green, outP->blue);
     outP->alpha = inP->alpha;
     return PF_Err_NONE;
 }
@@ -166,7 +420,7 @@ static PF_Err FilterImage16(void* refcon, A_long, A_long, PF_Pixel16* inP, PF_Pi
     CG_RenderData* d = reinterpret_cast<CG_RenderData*>(refcon);
     const float k = 32768.0f;  // AE 16-bit max channel value
     float r, g, b;
-    ApplyLut(d->lut, d->strength, inP->red / k, inP->green / k, inP->blue / k, r, g, b);
+    ApplyLut(d->lut, d->applyStrength, inP->red / k, inP->green / k, inP->blue / k, r, g, b);
     auto to16 = [k](float v) -> A_u_short {
         float s = v * k + 0.5f;
         if (s < 0.0f) s = 0.0f;
@@ -182,7 +436,7 @@ static PF_Err FilterImage8(void* refcon, A_long, A_long, PF_Pixel8* inP, PF_Pixe
     CG_RenderData* d = reinterpret_cast<CG_RenderData*>(refcon);
     const float k = 255.0f;
     float r, g, b;
-    ApplyLut(d->lut, d->strength, inP->red / k, inP->green / k, inP->blue / k, r, g, b);
+    ApplyLut(d->lut, d->applyStrength, inP->red / k, inP->green / k, inP->blue / k, r, g, b);
     auto to8 = [k](float v) -> A_u_char {
         float s = v * k + 0.5f;
         if (s < 0.0f) s = 0.0f;
@@ -201,8 +455,13 @@ static PF_Err FilterImage8(void* refcon, A_long, A_long, PF_Pixel8* inP, PF_Pixe
 static PF_Err LegacyRender(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* params[], PF_LayerDef* output) {
     PF_Err err = PF_Err_NONE;
     CG_RenderData data;
-    data.strength = static_cast<float>(params[CG_STRENGTH]->u.fs_d.value / 100.0);
-    ResolveLut(params[CG_LUT_SOURCE]->u.pd.value, data.lut);
+    const double strength01 = params[CG_STRENGTH]->u.fs_d.value / 100.0;
+    const double skin01 = params[CG_SKIN_PROTECTION]->u.fs_d.value / 100.0;
+    const double chromaGain = params[CG_CHROMA_GAIN]->u.fs_d.value / 100.0;
+    const A_long theme = params[CG_THEME]->u.pd.value;
+    const A_long source = params[CG_LUT_SOURCE]->u.pd.value;
+    const RecipeData recipe = RecipeFromHandle(in_data, params[CG_RECIPE]->u.arb_d.value);
+    ResolveRenderData(in_data, source, theme, strength01, skin01, chromaGain, recipe, data);
 
     PF_EffectWorld* input = &params[CG_INPUT]->u.ld;
     AEFX_SuiteScoper<PF_Iterate8Suite2> iterate8(in_data, kPFIterate8Suite, kPFIterate8SuiteVersion2, out_data);
@@ -217,7 +476,7 @@ static void DisposePreRenderData(void* pv) {
 }
 
 static PF_Err PreRender(PF_InData* in_data, PF_OutData* out_data, PF_PreRenderExtra* extra) {
-    PF_Err err = PF_Err_NONE;
+    PF_Err err = PF_Err_NONE, err2 = PF_Err_NONE;
     PF_CheckoutResult in_result;
     PF_RenderRequest req = extra->input->output_request;
 
@@ -229,15 +488,37 @@ static PF_Err PreRender(PF_InData* in_data, PF_OutData* out_data, PF_PreRenderEx
     PF_ParamDef p;
     AEFX_CLR_STRUCT(p);
     ERR(PF_CHECKOUT_PARAM(in_data, CG_STRENGTH, in_data->current_time, in_data->time_step, in_data->time_scale, &p));
-    d->strength = static_cast<float>(p.u.fs_d.value / 100.0);
+    const double strength01 = p.u.fs_d.value / 100.0;
+    ERR2(PF_CHECKIN_PARAM(in_data, &p));
+
+    AEFX_CLR_STRUCT(p);
+    ERR(PF_CHECKOUT_PARAM(in_data, CG_SKIN_PROTECTION, in_data->current_time, in_data->time_step, in_data->time_scale, &p));
+    const double skin01 = p.u.fs_d.value / 100.0;
+    ERR2(PF_CHECKIN_PARAM(in_data, &p));
+
+    AEFX_CLR_STRUCT(p);
+    ERR(PF_CHECKOUT_PARAM(in_data, CG_CHROMA_GAIN, in_data->current_time, in_data->time_step, in_data->time_scale, &p));
+    const double chromaGain = p.u.fs_d.value / 100.0;
+    ERR2(PF_CHECKIN_PARAM(in_data, &p));
+
+    AEFX_CLR_STRUCT(p);
+    ERR(PF_CHECKOUT_PARAM(in_data, CG_THEME, in_data->current_time, in_data->time_step, in_data->time_scale, &p));
+    const A_long theme = p.u.pd.value;
     ERR2(PF_CHECKIN_PARAM(in_data, &p));
 
     AEFX_CLR_STRUCT(p);
     ERR(PF_CHECKOUT_PARAM(in_data, CG_LUT_SOURCE, in_data->current_time, in_data->time_step, in_data->time_scale, &p));
-    A_long source = p.u.pd.value;
+    const A_long source = p.u.pd.value;
     ERR2(PF_CHECKIN_PARAM(in_data, &p));
 
-    ResolveLut(source, d->lut);
+    // Copy the grade recipe out of its arb handle before checkin (the handle is
+    // only valid while checked out).
+    AEFX_CLR_STRUCT(p);
+    ERR(PF_CHECKOUT_PARAM(in_data, CG_RECIPE, in_data->current_time, in_data->time_step, in_data->time_scale, &p));
+    const RecipeData recipe = RecipeFromHandle(in_data, p.u.arb_d.value);
+    ERR2(PF_CHECKIN_PARAM(in_data, &p));
+
+    ResolveRenderData(in_data, source, theme, strength01, skin01, chromaGain, recipe, *d);
 
     extra->output->pre_render_data = d;
     extra->output->delete_pre_render_data_func = DisposePreRenderData;
@@ -341,6 +622,12 @@ PF_Err EffectMain(PF_Cmd cmd, PF_InData* in_data, PF_OutData* out_data,
                 break;
             case PF_Cmd_PARAMS_SETUP:
                 err = ParamsSetup(in_data, out_data, params, output);
+                break;
+            case PF_Cmd_ARBITRARY_CALLBACK:
+                err = HandleArbitrary(in_data, out_data, (PF_ArbParamsExtra*)extra);
+                break;
+            case PF_Cmd_USER_CHANGED_PARAM:
+                err = UserChangedParam(in_data, out_data, params, (PF_UserChangedParamExtra*)extra);
                 break;
 #if HAS_ANY_GPU
             case PF_Cmd_GPU_DEVICE_SETUP:

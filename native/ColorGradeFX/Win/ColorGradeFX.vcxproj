@@ -69,7 +69,7 @@
     <ClCompile>
       <Optimization>Disabled</Optimization>
       <AdditionalIncludeDirectories>$(CG_ExtraIncludes)$(AE_SDK_EXAMPLES)\Headers;$(AE_SDK_EXAMPLES)\Headers\SP;$(AE_SDK_EXAMPLES)\Headers\Win;$(AE_SDK_EXAMPLES)\Resources;$(AE_SDK_EXAMPLES)\Util;$(AE_SDK_EXAMPLES)\GPUUtils;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
-      <PreprocessorDefinitions>$(CG_ExtraDefines)MSWindows;WIN32;_DEBUG;_WINDOWS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>$(CG_ExtraDefines)NOMINMAX;MSWindows;WIN32;_DEBUG;_WINDOWS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <RuntimeLibrary>MultiThreadedDebugDLL</RuntimeLibrary>
       <LanguageStandard>stdcpp17</LanguageStandard>
       <WarningLevel>Level3</WarningLevel>
@@ -101,7 +101,7 @@
       <FunctionLevelLinking>true</FunctionLevelLinking>
       <IntrinsicFunctions>true</IntrinsicFunctions>
       <AdditionalIncludeDirectories>$(CG_ExtraIncludes)$(AE_SDK_EXAMPLES)\Headers;$(AE_SDK_EXAMPLES)\Headers\SP;$(AE_SDK_EXAMPLES)\Headers\Win;$(AE_SDK_EXAMPLES)\Resources;$(AE_SDK_EXAMPLES)\Util;$(AE_SDK_EXAMPLES)\GPUUtils;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
-      <PreprocessorDefinitions>$(CG_ExtraDefines)MSWindows;WIN32;NDEBUG;_WINDOWS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>$(CG_ExtraDefines)NOMINMAX;MSWindows;WIN32;NDEBUG;_WINDOWS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary>
       <LanguageStandard>stdcpp17</LanguageStandard>
       <WarningLevel>Level3</WarningLevel>

@@ -198,7 +198,7 @@ static PF_Err SmartRenderGPU(PF_InData* in_data, PF_OutData* out_data, PF_PixelF
     params.mDstPitch = dst_row_bytes / bytes_per_pixel;
     params.m16f = 0;  // BGRA128 is 32f
     params.mLutSize = d->lut.size;
-    params.mStrength = d->strength;
+    params.mStrength = d->applyStrength;
 
 #if HAS_CUDA
     if (!err && extra->input->what_gpu == PF_GPU_Framework_CUDA) {

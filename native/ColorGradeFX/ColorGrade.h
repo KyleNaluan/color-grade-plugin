@@ -45,38 +45,72 @@
 
 #include "lut/CubeLut.h"
 #include "embedded/EmbeddedLut.h"
+#include "core/Recipe.h"   // POD grade recipe (arb-data) + in-effect bake
+#include "core/Themes.h"   // ported shipping themes (getTheme by name)
 
-#define DESCRIPTION "\nApplies a baked 3D LUT (Color Grade). Phase 1 native re-platform."
+#define DESCRIPTION "\nApplies a Color Grade (theme + analysis, baked natively). Phase 2 native re-platform."
 #define NAME        "CG Color Grade"
 #define MAJOR_VERSION  1
-#define MINOR_VERSION  0
+#define MINOR_VERSION  1
 #define BUG_VERSION    0
 #define STAGE_VERSION  PF_Stage_DEVELOP
 #define BUILD_VERSION  1
 
+// Param order. Phase 2 adds the theme popup, the skin-protection + chroma-gain
+// knob sliders, and the grade-recipe arb-data param (measured stats + the full
+// typed knob space). Pre-release, so reordering vs Phase 1 is fine.
 enum {
     CG_INPUT = 0,
+    CG_THEME,
     CG_STRENGTH,
+    CG_SKIN_PROTECTION,
+    CG_CHROMA_GAIN,
     CG_LUT_SOURCE,
+    CG_RECIPE,
     CG_NUM_PARAMS
 };
 
-// Popup order (1-based in AE).
+// Theme popup order (1-based in AE); maps to cg::core::getTheme keys.
 enum {
-    CG_SRC_EMBEDDED = 1,
+    CG_THEME_TEAL = 1,
+    CG_THEME_WARM,
+    CG_THEME_COOL
+};
+#define CG_THEME_CHOICES "Teal-Orange|Warm-Film|Cool-Noir"
+
+// LUT-source popup order (1-based). Auto bakes the grade from theme + recipe.
+enum {
+    CG_SRC_AUTO = 1,
+    CG_SRC_EMBEDDED,
     CG_SRC_EXTERNAL
 };
+#define CG_LUT_SOURCE_CHOICES "Auto (Theme + Analysis)|Embedded (Teal-Orange)|External .cube file"
 
 #define CG_STRENGTH_MIN    0
 #define CG_STRENGTH_MAX    100
-#define CG_STRENGTH_DFLT   100
+#define CG_STRENGTH_DFLT   80    // mirrors the default theme's authored strength (teal-orange 0.8)
 
-#define CG_LUT_SOURCE_CHOICES "Embedded (Teal-Orange)|External .cube file"
+#define CG_SKIN_MIN        0
+#define CG_SKIN_MAX        100
+#define CG_SKIN_DFLT       78    // mirrors the default theme's authored skinProtection (teal-orange 0.78)
 
-// Data passed from PreRender to (Smart)Render. Owns a parsed LUT for this frame.
+// Chroma gain as a percentage: 100% = 1.0 (theme default), <100 mutes, >100 boosts.
+#define CG_CHROMA_MIN      0
+#define CG_CHROMA_MAX      300
+#define CG_CHROMA_SLIDER_MAX 200
+#define CG_CHROMA_DFLT     100
+
+// arb-data identity: unique id + refcon guard (see the arb callbacks).
+#define CG_ARB_ID          1
+#define CG_ARB_REFCON      (reinterpret_cast<void*>(static_cast<uintptr_t>(0xC0107ADEULL)))
+
+// Which grid the in-effect Auto bake uses (matches the TS grade default).
+#define CG_GRADE_LUT_SIZE  33
+
+// Data passed from PreRender to (Smart)Render. Owns a parsed/baked LUT for this frame.
 struct CG_RenderData {
-    cg::Lut3D lut;      // resolved LUT (embedded or external)
-    float     strength; // 0..1
+    cg::Lut3D lut;            // resolved LUT (auto-baked, embedded, or external)
+    float     applyStrength;  // post-LUT blend: 1.0 for Auto (strength is baked in), else the slider
 };
 
 extern "C" {
