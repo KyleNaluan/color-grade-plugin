@@ -397,6 +397,36 @@ function main(): void {
     }
   }
 
+  // --- Embedded/External V-Log partial-Strength composition parity (effect
+  //     ComposeDecodeIntoLut + strength baked in): the decoded-space blend
+  //     newLut(x) = lerp(decode(x), rawLut(decode(x)), s). Proves s<100% agrees
+  //     with the oracle (no raw-log term left in the blend). ---
+  for (const [themeName, theme] of Object.entries(THEMES)) {
+    for (const f of frames) {
+      const stats = computeStats(f.pixels);
+      const raw: Lut3D = bakeGradeLut(stats, theme, {}, 33);
+      const profile = PROFILES[decodeProfileKey]!;
+      for (const s of [0, 0.5, 1]) {
+        const ref: Lut3D = bakeLut((rgb) => {
+          const dec = decodePixelToRec709(rgb, profile);
+          const lut = sampleLut(raw, dec);
+          return [
+            dec[0] * (1 - s) + lut[0] * s,
+            dec[1] * (1 - s) + lut[1] * s,
+            dec[2] * (1 - s) + lut[2] * s,
+          ] as [number, number, number];
+        }, 33);
+        const outPath = join(tmp, `lutdecodestrength-${themeName}-${f.name}-${s}.f32`);
+        runCpp(ctx, [
+          'lutdecodestrength', framePaths.get(f.name)!, String(f.pixels.length),
+          themeName, '0', '0', '0', '0', '33', decodeProfileKey, String(s), outPath,
+        ]);
+        const got = readF32(outPath, ref.data.length);
+        track(gradeT, ref.data, got, `lutdecodestrength:${themeName}/${f.name}/s${s}`);
+      }
+    }
+  }
+
   // --- bakeDecodeLut parity: every profile, grade + fine grids ---
   for (const profileKey of Object.keys(PROFILES)) {
     for (const size of [33, 65]) {

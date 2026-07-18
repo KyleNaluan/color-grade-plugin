@@ -247,11 +247,6 @@ every command for one instance.
 - **Follow-ups:** Metal/Cocoa backend for the Mac target; live preview + scopes
   (Phases 4-5). (The idle-hook write driver, sequence-data uid, and the full
   Correct/Grade control set landed in Phase 3.)
-- **Strength-blend note (Embedded/External + V-Log):** with decode composed into the
-  raw LUT, the Strength slider blends the corrected+graded result against the *original
-  log* input, so intermediate Strength on a log clip under a raw LUT is slightly
-  non-physical. Full-Strength (the default for a look) is correct; Auto mode is
-  unaffected. Acceptable for the raw-LUT advanced modes; revisit if it matters.
 
 ## Known limitations
 

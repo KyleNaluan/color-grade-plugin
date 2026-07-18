@@ -232,23 +232,32 @@ static void BakeAutoLut(A_long themePopup, A_long footagePopup, double strength0
     }
 }
 
-// Resample a baked LUT so the Footage/Correct decode applies *before* it:
-// newLut(x) = rawLut(decode(x)). This makes the decode stage apply in the
-// Embedded/External raw-LUT modes too (captain directive: never leave V-Log footage
-// undecoded under any LUT Source), while keeping the per-pixel apply a single
-// trilinear sample (CPU/GPU identical). Rec.709 decodes to itself, so it is a no-op.
+// Resample a baked LUT so the Footage/Correct decode applies *before* it and the
+// Strength blend happens in DECODED space:
+//   newLut(x) = lerp(decode(x), rawLut(decode(x)), strength01)
+//             = decode(x)*(1-s) + rawLut(decode(x))*s.
+// This makes the decode stage apply in the Embedded/External raw-LUT modes too
+// (captain directive: never leave V-Log footage undecoded under any LUT Source) AND
+// bakes Strength into the composed LUT so at s<100% the blend is decoded-vs-graded,
+// never a raw-log term. Callers apply this LUT at applyStrength=1.0. The per-pixel
+// apply stays a single trilinear sample (CPU/GPU identical). Rec.709 decodes to
+// itself, so it is a no-op and the caller keeps the raw LUT + slider strength.
 // (The Auto path composes the decode into the *continuous* grade in BakeAutoLut, which
 // avoids this resample's extra interpolation; here we only have a baked LUT to compose.)
-static cg::Lut3D ComposeDecodeIntoLut(const cg::Lut3D& lut, A_long footagePopup) {
+static cg::Lut3D ComposeDecodeIntoLut(const cg::Lut3D& lut, A_long footagePopup, double strength01) {
     if (footagePopup != CG_FOOT_VLOG) return lut;
     const cg::core::LogProfile& profile = ProfileFromFootagePopup(footagePopup);
     return cg::core::bakeLut(
-        [&lut, &profile](const cg::core::Vec3d& x) -> cg::core::Vec3d {
+        [&lut, &profile, strength01](const cg::core::Vec3d& x) -> cg::core::Vec3d {
             const cg::core::Vec3d dec = cg::core::decodePixelToRec709(x, profile);
             const cg::Vec3 s = cg::sampleLut(
                 lut, cg::Vec3{static_cast<float>(dec[0]), static_cast<float>(dec[1]),
                               static_cast<float>(dec[2])});
-            return cg::core::Vec3d{s[0], s[1], s[2]};
+            return cg::core::Vec3d{
+                dec[0] * (1.0 - strength01) + s[0] * strength01,
+                dec[1] * (1.0 - strength01) + s[1] * strength01,
+                dec[2] * (1.0 - strength01) + s[2] * strength01,
+            };
         },
         lut.size);
 }
@@ -395,12 +404,19 @@ static void ResolveRenderData(PF_InData* in_data, A_long source, A_long themePop
         BakeAutoLut(themePopup, footagePopup, strength01, skin01, chromaGain, recipe, d.lut);
         d.applyStrength = 1.0f;
     } else {
-        // Embedded/External raw LUT, with the Footage/Correct decode composed in first
-        // so V-Log footage is still decoded to Rec.709 before the LUT (captain directive).
+        // Embedded/External raw LUT. For V-Log the Footage/Correct decode is composed in
+        // and Strength is baked into the composed LUT (blend in decoded space, applied at
+        // 1.0) so V-Log is never left undecoded even at partial Strength (captain
+        // directive). Rec.709 decodes to itself: keep the raw LUT + slider-strength blend.
         cg::Lut3D raw;
         ResolveLut(source, raw);
-        d.lut = ComposeDecodeIntoLut(raw, footagePopup);
-        d.applyStrength = static_cast<float>(strength01);
+        if (footagePopup == CG_FOOT_VLOG) {
+            d.lut = ComposeDecodeIntoLut(raw, footagePopup, strength01);
+            d.applyStrength = 1.0f;
+        } else {
+            d.lut = raw;
+            d.applyStrength = static_cast<float>(strength01);
+        }
     }
 }
 
