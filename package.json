@@ -17,6 +17,7 @@
     "native:gen-lut": "tsx native/scripts/gen-embedded-lut.ts",
     "native:parity": "tsx native/scripts/parity-test.ts",
     "native:core-parity": "tsx native/scripts/core-parity-test.ts",
+    "native:editor-test": "tsx native/scripts/editor-bridge-test.ts",
     "native:build": "native/scripts/build.sh"
   },
   "devDependencies": {

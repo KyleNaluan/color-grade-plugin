@@ -15,6 +15,8 @@ LUT to a layer through the ported trilinear `sampleLut`, with a CPU path and a G
 ```bash
 npm run native:gen-lut      # (re)generate the embedded default LUT header (committed)
 npm run native:parity       # C++ sampleLut vs TS oracle, ~1e-4 (needs g++/clang; not in CI)
+npm run native:core-parity  # full C++ core vs TS oracle end-to-end (needs g++/clang; not in CI)
+npm run native:editor-test  # headless editor<->effect bridge logic (needs g++/clang; not in CI)
 
 native/scripts/build.sh Debug            # CPU-only  .aex -> MediaCore
 native/scripts/build.sh Debug --gpu      # CPU + GPU (DirectX + CUDA) .aex + DirectX_Assets
@@ -123,6 +125,30 @@ file ...aex"**.
   `GetModuleHandleEx` string arg to `LPCSTR`; Unicode would break it. Our own code uses
   explicit `...W` Win32 APIs, so it is charset-agnostic.
 
+### Editor window (Phase 3)
+
+The editor is a Dear ImGui + Win32/D3D11 window opened from the **Open Editor…**
+button param. Toolkit rationale + the effect<->window bridge design live in
+`native/docs/adr-editor-ui.md` (the toolkit choice is a captain decision).
+
+- **Vendored** `native/third_party/imgui/` (v1.91.5, MIT; `VERSION.txt`) is compiled
+  straight into the `.aex` - zero external runtime dependency. `imgui_impl_dx11`/
+  `imgui_impl_win32` `#pragma comment(lib,...)` auto-link d3dcompiler/gdi32/dwmapi;
+  XInput loads dynamically. The vcxproj also links `d3d11.lib;dxgi.lib` and adds
+  `third_party/imgui[/backends]` to the include path (both configs).
+- **Editor sources** `native/ColorGradeFX/editor/`: `EditorBridge.h` (pure,
+  AE/Win32-free seam - the thread-safe edit queue + value mapping, headless-tested by
+  `npm run native:editor-test`), `EditorWindow.{h,cpp}` (Win32/D3D11/ImGui host,
+  single-instance-per-effect, own UI thread). The `.cpp` compiles to no-op stubs off
+  Windows so the interface still links for the eventual Mac backend.
+- **Effect wiring** (`ColorGrade.cpp`): `CG_OPEN_EDITOR` button (SUPERVISE) opens the
+  window in `UserChangedParam`; `PreRender` publishes a param snapshot to it;
+  `GLOBAL_SETDOWN`/`SEQUENCE_SETDOWN` tear windows down (no orphans). The window's
+  write-back to params is captain-verified in AE (the continuous driver is a companion
+  AEGP idle hook - see the ADR).
+- **Four-config rule now covers the editor too**: build Debug/Release x CPU/`--gpu`
+  after any editor/effect change (the editor sources compile in all four).
+
 ---
 
 ## Phase 0 checklist (folded in, with the six corrections applied)
@@ -218,10 +244,11 @@ A build cannot prove the effect works in AE; that needs a human at the GUI. When
 is ready, verify in AE 2025:
 
 1. **Registers & drags:** AE launched, the effect appears under **Effects & Presets ->
-   Color Grade -> "CG Color Grade"**, and drags onto a layer. Effect Controls now shows
-   (Phase 2): **Theme** (Teal-Orange / Warm-Film / Cool-Noir), **Strength**,
-   **Skin Protection**, **Chroma Gain**, and **LUT Source** (Auto / Embedded / External).
-   The **Grade Recipe** arb-data param is data-only (no visible control) but persists in the
+   Color Grade -> "CG Color Grade"**, and drags onto a layer. Effect Controls shows:
+   **Footage** (Rec.709 / V-Log - Correct), **Theme** (Teal-Orange / Warm-Film /
+   Cool-Noir), **Strength**, **Skin Protection**, **Chroma Gain**, **LUT Source**
+   (Auto / Embedded / External), and **Open Editor…** (Phase 3 button). The **Grade
+   Recipe** arb-data param is data-only (no visible control) but persists in the
    project - save, reopen the `.aep`, and confirm the grade survives.
 2. **Auto grade (Phase 2 engine path):** with LUT Source = "Auto (Theme + Analysis)", the
    layer takes on the selected **Theme**'s look, baked natively in-effect from the ported
@@ -239,6 +266,15 @@ is ready, verify in AE 2025:
    (RTX 3090 + AMD) AE offers only CUDA, so expect the CUDA tracer lines; DirectX would
    engage only on a host that offers it. If it falls back to CPU, adapter/framework
    selection is the suspect - check the `GPUDeviceSetup` trace for which framework AE offered.
+6. **Correct (Footage):** on a V-Log clip, set **Footage** = "V-Log" with LUT Source =
+   "Auto"; the clip is decoded to Rec.709 then graded (looks corrected, not washed-out
+   log). "Rec.709 (standard)" leaves the decode out. (The decode applies in every LUT
+   Source mode - Embedded/External resample their raw LUT through it - so V-Log is never
+   left undecoded; repeat with LUT Source = "Embedded"/"External" to confirm.)
+7. **Editor window (Phase 3):** click **Open Editor…**; the native editor window opens and
+   AE stays responsive. Run the full editor checklist in
+   `native/docs/adr-editor-ui.md` (button opens, single instance, controls round-trip
+   both ways, no dialogs/hangs, sane close/reopen/project-close lifecycle, undo).
 
 The numerical correctness of the ported engine is proven unattended by the cross-engine
 golden harness (`npm run native:core-parity`), so AE verification here is about the SDK glue

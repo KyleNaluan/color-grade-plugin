@@ -47,6 +47,7 @@
 #include "embedded/EmbeddedLut.h"
 #include "core/Recipe.h"   // POD grade recipe (arb-data) + in-effect bake
 #include "core/Themes.h"   // ported shipping themes (getTheme by name)
+#include "editor/EditorWindow.h"  // Phase 3 editor-window host (ImGui spike) + bridge
 
 #define DESCRIPTION "\nApplies a Color Grade (theme + analysis, baked natively). Phase 2 native re-platform."
 #define NAME        "CG Color Grade"
@@ -61,14 +62,24 @@
 // typed knob space). Pre-release, so reordering vs Phase 1 is fine.
 enum {
     CG_INPUT = 0,
+    CG_FOOTAGE_PROFILE,  // Correct: the clip's log format (drives the decode stage)
     CG_THEME,
     CG_STRENGTH,
     CG_SKIN_PROTECTION,
     CG_CHROMA_GAIN,
     CG_LUT_SOURCE,
+    CG_OPEN_EDITOR,   // momentary button: opens the native editor window (Phase 3)
     CG_RECIPE,
     CG_NUM_PARAMS
 };
+
+// Footage-profile popup order (1-based in AE); maps to cg::core::getProfile keys.
+// Rec.709 = standard (no decode); V-Log decodes to Rec.709 before the grade.
+enum {
+    CG_FOOT_REC709 = 1,
+    CG_FOOT_VLOG
+};
+#define CG_FOOTAGE_CHOICES "Rec.709 (standard)|V-Log"
 
 // Theme popup order (1-based in AE); maps to cg::core::getTheme keys.
 enum {

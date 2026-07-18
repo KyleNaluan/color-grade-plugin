@@ -68,7 +68,7 @@
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <ClCompile>
       <Optimization>Disabled</Optimization>
-      <AdditionalIncludeDirectories>$(CG_ExtraIncludes)$(AE_SDK_EXAMPLES)\Headers;$(AE_SDK_EXAMPLES)\Headers\SP;$(AE_SDK_EXAMPLES)\Headers\Win;$(AE_SDK_EXAMPLES)\Resources;$(AE_SDK_EXAMPLES)\Util;$(AE_SDK_EXAMPLES)\GPUUtils;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(CG_ExtraIncludes)..\..\third_party\imgui;..\..\third_party\imgui\backends;$(AE_SDK_EXAMPLES)\Headers;$(AE_SDK_EXAMPLES)\Headers\SP;$(AE_SDK_EXAMPLES)\Headers\Win;$(AE_SDK_EXAMPLES)\Resources;$(AE_SDK_EXAMPLES)\Util;$(AE_SDK_EXAMPLES)\GPUUtils;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <PreprocessorDefinitions>$(CG_ExtraDefines)NOMINMAX;MSWindows;WIN32;_DEBUG;_WINDOWS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <RuntimeLibrary>MultiThreadedDebugDLL</RuntimeLibrary>
       <LanguageStandard>stdcpp17</LanguageStandard>
@@ -90,7 +90,7 @@
       <RandomizedBaseAddress>false</RandomizedBaseAddress>
       <ImportLibrary>$(IntDir)$(TargetName).lib</ImportLibrary>
       <TargetMachine>MachineX64</TargetMachine>
-      <AdditionalDependencies>$(CG_ExtraLibs)%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>$(CG_ExtraLibs)d3d11.lib;d3dcompiler.lib;dxgi.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <AdditionalLibraryDirectories>$(CG_ExtraLibDirs)%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <IgnoreSpecificDefaultLibraries>$(CG_IgnoreLibs)%(IgnoreSpecificDefaultLibraries)</IgnoreSpecificDefaultLibraries>
     </Link>
@@ -100,7 +100,7 @@
       <Optimization>MaxSpeed</Optimization>
       <FunctionLevelLinking>true</FunctionLevelLinking>
       <IntrinsicFunctions>true</IntrinsicFunctions>
-      <AdditionalIncludeDirectories>$(CG_ExtraIncludes)$(AE_SDK_EXAMPLES)\Headers;$(AE_SDK_EXAMPLES)\Headers\SP;$(AE_SDK_EXAMPLES)\Headers\Win;$(AE_SDK_EXAMPLES)\Resources;$(AE_SDK_EXAMPLES)\Util;$(AE_SDK_EXAMPLES)\GPUUtils;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(CG_ExtraIncludes)..\..\third_party\imgui;..\..\third_party\imgui\backends;$(AE_SDK_EXAMPLES)\Headers;$(AE_SDK_EXAMPLES)\Headers\SP;$(AE_SDK_EXAMPLES)\Headers\Win;$(AE_SDK_EXAMPLES)\Resources;$(AE_SDK_EXAMPLES)\Util;$(AE_SDK_EXAMPLES)\GPUUtils;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <PreprocessorDefinitions>$(CG_ExtraDefines)NOMINMAX;MSWindows;WIN32;NDEBUG;_WINDOWS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary>
       <LanguageStandard>stdcpp17</LanguageStandard>
@@ -119,7 +119,7 @@
       <RandomizedBaseAddress>false</RandomizedBaseAddress>
       <ImportLibrary>$(IntDir)$(TargetName).lib</ImportLibrary>
       <TargetMachine>MachineX64</TargetMachine>
-      <AdditionalDependencies>$(CG_ExtraLibs)%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>$(CG_ExtraLibs)d3d11.lib;d3dcompiler.lib;dxgi.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <AdditionalLibraryDirectories>$(CG_ExtraLibDirs)%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <IgnoreSpecificDefaultLibraries>$(CG_IgnoreLibs)%(IgnoreSpecificDefaultLibraries)</IgnoreSpecificDefaultLibraries>
     </Link>
@@ -129,11 +129,25 @@
     <ClInclude Include="..\ColorGradeGPU.inc" />
     <ClInclude Include="..\lut\CubeLut.h" />
     <ClInclude Include="..\embedded\EmbeddedLut.h" />
+    <ClInclude Include="..\editor\EditorBridge.h" />
+    <ClInclude Include="..\editor\EditorWindow.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="..\ColorGrade.cpp" />
+    <ClCompile Include="..\editor\EditorWindow.cpp" />
     <ClCompile Include="$(AE_SDK_EXAMPLES)\Util\Smart_Utils.cpp" />
+    <!-- AEGP_SuiteHandler impl: the effect uses AEGP suites via PICA for the editor
+         bridge (idle-hook driver + stream writes). Same convention as Smart_Utils. -->
+    <ClCompile Include="$(AE_SDK_EXAMPLES)\Util\AEGP_SuiteHandler.cpp" />
     <ClCompile Include="$(AE_SDK_EXAMPLES)\Util\DirectXUtils.cpp" Condition="'$(CG_GPU)'=='true'" />
+    <!-- Dear ImGui (vendored, third_party/imgui) + Win32/D3D11 backends: the Phase 3
+         editor toolkit. Compiled into the .aex; zero external runtime dependency. -->
+    <ClCompile Include="..\..\third_party\imgui\imgui.cpp" />
+    <ClCompile Include="..\..\third_party\imgui\imgui_draw.cpp" />
+    <ClCompile Include="..\..\third_party\imgui\imgui_tables.cpp" />
+    <ClCompile Include="..\..\third_party\imgui\imgui_widgets.cpp" />
+    <ClCompile Include="..\..\third_party\imgui\backends\imgui_impl_win32.cpp" />
+    <ClCompile Include="..\..\third_party\imgui\backends\imgui_impl_dx11.cpp" />
   </ItemGroup>
   <ItemGroup>
     <!-- Compile the PiPL: preprocess .r -> PiPLtool -> .rc (mirrors the SDK samples). -->

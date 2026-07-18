@@ -169,6 +169,105 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    if (cmd == "gradedecode" && argc == 12) {
+        // Exercise the effect's Correct+Grade Auto path (BakeAutoLut, log profile):
+        // decode each grid node to Rec.709, then grade, baked into one LUT. Mirrors
+        // BakeAutoLut's compose-when-V-Log branch so the Correct decode stage is
+        // proven against the TS oracle, not just eyeballed.
+        const size_t n = static_cast<size_t>(std::strtoull(argv[3], nullptr, 10));
+        std::vector<float> px = readF32(argv[2], n);
+        Theme theme;
+        if (!getTheme(argv[4], theme)) {
+            std::fprintf(stderr, "core_parity: unknown theme %s\n", argv[4]);
+            return 2;
+        }
+        EngineOptions opts;
+        if (std::atoi(argv[5])) opts.strength = std::atof(argv[6]);
+        if (std::atoi(argv[7])) opts.skinProtection = std::atof(argv[8]);
+        const int size = std::atoi(argv[9]);
+        const LogProfile* profile = getProfile(argv[10]);
+        if (!profile) { std::fprintf(stderr, "core_parity: unknown profile %s\n", argv[10]); return 2; }
+        FootageStats stats = computeStats(px.data(), px.size());
+        auto grade = buildTransform(stats, theme, opts);
+        cg::Lut3D lut = bakeLut(
+            [&grade, profile](const Vec3d& x) { return grade(decodePixelToRec709(x, *profile)); },
+            size);
+        writeF32(argv[11], lut.data);
+        return 0;
+    }
+
+    if (cmd == "lutdecode" && argc == 12) {
+        // Exercise the effect's Embedded/External Correct path (ComposeDecodeIntoLut):
+        // a baked raw LUT resampled through the decode - newLut(x) = rawLut(decode(x)).
+        // Uses a baked grade LUT as the stand-in raw LUT (both engines bake it
+        // identically), then composes decode via the ported sampleLut.
+        const size_t n = static_cast<size_t>(std::strtoull(argv[3], nullptr, 10));
+        std::vector<float> px = readF32(argv[2], n);
+        Theme theme;
+        if (!getTheme(argv[4], theme)) {
+            std::fprintf(stderr, "core_parity: unknown theme %s\n", argv[4]);
+            return 2;
+        }
+        EngineOptions opts;
+        if (std::atoi(argv[5])) opts.strength = std::atof(argv[6]);
+        if (std::atoi(argv[7])) opts.skinProtection = std::atof(argv[8]);
+        const int size = std::atoi(argv[9]);
+        const LogProfile* profile = getProfile(argv[10]);
+        if (!profile) { std::fprintf(stderr, "core_parity: unknown profile %s\n", argv[10]); return 2; }
+        FootageStats stats = computeStats(px.data(), px.size());
+        cg::Lut3D raw = bakeGradeLut(stats, theme, opts, size);
+        cg::Lut3D lut = bakeLut(
+            [&raw, profile](const Vec3d& x) -> Vec3d {
+                const Vec3d dec = decodePixelToRec709(x, *profile);
+                const cg::Vec3 s = cg::sampleLut(
+                    raw, cg::Vec3{static_cast<float>(dec[0]), static_cast<float>(dec[1]),
+                                  static_cast<float>(dec[2])});
+                return Vec3d{s[0], s[1], s[2]};
+            },
+            size);
+        writeF32(argv[11], lut.data);
+        return 0;
+    }
+
+    if (cmd == "lutdecodestrength" && argc == 13) {
+        // Exercise the effect's Embedded/External V-Log path with Strength baked into
+        // the composed LUT (ComposeDecodeIntoLut + strength):
+        //   newLut(x) = lerp(decode(x), rawLut(decode(x)), s)
+        //             = decode(x)*(1-s) + rawLut(decode(x))*s.
+        // Proves the decoded-space blend agrees with the TS oracle at partial Strength.
+        const size_t n = static_cast<size_t>(std::strtoull(argv[3], nullptr, 10));
+        std::vector<float> px = readF32(argv[2], n);
+        Theme theme;
+        if (!getTheme(argv[4], theme)) {
+            std::fprintf(stderr, "core_parity: unknown theme %s\n", argv[4]);
+            return 2;
+        }
+        EngineOptions opts;
+        if (std::atoi(argv[5])) opts.strength = std::atof(argv[6]);
+        if (std::atoi(argv[7])) opts.skinProtection = std::atof(argv[8]);
+        const int size = std::atoi(argv[9]);
+        const LogProfile* profile = getProfile(argv[10]);
+        if (!profile) { std::fprintf(stderr, "core_parity: unknown profile %s\n", argv[10]); return 2; }
+        const double s01 = std::atof(argv[11]);
+        FootageStats stats = computeStats(px.data(), px.size());
+        cg::Lut3D raw = bakeGradeLut(stats, theme, opts, size);
+        cg::Lut3D lut = bakeLut(
+            [&raw, profile, s01](const Vec3d& x) -> Vec3d {
+                const Vec3d dec = decodePixelToRec709(x, *profile);
+                const cg::Vec3 s = cg::sampleLut(
+                    raw, cg::Vec3{static_cast<float>(dec[0]), static_cast<float>(dec[1]),
+                                  static_cast<float>(dec[2])});
+                return Vec3d{
+                    dec[0] * (1.0 - s01) + s[0] * s01,
+                    dec[1] * (1.0 - s01) + s[1] * s01,
+                    dec[2] * (1.0 - s01) + s[2] * s01,
+                };
+            },
+            size);
+        writeF32(argv[12], lut.data);
+        return 0;
+    }
+
     if (cmd == "decode" && argc == 5) {
         const LogProfile* profile = getProfile(argv[2]);
         if (!profile) { std::fprintf(stderr, "core_parity: unknown profile %s\n", argv[2]); return 2; }

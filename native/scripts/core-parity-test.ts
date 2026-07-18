@@ -23,10 +23,11 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { computeStats, type FootageStats } from '../../src/core/analysis/stats.js';
-import { toneStretchChromaGuard } from '../../src/core/engine/engine.js';
+import { toneStretchChromaGuard, buildTransform } from '../../src/core/engine/engine.js';
 import { bakeGradeLut } from '../../src/core/lut/gradeLut.js';
 import { bakeDecodeLut } from '../../src/core/lut/decodeLut.js';
-import type { Lut3D } from '../../src/core/lut/cube.js';
+import { bakeLut, sampleLut, type Lut3D } from '../../src/core/lut/cube.js';
+import { decodePixelToRec709 } from '../../src/core/color/decode.js';
 import type { EngineOptions } from '../../src/core/engine/engine.js';
 import { THEMES } from '../../src/themes/index.js';
 import { PROFILES } from '../../src/core/color/index.js';
@@ -338,6 +339,90 @@ function main(): void {
         ]);
         const got = readF32(outPath, ref.data.length);
         track(gradeT, ref.data, got, `chroma:${themeName}/${f.name}/x${factor}`);
+      }
+    }
+  }
+
+  // --- Correct+Grade decode composition parity (effect BakeAutoLut, V-Log path):
+  //     decode each grid node to Rec.709, then grade, baked into one LUT. Proves the
+  //     effect's Correct decode stage matches the oracle, not just the pieces. ---
+  const decodeProfileKey = 'vlog';
+  const decodeOpts: { label: string; opts: EngineOptions }[] = [
+    { label: 'default', opts: {} },
+    { label: 'str0.6-skin0.3', opts: { strength: 0.6, skinProtection: 0.3 } },
+  ];
+  for (const [themeName, theme] of Object.entries(THEMES)) {
+    for (const f of frames) {
+      const stats = computeStats(f.pixels);
+      for (const { label, opts } of decodeOpts) {
+        const g = buildTransform(stats, theme, opts);
+        const profile = PROFILES[decodeProfileKey]!;
+        const ref: Lut3D = bakeLut((rgb) => g(decodePixelToRec709(rgb, profile)), 33);
+        const outPath = join(tmp, `gradedecode-${themeName}-${f.name}-${label}.f32`);
+        const hasStr = opts.strength !== undefined ? '1' : '0';
+        const strVal = String(opts.strength ?? 0);
+        const hasSkin = opts.skinProtection !== undefined ? '1' : '0';
+        const skinVal = String(opts.skinProtection ?? 0);
+        runCpp(ctx, [
+          'gradedecode', framePaths.get(f.name)!, String(f.pixels.length),
+          themeName, hasStr, strVal, hasSkin, skinVal, '33', decodeProfileKey, outPath,
+        ]);
+        const got = readF32(outPath, ref.data.length);
+        track(gradeT, ref.data, got, `gradedecode:${themeName}/${f.name}/${label}`);
+      }
+    }
+  }
+
+  // --- Embedded/External Correct composition parity (effect ComposeDecodeIntoLut):
+  //     a baked raw LUT resampled through decode - newLut(x) = rawLut(decode(x)). ---
+  for (const [themeName, theme] of Object.entries(THEMES)) {
+    for (const f of frames) {
+      const stats = computeStats(f.pixels);
+      for (const { label, opts } of decodeOpts) {
+        const raw: Lut3D = bakeGradeLut(stats, theme, opts, 33);
+        const profile = PROFILES[decodeProfileKey]!;
+        const ref: Lut3D = bakeLut((rgb) => sampleLut(raw, decodePixelToRec709(rgb, profile)), 33);
+        const outPath = join(tmp, `lutdecode-${themeName}-${f.name}-${label}.f32`);
+        const hasStr = opts.strength !== undefined ? '1' : '0';
+        const strVal = String(opts.strength ?? 0);
+        const hasSkin = opts.skinProtection !== undefined ? '1' : '0';
+        const skinVal = String(opts.skinProtection ?? 0);
+        runCpp(ctx, [
+          'lutdecode', framePaths.get(f.name)!, String(f.pixels.length),
+          themeName, hasStr, strVal, hasSkin, skinVal, '33', decodeProfileKey, outPath,
+        ]);
+        const got = readF32(outPath, ref.data.length);
+        track(gradeT, ref.data, got, `lutdecode:${themeName}/${f.name}/${label}`);
+      }
+    }
+  }
+
+  // --- Embedded/External V-Log partial-Strength composition parity (effect
+  //     ComposeDecodeIntoLut + strength baked in): the decoded-space blend
+  //     newLut(x) = lerp(decode(x), rawLut(decode(x)), s). Proves s<100% agrees
+  //     with the oracle (no raw-log term left in the blend). ---
+  for (const [themeName, theme] of Object.entries(THEMES)) {
+    for (const f of frames) {
+      const stats = computeStats(f.pixels);
+      const raw: Lut3D = bakeGradeLut(stats, theme, {}, 33);
+      const profile = PROFILES[decodeProfileKey]!;
+      for (const s of [0, 0.5, 1]) {
+        const ref: Lut3D = bakeLut((rgb) => {
+          const dec = decodePixelToRec709(rgb, profile);
+          const lut = sampleLut(raw, dec);
+          return [
+            dec[0] * (1 - s) + lut[0] * s,
+            dec[1] * (1 - s) + lut[1] * s,
+            dec[2] * (1 - s) + lut[2] * s,
+          ] as [number, number, number];
+        }, 33);
+        const outPath = join(tmp, `lutdecodestrength-${themeName}-${f.name}-${s}.f32`);
+        runCpp(ctx, [
+          'lutdecodestrength', framePaths.get(f.name)!, String(f.pixels.length),
+          themeName, '0', '0', '0', '0', '33', decodeProfileKey, String(s), outPath,
+        ]);
+        const got = readF32(outPath, ref.data.length);
+        track(gradeT, ref.data, got, `lutdecodestrength:${themeName}/${f.name}/s${s}`);
       }
     }
   }
