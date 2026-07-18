@@ -268,7 +268,9 @@ is ready, verify in AE 2025:
    selection is the suspect - check the `GPUDeviceSetup` trace for which framework AE offered.
 6. **Correct (Footage):** on a V-Log clip, set **Footage** = "V-Log" with LUT Source =
    "Auto"; the clip is decoded to Rec.709 then graded (looks corrected, not washed-out
-   log). "Rec.709 (standard)" leaves the decode out. (Decode applies to the Auto path.)
+   log). "Rec.709 (standard)" leaves the decode out. (The decode applies in every LUT
+   Source mode - Embedded/External resample their raw LUT through it - so V-Log is never
+   left undecoded; repeat with LUT Source = "Embedded"/"External" to confirm.)
 7. **Editor window (Phase 3):** click **Open Editor…**; the native editor window opens and
    AE stays responsive. Run the full editor checklist in
    `native/docs/adr-editor-ui.md` (button opens, single instance, controls round-trip

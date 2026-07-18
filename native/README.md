@@ -68,6 +68,7 @@ native/
 npm run native:gen-lut       # regenerate embedded/EmbeddedLut.h from the TS engine
 npm run native:parity        # Phase 1 LUT-apply parity gate (needs g++/clang; not in CI)
 npm run native:core-parity   # Phase 2 full-core cross-engine golden harness (g++/clang; not in CI)
+npm run native:editor-test   # Phase 3 headless editor<->effect bridge logic (g++/clang; not in CI)
 native/scripts/build.sh Debug          # CPU-only build
 native/scripts/build.sh Release --gpu  # CPU + GPU (DirectX + CUDA) build
 ```
