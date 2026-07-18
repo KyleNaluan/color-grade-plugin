@@ -88,11 +88,11 @@ enum {
 
 #define CG_STRENGTH_MIN    0
 #define CG_STRENGTH_MAX    100
-#define CG_STRENGTH_DFLT   80    // matches the shipping themes' strength knob default
+#define CG_STRENGTH_DFLT   80    // mirrors the default theme's authored strength (teal-orange 0.8)
 
 #define CG_SKIN_MIN        0
 #define CG_SKIN_MAX        100
-#define CG_SKIN_DFLT       75    // matches the shipping themes' skinProtection default
+#define CG_SKIN_DFLT       78    // mirrors the default theme's authored skinProtection (teal-orange 0.78)
 
 // Chroma gain as a percentage: 100% = 1.0 (theme default), <100 mutes, >100 boosts.
 #define CG_CHROMA_MIN      0

@@ -317,12 +317,15 @@ static PF_Err ParamsSetup(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef*
     PF_ParamDef def;
 
     // Order must match the CG_* param enum (after CG_INPUT).
+    // SUPERVISE so AE sends PF_Cmd_USER_CHANGED_PARAM when the theme changes; that
+    // handler resets the Strength/Skin sliders to the new theme's authored knobs.
     AEFX_CLR_STRUCT(def);
-    PF_ADD_POPUP("Theme",
-                 3 /* num choices */,
-                 CG_THEME_TEAL,
-                 CG_THEME_CHOICES,
-                 CG_THEME);
+    PF_ADD_POPUPX("Theme",
+                  3 /* num choices */,
+                  CG_THEME_TEAL,
+                  CG_THEME_CHOICES,
+                  PF_ParamFlag_SUPERVISE,
+                  CG_THEME);
 
     AEFX_CLR_STRUCT(def);
     PF_ADD_FLOAT_SLIDERX("Strength",
@@ -375,6 +378,23 @@ static PF_Err ParamsSetup(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef*
 
     out_data->num_params = CG_NUM_PARAMS;
     return err;
+}
+
+// The Theme popup is a supervised preset selector: switching it snaps the Strength
+// and Skin Protection sliders to the newly-selected theme's authored knob defaults.
+// This intentionally overwrites any manual Strength/Skin adjustments (captain's
+// decision - a theme is a preset). The Chroma Gain slider is untouched: it is a
+// relative multiplier (100% = the theme's authored chromaGain), so it needs no reset.
+static PF_Err UserChangedParam(PF_InData* in_data, PF_OutData* out_data,
+                               PF_ParamDef* params[], PF_UserChangedParamExtra* extra) {
+    if (extra->param_index == CG_THEME) {
+        cg::core::Theme theme = ThemeFromPopup(params[CG_THEME]->u.pd.value);
+        params[CG_STRENGTH]->u.fs_d.value = theme.knobs.strengthDefault * 100.0;
+        params[CG_STRENGTH]->uu.change_flags |= PF_ChangeFlag_CHANGED_VALUE;
+        params[CG_SKIN_PROTECTION]->u.fs_d.value = theme.knobs.skinProtectionDefault * 100.0;
+        params[CG_SKIN_PROTECTION]->uu.change_flags |= PF_ChangeFlag_CHANGED_VALUE;
+    }
+    return PF_Err_NONE;
 }
 
 /* ========================= Per-pixel LUT apply =========================== */
@@ -605,6 +625,9 @@ PF_Err EffectMain(PF_Cmd cmd, PF_InData* in_data, PF_OutData* out_data,
                 break;
             case PF_Cmd_ARBITRARY_CALLBACK:
                 err = HandleArbitrary(in_data, out_data, (PF_ArbParamsExtra*)extra);
+                break;
+            case PF_Cmd_USER_CHANGED_PARAM:
+                err = UserChangedParam(in_data, out_data, params, (PF_UserChangedParamExtra*)extra);
                 break;
 #if HAS_ANY_GPU
             case PF_Cmd_GPU_DEVICE_SETUP:
