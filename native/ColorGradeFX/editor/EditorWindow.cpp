@@ -431,6 +431,21 @@ std::vector<ParamEdit> EditorHost::drainEdits(InstanceKey key) {
     return {};
 }
 
+std::vector<InstanceKey> EditorHost::openKeys() {
+    std::lock_guard<std::mutex> lk(g_mapMutex);
+    ReapFinishedLocked();
+    std::vector<InstanceKey> keys;
+    keys.reserve(g_windows.size());
+    for (auto& kv : g_windows) keys.push_back(kv.first);
+    return keys;
+}
+
+bool EditorHost::hasPendingEdits(InstanceKey key) {
+    std::lock_guard<std::mutex> lk(g_mapMutex);
+    auto it = g_windows.find(key);
+    return it != g_windows.end() && !it->second->edits.empty();
+}
+
 bool EditorHost::consumeCloseRequest(InstanceKey key) {
     std::lock_guard<std::mutex> lk(g_mapMutex);
     auto it = g_windows.find(key);
@@ -471,6 +486,8 @@ EditorHost::~EditorHost() {}
 void EditorHost::open(InstanceKey, const ParamSnapshot&) {}
 void EditorHost::publishSnapshot(InstanceKey, const ParamSnapshot&) {}
 std::vector<ParamEdit> EditorHost::drainEdits(InstanceKey) { return {}; }
+std::vector<InstanceKey> EditorHost::openKeys() { return {}; }
+bool EditorHost::hasPendingEdits(InstanceKey) { return false; }
 bool EditorHost::consumeCloseRequest(InstanceKey) { return false; }
 bool EditorHost::isOpen(InstanceKey) { return false; }
 void EditorHost::close(InstanceKey) {}

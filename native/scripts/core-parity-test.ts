@@ -26,7 +26,7 @@ import { computeStats, type FootageStats } from '../../src/core/analysis/stats.j
 import { toneStretchChromaGuard, buildTransform } from '../../src/core/engine/engine.js';
 import { bakeGradeLut } from '../../src/core/lut/gradeLut.js';
 import { bakeDecodeLut } from '../../src/core/lut/decodeLut.js';
-import { bakeLut, type Lut3D } from '../../src/core/lut/cube.js';
+import { bakeLut, sampleLut, type Lut3D } from '../../src/core/lut/cube.js';
 import { decodePixelToRec709 } from '../../src/core/color/decode.js';
 import type { EngineOptions } from '../../src/core/engine/engine.js';
 import { THEMES } from '../../src/themes/index.js';
@@ -369,6 +369,30 @@ function main(): void {
         ]);
         const got = readF32(outPath, ref.data.length);
         track(gradeT, ref.data, got, `gradedecode:${themeName}/${f.name}/${label}`);
+      }
+    }
+  }
+
+  // --- Embedded/External Correct composition parity (effect ComposeDecodeIntoLut):
+  //     a baked raw LUT resampled through decode - newLut(x) = rawLut(decode(x)). ---
+  for (const [themeName, theme] of Object.entries(THEMES)) {
+    for (const f of frames) {
+      const stats = computeStats(f.pixels);
+      for (const { label, opts } of decodeOpts) {
+        const raw: Lut3D = bakeGradeLut(stats, theme, opts, 33);
+        const profile = PROFILES[decodeProfileKey]!;
+        const ref: Lut3D = bakeLut((rgb) => sampleLut(raw, decodePixelToRec709(rgb, profile)), 33);
+        const outPath = join(tmp, `lutdecode-${themeName}-${f.name}-${label}.f32`);
+        const hasStr = opts.strength !== undefined ? '1' : '0';
+        const strVal = String(opts.strength ?? 0);
+        const hasSkin = opts.skinProtection !== undefined ? '1' : '0';
+        const skinVal = String(opts.skinProtection ?? 0);
+        runCpp(ctx, [
+          'lutdecode', framePaths.get(f.name)!, String(f.pixels.length),
+          themeName, hasStr, strVal, hasSkin, skinVal, '33', decodeProfileKey, outPath,
+        ]);
+        const got = readF32(outPath, ref.data.length);
+        track(gradeT, ref.data, got, `lutdecode:${themeName}/${f.name}/${label}`);
       }
     }
   }

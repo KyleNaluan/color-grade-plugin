@@ -31,12 +31,17 @@
 
 #include "ColorGrade.h"
 
+#include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <fstream>
+#include <map>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <cstring>
 #include <new>
+#include <vector>
 
 // Debug-only path tracer: prints to the debugger / DebugView so the active render
 // path (CPU vs DirectX GPU) can be confirmed WITHOUT attaching a debugger/breakpoint.
@@ -46,6 +51,69 @@
 #else
 #define CG_DBG(msg) ((void)0)
 #endif
+
+/* ================= AEGP bridge globals + stable instance key ============== */
+//
+// The editor window <-> effect bridge (Phase 3). Two things need AEGP:
+//   1. A STABLE per-instance key. in_data->effect_ref is NOT stable across command
+//      types, so keying the window registry on it made the effect->window publish
+//      (and the window->effect drain) target the wrong/no window - the live-AE
+//      round-trip was dead. The key is now a uid stored in the effect's sequence
+//      data, consistent across every command for one instance.
+//   2. A main-thread DRIVER for window-originated writes. An effect gets no periodic
+//      callback on its own, so a window edit had nothing to apply it. We register a
+//      global AEGP idle hook (via PICA - no separate AEGP plugin) that, on AE's main
+//      thread, drains each open window's edits and writes them onto the effect's
+//      param streams (AEGP_SetStreamValue, inside one undo group) so AE re-renders and
+//      Effect Controls updates. The hook cheap-noops when nothing is pending, so it
+//      never burdens AE.
+//
+// All AEGP use here is captain-verified in AE (unautomatable from WSL); every call is
+// guarded and failures are swallowed so a bridge hiccup never destabilizes rendering.
+
+// AEGP_SuiteHandler requires the client to define this (it must throw, never return).
+// All our AEGP use is wrapped in catch(...), so a missing suite degrades gracefully to
+// the on-param-change drain instead of crashing.
+void AEGP_SuiteHandler::MissingSuiteError() const {
+    A_THROW(A_Err_MISSING_SUITE);
+}
+
+static SPBasicSuite*    g_spbasic = nullptr;   // cached PICA basic suite (from in_data)
+static AEGP_PluginID    g_aegpId = 0;          // our AEGP id (for stream/undo calls)
+static bool             g_idleHookRegistered = false;
+
+// Per-instance AEGP effect refs, captured on the main thread (button-open), used by
+// the idle hook to reach the effect's param streams. Disposed on close/setdown.
+static std::mutex                                         g_effMutex;
+static std::map<cg::editor::InstanceKey, AEGP_EffectRefH> g_effectRefs;
+
+// Flat POD sequence data: just a stable per-instance uid for the window registry.
+#define CG_SEQ_MAGIC   0x43475351u  // 'CGSQ'
+#define CG_SEQ_VERSION 1u
+struct CG_SequenceData {
+    A_u_long magic;
+    A_u_long version;
+    A_u_long uidHi;
+    A_u_long uidLo;
+};
+
+// Monotonic-per-session uid, seeded from a clock so it is unlikely to collide with a
+// uid persisted by a previous session. Regenerated on SETUP/RESETUP (so a duplicated
+// or reloaded effect never shares a key). Windows never persist, so this is purely a
+// runtime association token.
+static uint64_t GenUid() {
+    static std::atomic<uint64_t> counter{
+        static_cast<uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count()) << 16};
+    return counter.fetch_add(1) + 1;
+}
+
+static void PackUid(CG_SequenceData* sd, uint64_t uid) {
+    sd->uidHi = static_cast<A_u_long>(uid >> 32);
+    sd->uidLo = static_cast<A_u_long>(uid & 0xffffffffu);
+}
+static uint64_t UnpackUid(const CG_SequenceData* sd) {
+    return (static_cast<uint64_t>(sd->uidHi) << 32) | static_cast<uint64_t>(sd->uidLo);
+}
 
 /* =========================== LUT resolution =============================== */
 
@@ -156,6 +224,27 @@ static void BakeAutoLut(A_long themePopup, A_long footagePopup, double strength0
     } else {
         dst = cg::core::bakeLut(grade, CG_GRADE_LUT_SIZE, theme.name + " grade");
     }
+}
+
+// Resample a baked LUT so the Footage/Correct decode applies *before* it:
+// newLut(x) = rawLut(decode(x)). This makes the decode stage apply in the
+// Embedded/External raw-LUT modes too (captain directive: never leave V-Log footage
+// undecoded under any LUT Source), while keeping the per-pixel apply a single
+// trilinear sample (CPU/GPU identical). Rec.709 decodes to itself, so it is a no-op.
+// (The Auto path composes the decode into the *continuous* grade in BakeAutoLut, which
+// avoids this resample's extra interpolation; here we only have a baked LUT to compose.)
+static cg::Lut3D ComposeDecodeIntoLut(const cg::Lut3D& lut, A_long footagePopup) {
+    if (footagePopup != CG_FOOT_VLOG) return lut;
+    const cg::core::LogProfile& profile = ProfileFromFootagePopup(footagePopup);
+    return cg::core::bakeLut(
+        [&lut, &profile](const cg::core::Vec3d& x) -> cg::core::Vec3d {
+            const cg::core::Vec3d dec = cg::core::decodePixelToRec709(x, profile);
+            const cg::Vec3 s = cg::sampleLut(
+                lut, cg::Vec3{static_cast<float>(dec[0]), static_cast<float>(dec[1]),
+                              static_cast<float>(dec[2])});
+            return cg::core::Vec3d{s[0], s[1], s[2]};
+        },
+        lut.size);
 }
 
 /* ========================== Arb-data (recipe) ============================ */
@@ -300,7 +389,11 @@ static void ResolveRenderData(PF_InData* in_data, A_long source, A_long themePop
         BakeAutoLut(themePopup, footagePopup, strength01, skin01, chromaGain, recipe, d.lut);
         d.applyStrength = 1.0f;
     } else {
-        ResolveLut(source, d.lut);
+        // Embedded/External raw LUT, with the Footage/Correct decode composed in first
+        // so V-Log footage is still decoded to Rec.709 before the LUT (captain directive).
+        cg::Lut3D raw;
+        ResolveLut(source, raw);
+        d.lut = ComposeDecodeIntoLut(raw, footagePopup);
         d.applyStrength = static_cast<float>(strength01);
     }
 }
@@ -325,7 +418,19 @@ static void ResolveRenderData(PF_InData* in_data, A_long source, A_long themePop
 // effect's lifetime within a session). Production hardening: store a generated uid
 // in sequence data so the key survives an effect_ref reuse across delete/re-add.
 
-static cg::editor::InstanceKey EffectKey(PF_InData* in_data) {
+// Stable per-instance key = the uid in this effect's sequence data (consistent across
+// every command for one instance). Falls back to effect_ref only if sequence data is
+// somehow unavailable.
+static cg::editor::InstanceKey SeqKey(PF_InData* in_data) {
+    if (in_data->sequence_data) {
+        CG_SequenceData* sd = reinterpret_cast<CG_SequenceData*>(PF_LOCK_HANDLE(in_data->sequence_data));
+        if (sd && sd->magic == CG_SEQ_MAGIC) {
+            const uint64_t uid = UnpackUid(sd);
+            PF_UNLOCK_HANDLE(in_data->sequence_data);
+            return static_cast<cg::editor::InstanceKey>(uid);
+        }
+        if (sd) PF_UNLOCK_HANDLE(in_data->sequence_data);
+    }
     return static_cast<cg::editor::InstanceKey>(reinterpret_cast<uintptr_t>(in_data->effect_ref));
 }
 
@@ -350,13 +455,13 @@ static cg::editor::ParamSnapshot MakeSnapshot(A_long footage, A_long theme, doub
 static void PublishEditorSnapshot(PF_InData* in_data, A_long footage, A_long theme, double strength01,
                                   double skin01, double chromaFrac, A_long source) {
     cg::editor::EditorHost::instance().publishSnapshot(
-        EffectKey(in_data), MakeSnapshot(footage, theme, strength01, skin01, chromaFrac, source));
+        SeqKey(in_data), MakeSnapshot(footage, theme, strength01, skin01, chromaFrac, source));
 }
 
 // Drain any edits the window produced and write them onto params[] (CHANGED_VALUE so
 // AE re-renders). Valid only where params[] is writable (USER_CHANGED_PARAM context).
 static void ApplyEditorEdits(PF_InData* in_data, PF_ParamDef* params[]) {
-    auto edits = cg::editor::EditorHost::instance().drainEdits(EffectKey(in_data));
+    auto edits = cg::editor::EditorHost::instance().drainEdits(SeqKey(in_data));
     for (const auto& e : edits) {
         switch (e.field) {
             case cg::editor::EditField::FootageProfile:
@@ -387,6 +492,135 @@ static void ApplyEditorEdits(PF_InData* in_data, PF_ParamDef* params[]) {
     }
 }
 
+/* ============= Window -> effect writes via AEGP (idle-hook driver) ======== */
+//
+// The idle hook (registered in GlobalSetup) is the main-thread driver that actually
+// applies window-originated edits: it drains each open window's queue and writes the
+// values onto the effect's param streams so AE re-renders and Effect Controls updates.
+// This is what makes the window->effect direction work without the user also touching
+// Effect Controls (the ApplyEditorEdits stand-in above still runs on any param change).
+
+// Map an edit to its effect param stream index + the stream's one_d value (popups take
+// the 1-based index; the percent sliders take 0..100).
+static bool StreamForEdit(const cg::editor::ParamEdit& e, PF_ParamIndex& idx, double& one_d) {
+    using F = cg::editor::EditField;
+    switch (e.field) {
+        case F::FootageProfile: idx = CG_FOOTAGE_PROFILE; one_d = static_cast<int>(e.value + 0.5); return true;
+        case F::Theme:          idx = CG_THEME;           one_d = static_cast<int>(e.value + 0.5); return true;
+        case F::Strength:       idx = CG_STRENGTH;        one_d = cg::editor::clamp01(e.value) * 100.0; return true;
+        case F::SkinProtection: idx = CG_SKIN_PROTECTION; one_d = cg::editor::clamp01(e.value) * 100.0; return true;
+        case F::ChromaGain:     idx = CG_CHROMA_GAIN;     one_d = cg::editor::clampChromaFraction(e.value) * 100.0; return true;
+        case F::LutSource:      idx = CG_LUT_SOURCE;      one_d = static_cast<int>(e.value + 0.5); return true;
+    }
+    return false;
+}
+
+// Capture this effect instance's AEGP effect ref (main-thread contexts only), so the
+// idle hook can reach its param streams. Replaces any stale ref for the same key.
+static void CaptureEffectRefForKey(PF_InData* in_data, cg::editor::InstanceKey key) {
+    if (!g_spbasic || !g_aegpId || !in_data->effect_ref) return;
+    try {
+        AEGP_SuiteHandler sh(g_spbasic);
+        AEGP_EffectRefH effectH = nullptr;
+        A_Err e = sh.PFInterfaceSuite1()->AEGP_GetNewEffectForEffect(g_aegpId, in_data->effect_ref, &effectH);
+        if (e || !effectH) return;
+        AEGP_EffectRefH stale = nullptr;
+        {
+            std::lock_guard<std::mutex> lk(g_effMutex);
+            auto it = g_effectRefs.find(key);
+            if (it != g_effectRefs.end()) stale = it->second;
+            g_effectRefs[key] = effectH;
+        }
+        if (stale) sh.EffectSuite4()->AEGP_DisposeEffect(stale);
+    } catch (...) { /* AEGP unavailable - the on-param-change stand-in still applies edits */ }
+}
+
+static void DisposeEffectRefForKey(cg::editor::InstanceKey key) {
+    AEGP_EffectRefH effectH = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(g_effMutex);
+        auto it = g_effectRefs.find(key);
+        if (it == g_effectRefs.end()) return;
+        effectH = it->second;
+        g_effectRefs.erase(it);
+    }
+    if (effectH && g_spbasic) {
+        try { AEGP_SuiteHandler sh(g_spbasic); sh.EffectSuite4()->AEGP_DisposeEffect(effectH); } catch (...) {}
+    }
+}
+
+// The AEGP idle hook: main thread, fires while AE is idle. Cheap-noops unless a window
+// has pending edits, so it never burdens AE. Applies drained edits inside one undo
+// group per tick, and reaps effect refs whose window has been closed.
+static A_Err CG_IdleHook(AEGP_GlobalRefcon, AEGP_IdleRefcon, A_long* max_sleepPL) {
+    auto& host = cg::editor::EditorHost::instance();
+    std::vector<cg::editor::InstanceKey> keys = host.openKeys();
+
+    // Reap effect refs whose window is gone (user closed it) - dispose to avoid leaks.
+    {
+        std::vector<cg::editor::InstanceKey> orphans;
+        {
+            std::lock_guard<std::mutex> lk(g_effMutex);
+            for (auto& kv : g_effectRefs) {
+                if (std::find(keys.begin(), keys.end(), kv.first) == keys.end()) orphans.push_back(kv.first);
+            }
+        }
+        for (auto k : orphans) DisposeEffectRefForKey(k);
+    }
+
+    if (g_spbasic && g_aegpId) {
+        for (auto key : keys) {
+            if (!host.hasPendingEdits(key)) continue;  // fast path: nothing to do
+            AEGP_EffectRefH effectH = nullptr;
+            {
+                std::lock_guard<std::mutex> lk(g_effMutex);
+                auto it = g_effectRefs.find(key);
+                if (it != g_effectRefs.end()) effectH = it->second;
+            }
+            if (!effectH) continue;
+            std::vector<cg::editor::ParamEdit> edits = host.drainEdits(key);
+            if (edits.empty()) continue;
+            try {
+                AEGP_SuiteHandler sh(g_spbasic);
+                sh.UtilitySuite6()->AEGP_StartUndoGroup("Color Grade editor edit");
+                for (const auto& e : edits) {
+                    PF_ParamIndex idx = 0;
+                    double one_d = 0.0;
+                    if (!StreamForEdit(e, idx, one_d)) continue;
+                    AEGP_StreamRefH streamH = nullptr;
+                    A_Err er = sh.StreamSuite5()->AEGP_GetNewEffectStreamByIndex(g_aegpId, effectH, idx, &streamH);
+                    if (!er && streamH) {
+                        AEGP_StreamValue2 val;
+                        std::memset(&val, 0, sizeof(val));
+                        val.streamH = streamH;
+                        val.val.one_d = one_d;
+                        sh.StreamSuite5()->AEGP_SetStreamValue(g_aegpId, streamH, &val);
+                        sh.StreamSuite5()->AEGP_DisposeStream(streamH);
+                    }
+                }
+                sh.UtilitySuite6()->AEGP_EndUndoGroup();
+            } catch (...) { /* swallow: a bridge hiccup must never destabilize AE */ }
+        }
+    }
+    // Keep AE responsive but poll edits promptly (units of 1/60 s).
+    if (max_sleepPL && *max_sleepPL > 8) *max_sleepPL = 8;
+    return A_Err_NONE;
+}
+
+// Register our AEGP id + the global idle hook once (via PICA; no separate AEGP plugin).
+// Best-effort: on a host without AEGP (e.g. Premiere) the idle driver is simply absent.
+static void EnsureAegpIdleHook(PF_InData* in_data) {
+    if (g_idleHookRegistered) return;
+    g_spbasic = in_data->pica_basicP;
+    if (!g_spbasic) return;
+    try {
+        AEGP_SuiteHandler sh(g_spbasic);
+        if (!g_aegpId) sh.UtilitySuite6()->AEGP_RegisterWithAEGP(nullptr, "ColorGradeFX", &g_aegpId);
+        sh.RegisterSuite5()->AEGP_RegisterIdleHook(g_aegpId, CG_IdleHook, nullptr);
+        g_idleHookRegistered = true;
+    } catch (...) { /* no AEGP here - window->effect writes fall back to the param-change drain */ }
+}
+
 /* =============================== Setup =================================== */
 
 static PF_Err About(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef*[], PF_LayerDef*) {
@@ -414,6 +648,9 @@ static PF_Err GlobalSetup(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef*
 #endif
     }
 #endif
+
+    // Register the AEGP idle hook (the main-thread driver that applies window edits).
+    EnsureAegpIdleHook(in_data);
     return PF_Err_NONE;
 }
 
@@ -424,9 +661,47 @@ static PF_Err GlobalSetdown(PF_InData* in_data, PF_OutData* out_data, PF_ParamDe
     return PF_Err_NONE;
 }
 
-// Effect instance removed (deleted from the layer, comp closed): close its window.
+// Sequence data holds this instance's stable window-registry uid. Flat POD, so no
+// flatten/unflatten needed; RESETUP reseeds the uid so a duplicated or reloaded effect
+// never shares a key with its source. Mirrors the SDK Gamma_Table lifecycle.
+static PF_Err SequenceSetup(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef*[], PF_LayerDef*) {
+    if (out_data->sequence_data) PF_DISPOSE_HANDLE(out_data->sequence_data);
+    PF_Handle h = PF_NEW_HANDLE(sizeof(CG_SequenceData));
+    if (!h) return PF_Err_INTERNAL_STRUCT_DAMAGED;
+    CG_SequenceData* sd = reinterpret_cast<CG_SequenceData*>(PF_LOCK_HANDLE(h));
+    if (sd) {
+        sd->magic = CG_SEQ_MAGIC;
+        sd->version = CG_SEQ_VERSION;
+        PackUid(sd, GenUid());
+        PF_UNLOCK_HANDLE(h);
+    }
+    out_data->sequence_data = h;
+    return PF_Err_NONE;
+}
+
+static PF_Err SequenceResetup(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* params[], PF_LayerDef* output) {
+    if (!in_data->sequence_data) return SequenceSetup(in_data, out_data, params, output);
+    // Reseed with a fresh uid so a duplicated/reloaded instance gets its own key.
+    CG_SequenceData* sd = reinterpret_cast<CG_SequenceData*>(PF_LOCK_HANDLE(in_data->sequence_data));
+    if (sd) {
+        sd->magic = CG_SEQ_MAGIC;
+        sd->version = CG_SEQ_VERSION;
+        PackUid(sd, GenUid());
+        PF_UNLOCK_HANDLE(in_data->sequence_data);
+    }
+    return PF_Err_NONE;
+}
+
+// Effect instance removed (deleted from the layer, comp closed): close its window,
+// dispose its captured AEGP effect ref, and free the sequence data.
 static PF_Err SequenceSetdown(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef*[], PF_LayerDef*) {
-    cg::editor::EditorHost::instance().close(EffectKey(in_data));
+    const cg::editor::InstanceKey key = SeqKey(in_data);
+    cg::editor::EditorHost::instance().close(key);
+    DisposeEffectRefForKey(key);
+    if (in_data->sequence_data) {
+        PF_DISPOSE_HANDLE(in_data->sequence_data);
+        out_data->sequence_data = NULL;
+    }
     return PF_Err_NONE;
 }
 
@@ -540,7 +815,11 @@ static PF_Err UserChangedParam(PF_InData* in_data, PF_OutData* out_data,
             params[CG_SKIN_PROTECTION]->u.fs_d.value / 100.0,
             params[CG_CHROMA_GAIN]->u.fs_d.value / 100.0,
             params[CG_LUT_SOURCE]->u.pd.value);
-        cg::editor::EditorHost::instance().open(EffectKey(in_data), seed);
+        const cg::editor::InstanceKey key = SeqKey(in_data);
+        cg::editor::EditorHost::instance().open(key, seed);
+        // Capture this instance's AEGP effect ref (main-thread context) so the idle
+        // hook can write window edits back onto its param streams.
+        CaptureEffectRefForKey(in_data, key);
     }
 
     // Flush any edits the editor window produced back onto the params (spike driver:
@@ -786,6 +1065,12 @@ PF_Err EffectMain(PF_Cmd cmd, PF_InData* in_data, PF_OutData* out_data,
                 break;
             case PF_Cmd_GLOBAL_SETDOWN:
                 err = GlobalSetdown(in_data, out_data, params, output);
+                break;
+            case PF_Cmd_SEQUENCE_SETUP:
+                err = SequenceSetup(in_data, out_data, params, output);
+                break;
+            case PF_Cmd_SEQUENCE_RESETUP:
+                err = SequenceResetup(in_data, out_data, params, output);
                 break;
             case PF_Cmd_SEQUENCE_SETDOWN:
                 err = SequenceSetdown(in_data, out_data, params, output);

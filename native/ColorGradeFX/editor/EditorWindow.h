@@ -53,6 +53,13 @@ public:
     // none / no window). The caller applies them to the effect's params.
     std::vector<ParamEdit> drainEdits(InstanceKey key);
 
+    // The keys of all currently-open windows (for the idle-hook driver to iterate).
+    std::vector<InstanceKey> openKeys();
+
+    // True if the window for `key` has edits waiting - the idle hook's cheap fast-path
+    // check so it does no AEGP work when nothing changed.
+    bool hasPendingEdits(InstanceKey key);
+
     // Did the user request the window be closed (clicked its close box)? Lets the
     // effect release a window that the user dismissed, without a per-instance hook.
     bool consumeCloseRequest(InstanceKey key);

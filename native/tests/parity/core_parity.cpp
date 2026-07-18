@@ -196,6 +196,39 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    if (cmd == "lutdecode" && argc == 12) {
+        // Exercise the effect's Embedded/External Correct path (ComposeDecodeIntoLut):
+        // a baked raw LUT resampled through the decode - newLut(x) = rawLut(decode(x)).
+        // Uses a baked grade LUT as the stand-in raw LUT (both engines bake it
+        // identically), then composes decode via the ported sampleLut.
+        const size_t n = static_cast<size_t>(std::strtoull(argv[3], nullptr, 10));
+        std::vector<float> px = readF32(argv[2], n);
+        Theme theme;
+        if (!getTheme(argv[4], theme)) {
+            std::fprintf(stderr, "core_parity: unknown theme %s\n", argv[4]);
+            return 2;
+        }
+        EngineOptions opts;
+        if (std::atoi(argv[5])) opts.strength = std::atof(argv[6]);
+        if (std::atoi(argv[7])) opts.skinProtection = std::atof(argv[8]);
+        const int size = std::atoi(argv[9]);
+        const LogProfile* profile = getProfile(argv[10]);
+        if (!profile) { std::fprintf(stderr, "core_parity: unknown profile %s\n", argv[10]); return 2; }
+        FootageStats stats = computeStats(px.data(), px.size());
+        cg::Lut3D raw = bakeGradeLut(stats, theme, opts, size);
+        cg::Lut3D lut = bakeLut(
+            [&raw, profile](const Vec3d& x) -> Vec3d {
+                const Vec3d dec = decodePixelToRec709(x, *profile);
+                const cg::Vec3 s = cg::sampleLut(
+                    raw, cg::Vec3{static_cast<float>(dec[0]), static_cast<float>(dec[1]),
+                                  static_cast<float>(dec[2])});
+                return Vec3d{s[0], s[1], s[2]};
+            },
+            size);
+        writeF32(argv[11], lut.data);
+        return 0;
+    }
+
     if (cmd == "decode" && argc == 5) {
         const LogProfile* profile = getProfile(argv[2]);
         if (!profile) { std::fprintf(stderr, "core_parity: unknown profile %s\n", argv[2]); return 2; }

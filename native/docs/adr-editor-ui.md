@@ -179,13 +179,15 @@ continuous write driver (below).
 After the captain approved ImGui, the full control set landed on it:
 
 - **Correct tab:** a **Footage** profile popup (Rec.709 / V-Log) - a real, persisted
-  effect param (`CG_FOOTAGE_PROFILE`). It drives a native **decode stage**: the Auto
-  bake composes `grade(decode(x))` into one LUT when the clip is a log profile, so a
-  V-Log clip is decoded to Rec.709 *before* the grade, baked into a single LUT (CPU
-  and GPU apply paths stay identical - no per-pixel decode in the kernel). This
-  composition is proven bit-exact against the TS oracle by a new `gradedecode` case in
-  `npm run native:core-parity`. (Analyze/scopes stay Phase 5; the raw Embedded/
-  External LUT modes are unaffected by the decode stage, by design.)
+  effect param (`CG_FOOTAGE_PROFILE`). It drives a native **decode stage** that applies
+  in **every** LUT Source mode (captain directive - never leave V-Log footage
+  undecoded): pipeline order is always decode-then-LUT. Auto composes `grade(decode(x))`
+  into one LUT (continuous, no resample); Embedded/External resample their raw LUT
+  through the decode (`rawLut(decode(x))`) - both keep the per-pixel apply a single
+  trilinear sample so CPU and GPU stay identical. Rec.709 decodes to itself (no-op).
+  Both compositions are proven bit-exact / within 3.3e-7 of the TS oracle by the
+  `gradedecode` and `lutdecode` cases in `npm run native:core-parity`. (Analyze/scopes
+  stay Phase 5.)
 - **Grade tab:** Theme popup, Strength / Skin Protection / Chroma Gain sliders, LUT
   Source popup - all round-trip through the bridge to their params.
 - **Every control** reads (via `publishSnapshot`) and writes (via `drainEdits` ->
@@ -207,23 +209,26 @@ Two directions over the pure `EditorBridge.h` seam:
   updates). The queue **coalesces per field** so a fast drag is one write per changed
   field, not one per pixel of travel.
 
-**Production write path (post-decision, captain-verified in AE):** a **companion
-AEGP** plugin owns an `AEGP_RegisterIdleHook`, draining the queue on AE's main thread
-and applying each edit via `AEGP_StreamSuite`/`AEGP_DynamicStreamSuite` set-value,
-wrapped in **one** `AEGP_StartUndoGroup`/`EndUndoGroup` per gesture so a drag is a
-single undo step. The effect reaches AEGP via `AEGP_PFInterfaceSuite`. The spike's
-in-command drain (any param-change flushes the queue) stands in for the idle-hook
-driver until the companion AEGP lands.
+**Write driver (implemented; captain-verified in AE):** the effect registers a global
+**AEGP idle hook** via PICA - `AEGP_RegisterSuite5::AEGP_RegisterIdleHook`, no separate
+AEGP plugin/PiPL needed - after `AEGP_RegisterWithAEGP` gives it a plugin id. On AE's
+main thread the hook drains each open window's queue and writes each value onto the
+effect's param streams (`AEGP_StreamSuite5::AEGP_GetNewEffectStreamByIndex` +
+`AEGP_SetStreamValue`), wrapped in **one** `AEGP_StartUndoGroup`/`EndUndoGroup` per
+tick so a gesture is a single undo step. It reaches the right instance through a
+per-key **`AEGP_EffectRefH`** captured on a main-thread command (button-open) via
+`AEGP_PFInterfaceSuite1::AEGP_GetNewEffectForEffect`, disposed on close/setdown. The
+hook **cheap-noops** when no window has pending edits, so it never burdens AE. The
+in-`UserChangedParam` `CHANGED_VALUE` drain remains as a secondary flush. All AEGP
+calls are wrapped in `catch(...)`, so on a host without AEGP (e.g. Premiere) the driver
+is simply absent rather than fatal.
 
-**Undo grouping behavior to document/verify:** editor writes should group as one
-undo step per gesture (via the undo group above). Writes coming through
-`CHANGED_VALUE` in the spike path currently ride AE's normal param-undo; the
-companion-AEGP path makes the grouping explicit. This is on the AE-verification list.
-
-**Instance key:** the spike keys the registry on `in_data->effect_ref` (stable for an
-applied effect's lifetime within a session). Production hardening: store a generated
-uid in **sequence data** so the key survives an `effect_ref` reuse across
-delete/re-add and project reload.
+**Instance key (fixed):** `in_data->effect_ref` is **not stable across command types**
+(it differs between `USER_CHANGED_PARAM` and `SMART_PRE_RENDER`), which is why the
+first cut's publish/drain targeted the wrong/no window and the round-trip was dead in
+live AE. The key is now a uid stored in **sequence data** (flat POD, reseeded on
+SETUP/RESETUP so a duplicated/reloaded effect never shares a key), consistent across
+every command for one instance.
 
 ## Consequences
 
@@ -233,9 +238,14 @@ delete/re-add and project reload.
 - **Negative:** `src/panel` Preact controls are not reused as code (the design is).
   Immediate-mode UI is less "designer-friendly" than HTML/CSS for heavy visual
   polish - acceptable for a pro color tool, revisit if that changes.
-- **Follow-ups:** companion AEGP + idle-hook write driver; sequence-data instance
-  uid; Metal/Cocoa backend for the Mac target; the full Correct/Grade control set +
-  live preview + scopes (Phases 4-5).
+- **Follow-ups:** Metal/Cocoa backend for the Mac target; live preview + scopes
+  (Phases 4-5). (The idle-hook write driver, sequence-data uid, and the full
+  Correct/Grade control set landed in Phase 3.)
+- **Strength-blend note (Embedded/External + V-Log):** with decode composed into the
+  raw LUT, the Strength slider blends the corrected+graded result against the *original
+  log* input, so intermediate Strength on a log clip under a raw LUT is slightly
+  non-physical. Full-Strength (the default for a look) is correct; Auto mode is
+  unaffected. Acceptable for the raw-LUT advanced modes; revisit if it matters.
 
 ## AE verification checklist (captain-assisted)
 

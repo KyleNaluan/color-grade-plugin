@@ -136,6 +136,9 @@
     <ClCompile Include="..\ColorGrade.cpp" />
     <ClCompile Include="..\editor\EditorWindow.cpp" />
     <ClCompile Include="$(AE_SDK_EXAMPLES)\Util\Smart_Utils.cpp" />
+    <!-- AEGP_SuiteHandler impl: the effect uses AEGP suites via PICA for the editor
+         bridge (idle-hook driver + stream writes). Same convention as Smart_Utils. -->
+    <ClCompile Include="$(AE_SDK_EXAMPLES)\Util\AEGP_SuiteHandler.cpp" />
     <ClCompile Include="$(AE_SDK_EXAMPLES)\Util\DirectXUtils.cpp" Condition="'$(CG_GPU)'=='true'" />
     <!-- Dear ImGui (vendored, third_party/imgui) + Win32/D3D11 backends: the Phase 3
          editor toolkit. Compiled into the .aex; zero external runtime dependency. -->
