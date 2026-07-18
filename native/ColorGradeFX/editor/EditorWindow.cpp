@@ -372,8 +372,8 @@ void RunWindowThread(WindowImpl* w, ParamSnapshot seed) {
     w->imguiCtx = nullptr;
     ImGui::SetCurrentContext(nullptr);
     CleanupDeviceD3D(w);
-    HWND hwnd = w->hwnd.exchange(nullptr);
-    if (hwnd) ::DestroyWindow(hwnd);
+    HWND doomed = w->hwnd.exchange(nullptr);
+    if (doomed) ::DestroyWindow(doomed);
     w->finished.store(true);
 }
 
