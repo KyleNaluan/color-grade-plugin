@@ -100,6 +100,15 @@ struct EffectContext {
 };
 static std::map<cg::editor::InstanceKey, EffectContext> g_effectCtx;
 
+// Consecutive "cannot verify" idle ticks per instance (main thread only). A single
+// could-not-verify tick is treated as transient and never force-closes the window
+// (review finding: a stale/failed capture must not kill a live window). But a PERSISTENT
+// failure - the parent layer or comp was deleted, so the cached layer handle no longer
+// enumerates - closes the lingering window once it reaches CG_VERIFY_FAIL_LIMIT
+// (captain: layer/comp deletion is crash-safe but leaves the window open; close it).
+static std::map<cg::editor::InstanceKey, int> g_verifyFailures;
+#define CG_VERIFY_FAIL_LIMIT 6  // ~0.8s at the windowed idle cadence (<=133ms/tick)
+
 // Last param values the idle hook published to each window (touched only from the
 // idle hook, which runs serially on the main thread - so no mutex). Lets the EC->window
 // poll publish only when something actually changed, avoiding revision churn.
@@ -600,23 +609,44 @@ static void ForgetEffectContextForKey(cg::editor::InstanceKey key) {
     g_effectCtx.erase(key);  // layerH is not owned, so nothing to dispose
 }
 
+// Outcome of trying to re-derive a live effect ref for an open window this tick.
+enum class EffectResolution {
+    Alive,         // found our effect on its live layer; outH is set (caller disposes)
+    ConfirmedGone, // the layer is live and has effects, but none are ours -> effect deleted
+    CannotVerify,  // couldn't determine: no/partial context, or the layer no longer enumerates
+                   // (layer/comp deleted) - treated as transient until it PERSISTS (see hook)
+};
+
 // Re-derive a FRESH, valid AEGP effect ref for `key` by scanning its captured layer's
-// current effects for one whose installed key matches ours. Returns the matched ref (the
-// CALLER MUST dispose it with AEGP_DisposeEffect) or null if our effect is no longer on
-// the layer (i.e. it was deleted). Every call here is on the live layer or on fresh
-// handles, so none can raise the stale-ref modal. (Multi-instance note: if two CG effects
-// share one layer, this returns the first match - acceptable, non-crashing; documented.)
-static AEGP_EffectRefH LiveEffectForKey(AEGP_SuiteHandler& sh, cg::editor::InstanceKey key) {
+// current effects for one whose installed key matches ours. On EffectResolution::Alive,
+// `outH` receives the matched ref and the CALLER MUST dispose it (AEGP_DisposeEffect).
+// Every call here is on the live layer or on fresh handles, so none can raise the
+// stale-ref modal. The tri-state lets the idle hook close promptly on a confirmed effect
+// deletion (live layer, no match) yet tolerate a transient "cannot verify" - only closing
+// on that once it persists (the layer/comp itself was deleted; captain-verified crash-safe
+// but otherwise leaves the window lingering). (Multi-instance note: if two CG effects share
+// one layer, this returns the first match - acceptable, non-crashing; documented.)
+static EffectResolution ResolveLiveEffect(AEGP_SuiteHandler& sh, cg::editor::InstanceKey key,
+                                          AEGP_EffectRefH& outH) {
+    outH = nullptr;
     EffectContext ctx;
     {
         std::lock_guard<std::mutex> lk(g_effMutex);
         auto it = g_effectCtx.find(key);
-        if (it == g_effectCtx.end()) return nullptr;
+        if (it == g_effectCtx.end()) return EffectResolution::CannotVerify;  // never captured
         ctx = it->second;
     }
-    if (!ctx.layerH) return nullptr;
+    // No layer, or a partial capture with no installed key to match on: not a confirmed
+    // deletion, just unverifiable. (A capture failure at open lands here; the idle hook's
+    // counter still closes it if it never recovers, without a first-tick force-close.)
+    if (!ctx.layerH || ctx.installedKey == AEGP_InstalledEffectKey_NONE) {
+        return EffectResolution::CannotVerify;
+    }
     A_long num = 0;
-    if (sh.EffectSuite5()->AEGP_GetLayerNumEffects(ctx.layerH, &num) || num <= 0) return nullptr;
+    if (sh.EffectSuite5()->AEGP_GetLayerNumEffects(ctx.layerH, &num)) {
+        return EffectResolution::CannotVerify;  // layer no longer enumerates (layer/comp gone)
+    }
+    if (num <= 0) return EffectResolution::CannotVerify;  // empty enumeration -> treat as failure
     for (A_long i = 0; i < num; ++i) {
         AEGP_EffectRefH candH = nullptr;
         if (sh.EffectSuite5()->AEGP_GetLayerEffectByIndex(g_aegpId, ctx.layerH,
@@ -626,12 +656,14 @@ static AEGP_EffectRefH LiveEffectForKey(AEGP_SuiteHandler& sh, cg::editor::Insta
         }
         AEGP_InstalledEffectKey candKey = AEGP_InstalledEffectKey_NONE;
         A_Err e = sh.EffectSuite5()->AEGP_GetInstalledKeyFromLayerEffect(candH, &candKey);
-        if (!e && candKey == ctx.installedKey && ctx.installedKey != AEGP_InstalledEffectKey_NONE) {
-            return candH;  // caller disposes
+        if (!e && candKey == ctx.installedKey) {
+            outH = candH;  // caller disposes
+            return EffectResolution::Alive;
         }
         sh.EffectSuite5()->AEGP_DisposeEffect(candH);
     }
-    return nullptr;  // our effect is gone (deleted)
+    // Live layer, enumerated its effects, none are ours: our effect was deleted.
+    return EffectResolution::ConfirmedGone;
 }
 
 // Read one param stream's scalar (one_d) value at t=0 (our value params don't
@@ -821,9 +853,13 @@ static void DrivePreviewForKey(AEGP_SuiteHandler& sh, cg::editor::InstanceKey ke
         std::shared_ptr<const cg::editor::PreviewFrame> cf = frame;
         drv.cache.put(pk, cf);
         cg::editor::EditorHost::instance().publishPreviewFrame(key, cf);
-        drv.lastKey = pk;
-        drv.hasLast = true;
     }
+    // Record the attempted key as current EITHER WAY. On success the window now shows it;
+    // on failure this suppresses an immediate re-render of the same key next tick (a
+    // persistently-failing checkout would otherwise drive a hot synchronous render every
+    // idle tick). The next genuine scrub/param change moves the key and retries.
+    drv.lastKey = pk;
+    drv.hasLast = true;
 }
 
 // The AEGP idle hook: main thread, fires while AE is idle. Cheap-noops unless a window
@@ -847,6 +883,7 @@ static A_Err CG_IdleHook(AEGP_GlobalRefcon, AEGP_IdleRefcon, A_long* max_sleepPL
         for (auto k : orphans) {
             ForgetEffectContextForKey(k);
             g_lastPolled.erase(k);
+            g_verifyFailures.erase(k);
             g_previewDrivers.erase(k);  // free the closed window's cached preview frames
         }
     }
@@ -855,23 +892,39 @@ static A_Err CG_IdleHook(AEGP_GlobalRefcon, AEGP_IdleRefcon, A_long* max_sleepPL
         for (auto key : keys) {
             // Re-derive a FRESH, valid effect ref by enumerating the live layer's effects
             // (never dereference a possibly-stale captured ref - that crashes AE when the
-            // effect was deleted). Null => the effect is no longer on the layer, i.e. it
-            // was deleted with the window open: tear the window down (Phase 3 "delete
-            // effect -> window closes"). Every stream/write/render call below then runs on
-            // this fresh handle, and the window->effect write can't fire on a dead ref
-            // because we already `continue`d.
+            // effect was deleted). The tri-state resolution decides how to react:
+            //   Alive         -> use the fresh handle this tick; reset the failure counter.
+            //   ConfirmedGone -> the effect was deleted (live layer, no match): close the
+            //                    window promptly (Phase 3 "delete effect -> window closes").
+            //   CannotVerify  -> couldn't confirm (partial/failed capture, or the layer/comp
+            //                    was deleted so the layer no longer enumerates). A single
+            //                    such tick is treated as transient and never force-closes a
+            //                    live window; only a PERSISTENT run (>= CG_VERIFY_FAIL_LIMIT
+            //                    consecutive) closes the lingering window.
+            auto closeAndForget = [&](cg::editor::InstanceKey k) {
+                host.close(k);
+                ForgetEffectContextForKey(k);
+                g_lastPolled.erase(k);
+                g_verifyFailures.erase(k);
+                g_previewDrivers.erase(k);
+            };
             AEGP_EffectRefH effectH = nullptr;
+            EffectResolution res = EffectResolution::CannotVerify;
             try {
                 AEGP_SuiteHandler sh(g_spbasic);
-                effectH = LiveEffectForKey(sh, key);
-            } catch (...) { effectH = nullptr; }
-            if (!effectH) {
-                host.close(key);
-                ForgetEffectContextForKey(key);
-                g_lastPolled.erase(key);
-                g_previewDrivers.erase(key);
+                res = ResolveLiveEffect(sh, key, effectH);
+            } catch (...) { res = EffectResolution::CannotVerify; effectH = nullptr; }
+
+            if (res == EffectResolution::ConfirmedGone) {
+                closeAndForget(key);
                 continue;
             }
+            if (res == EffectResolution::CannotVerify) {
+                int fails = ++g_verifyFailures[key];
+                if (fails >= CG_VERIFY_FAIL_LIMIT) closeAndForget(key);
+                continue;  // transient: leave the window open and retry next tick
+            }
+            g_verifyFailures[key] = 0;  // Alive: clear any accrued transient failures
             // Dispose the fresh ref no matter how we leave this iteration.
             auto effGuard = cg::editor::makeScopedCheckin([&] {
                 try { AEGP_SuiteHandler sh(g_spbasic); sh.EffectSuite5()->AEGP_DisposeEffect(effectH); }
@@ -1031,6 +1084,7 @@ static PF_Err SequenceSetdown(PF_InData* in_data, PF_OutData* out_data, PF_Param
     const cg::editor::InstanceKey key = SeqKey(in_data);
     cg::editor::EditorHost::instance().close(key);
     ForgetEffectContextForKey(key);
+    g_verifyFailures.erase(key);
     if (in_data->sequence_data) {
         PF_DISPOSE_HANDLE(in_data->sequence_data);
         out_data->sequence_data = NULL;
