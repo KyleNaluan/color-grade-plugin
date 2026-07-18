@@ -142,6 +142,33 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    if (cmd == "chromaslider" && argc == 12) {
+        // Exercise the effect's Chroma Gain slider path (BakeAutoLut): the slider is
+        // a RELATIVE multiplier on the theme's authored chromaGain, not an override.
+        // Mirrors BakeAutoLut's `ov.chromaGain = authored * factor` so factor=1.0
+        // must reproduce the plain by-name grade bit-exact.
+        const size_t n = static_cast<size_t>(std::strtoull(argv[3], nullptr, 10));
+        std::vector<float> px = readF32(argv[2], n);
+        Theme theme;
+        if (!getTheme(argv[4], theme)) {
+            std::fprintf(stderr, "core_parity: unknown theme %s\n", argv[4]);
+            return 2;
+        }
+        EngineOptions opts;
+        if (std::atoi(argv[5])) opts.strength = std::atof(argv[6]);
+        if (std::atoi(argv[7])) opts.skinProtection = std::atof(argv[8]);
+        const int size = std::atoi(argv[9]);
+        const double factor = std::atof(argv[10]);
+        cg::core::ThemeOverrides ov = theme.overrides.value_or(cg::core::ThemeOverrides{});
+        const double authored = ov.chromaGain.value_or(1.0);
+        ov.chromaGain = authored * factor;
+        theme.overrides = ov;
+        FootageStats stats = computeStats(px.data(), px.size());
+        cg::Lut3D lut = bakeGradeLut(stats, theme, opts, size);
+        writeF32(argv[11], lut.data);
+        return 0;
+    }
+
     if (cmd == "decode" && argc == 5) {
         const LogProfile* profile = getProfile(argv[2]);
         if (!profile) { std::fprintf(stderr, "core_parity: unknown profile %s\n", argv[2]); return 2; }

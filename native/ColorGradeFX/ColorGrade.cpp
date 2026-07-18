@@ -116,13 +116,16 @@ static cg::core::Theme ThemeFromPopup(A_long themePopup) {
 // Bake the Auto-mode grade LUT natively: the popup theme supplies the look, the
 // arb-data recipe supplies the measured source stats, and the sliders drive the
 // engine knobs (strength / skinProtection as EngineOptions, chroma-gain as a
-// per-theme override). This is the in-effect counterpart to the TS bakeGradeLut;
-// the cross-engine golden harness proves the two agree.
+// relative multiplier on the theme's authored chromaGain). This is the in-effect
+// counterpart to the TS bakeGradeLut; the cross-engine golden harness proves the
+// two agree. The chromaGain arg is the slider fraction (slider/100), so 100% (=1.0)
+// preserves each theme's authored chromaGain exactly and the slider scales from there.
 static void BakeAutoLut(A_long themePopup, double strength01, double skin01, double chromaGain,
                         const cg::core::RecipeData& recipe, cg::Lut3D& dst) {
     cg::core::Theme theme = ThemeFromPopup(themePopup);
     cg::core::ThemeOverrides ov = theme.overrides.value_or(cg::core::ThemeOverrides{});
-    ov.chromaGain = chromaGain;  // chroma-gain slider overrides the theme default
+    const double authored = ov.chromaGain.value_or(1.0);
+    ov.chromaGain = authored * chromaGain;  // slider scales the theme's authored gain
     theme.overrides = ov;
 
     cg::core::FootageStats src = cg::core::statsFromData(recipe.sourceStats);
@@ -194,24 +197,29 @@ static PF_Err HandleArbitrary(PF_InData* in_data, PF_OutData* out_data, PF_ArbPa
                 PF_UNLOCK_HANDLE(extra->u.flatten_func_params.arbH);
             }
             break;
-        case PF_Arbitrary_UNFLATTEN_FUNC:
-            if (extra->u.unflatten_func_params.buf_sizeLu >= sizeof(RecipeData)) {
-                PF_Handle handle = PF_NEW_HANDLE(sizeof(RecipeData));
-                if (!handle) return PF_Err_OUT_OF_MEMORY;
-                RecipeData* dstP = reinterpret_cast<RecipeData*>(PF_LOCK_HANDLE(handle));
-                if (dstP) {
+        case PF_Arbitrary_UNFLATTEN_FUNC: {
+            PF_Handle handle = PF_NEW_HANDLE(sizeof(RecipeData));
+            if (!handle) return PF_Err_OUT_OF_MEMORY;
+            RecipeData* dstP = reinterpret_cast<RecipeData*>(PF_LOCK_HANDLE(handle));
+            if (dstP) {
+                // Only trust a blob whose size matches; otherwise (foreign/older/grown
+                // struct) it is unusable, so reseed to the default recipe. Never leave
+                // *arbPH unset - AE must always receive a valid handle.
+                bool usable = extra->u.unflatten_func_params.buf_sizeLu == sizeof(RecipeData);
+                if (usable) {
                     std::memcpy(dstP, extra->u.unflatten_func_params.flat_dataPV, sizeof(RecipeData));
-                    // Reject a foreign/older blob: reseed to the default recipe.
-                    if (dstP->magic != cg::core::RECIPE_MAGIC || dstP->version != cg::core::RECIPE_VERSION) {
-                        cg::core::Theme th = cg::core::tealOrangeTheme();
-                        RecipeData def = cg::core::recipeFromTheme(th, th.targetStats);
-                        std::memcpy(dstP, &def, sizeof(RecipeData));
-                    }
+                    usable = dstP->magic == cg::core::RECIPE_MAGIC && dstP->version == cg::core::RECIPE_VERSION;
                 }
-                *(extra->u.unflatten_func_params.arbPH) = handle;
-                PF_UNLOCK_HANDLE(handle);
+                if (!usable) {
+                    cg::core::Theme th = cg::core::tealOrangeTheme();
+                    RecipeData def = cg::core::recipeFromTheme(th, th.targetStats);
+                    std::memcpy(dstP, &def, sizeof(RecipeData));
+                }
             }
+            *(extra->u.unflatten_func_params.arbPH) = handle;
+            PF_UNLOCK_HANDLE(handle);
             break;
+        }
         case PF_Arbitrary_INTERP_FUNC:
             // No meaningful tween for a grade recipe; snap to the left keyframe.
             err = CreateDefaultRecipe(in_data, extra->u.interp_func_params.interpPH);

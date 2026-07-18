@@ -316,6 +316,32 @@ function main(): void {
     }
   }
 
+  // --- Chroma Gain slider parity (effect BakeAutoLut): the slider is a RELATIVE
+  //     multiplier on the theme's authored chromaGain, so slider factor 1.0 must
+  //     reproduce the plain by-name grade bit-exact (100% = authored). This is the
+  //     one path the by-name bakes never exercise. ---
+  const chromaFactors = [1.0, 0.5, 1.5];
+  for (const [themeName, theme] of Object.entries(THEMES)) {
+    const authored = theme.overrides?.chromaGain ?? 1;
+    for (const f of frames) {
+      const stats = computeStats(f.pixels);
+      for (const factor of chromaFactors) {
+        const themeWithChroma = {
+          ...theme,
+          overrides: { ...(theme.overrides ?? {}), chromaGain: authored * factor },
+        };
+        const ref: Lut3D = bakeGradeLut(stats, themeWithChroma, {}, 33);
+        const outPath = join(tmp, `chroma-${themeName}-${f.name}-${factor}.f32`);
+        runCpp(ctx, [
+          'chromaslider', framePaths.get(f.name)!, String(f.pixels.length),
+          themeName, '0', '0', '0', '0', '33', String(factor), outPath,
+        ]);
+        const got = readF32(outPath, ref.data.length);
+        track(gradeT, ref.data, got, `chroma:${themeName}/${f.name}/x${factor}`);
+      }
+    }
+  }
+
   // --- bakeDecodeLut parity: every profile, grade + fine grids ---
   for (const profileKey of Object.keys(PROFILES)) {
     for (const size of [33, 65]) {
