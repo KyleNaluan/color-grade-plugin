@@ -169,6 +169,7 @@ describe('expanded overrides', () => {
       chromaGain: 2,
       shadowTint: [30, -30],
       highlightTint: [-30, 30],
+      midtoneTint: [-30, 30],
     });
     const t = buildTransform(stats, extreme, { strength: 1, skinProtection: 0 });
     for (let r = 0; r <= 4; r++)
@@ -180,6 +181,117 @@ describe('expanded overrides', () => {
             expect(out[c]).toBeLessThanOrEqual(1);
           }
         }
+  });
+});
+
+describe('midtone tint', () => {
+  // Synthetic reproduction of the scout report's Experiment A round-2 gap
+  // (`firstmate/data/cg-agent-grade-s7/report.md`): a uniform olive cast
+  // sitting entirely in the midtone luma band. shadowTint/highlightTint are
+  // weighted by bandWeights(), which is ~0 for shadows/highlights when every
+  // pixel's luma sits deep in the mids - so they cannot reach it. midtoneTint
+  // uses the same band-weighting approach against the mids weight instead.
+  function midtoneCastFrame(n: number): Float32Array {
+    let seed = 99;
+    const rand = () => ((seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff);
+    const px = new Float32Array(n * 3);
+    for (let i = 0; i < px.length; i += 3) {
+      // Luma ~0.5-0.6, comfortably inside SHADOW_MID_SPLIT..MID_HIGHLIGHT_SPLIT
+      // (0.25-0.7) with room to spare from the 0.08 feather on either edge.
+      const base = 0.5 + rand() * 0.08;
+      // Olive cast: boost green, cut blue relative to the neutral base.
+      px[i] = Math.min(1, Math.max(0, base - 0.02 + (rand() - 0.5) * 0.02));
+      px[i + 1] = Math.min(1, Math.max(0, base + 0.08 + (rand() - 0.5) * 0.02));
+      px[i + 2] = Math.min(1, Math.max(0, base - 0.1 + (rand() - 0.5) * 0.02));
+    }
+    return px;
+  }
+
+  function meanAB(px: Float32Array): [number, number] {
+    let sumA = 0;
+    let sumB = 0;
+    let n = 0;
+    for (let i = 0; i < px.length; i += 3) {
+      const lab = encodedRec709ToLab(px[i]!, px[i + 1]!, px[i + 2]!);
+      sumA += lab[1];
+      sumB += lab[2];
+      n++;
+    }
+    return [sumA / n, sumB / n];
+  }
+
+  function applyToFrame(t: (p: Vec3) => Vec3, px: Float32Array): Float32Array {
+    const out = new Float32Array(px.length);
+    for (let i = 0; i < px.length; i += 3) {
+      const o = t([px[i]!, px[i + 1]!, px[i + 2]!]);
+      out[i] = o[0]!;
+      out[i + 1] = o[1]!;
+      out[i + 2] = o[2]!;
+    }
+    return out;
+  }
+
+  const frame = midtoneCastFrame(4000);
+  const src = computeStats(frame);
+  const [srcA, srcB] = meanAB(frame);
+  // Sanity: the fixture is a real, sizable cast, not a rounding artifact.
+  const srcCastMag = Math.hypot(srcA, srcB);
+
+  // Target = source stats verbatim: the automatic stat-matching stage is
+  // already fully converged (no tone-curve stretch, no mean-shift, no
+  // band-scale change), isolating the tint overrides as the only thing left
+  // that can move color - exactly the round-2 situation in the scout report.
+  const target: FootageStats = src;
+  const baseKnobs = { strength: { default: 1 }, skinProtection: { default: 0 } };
+
+  it('fixture cast is sizable and lands in the midtone band', () => {
+    expect(srcCastMag).toBeGreaterThan(8);
+  });
+
+  it('shadow+highlight tints alone cannot cancel a midtone-concentrated cast', () => {
+    const theme: Theme = {
+      name: 'midtone-cast-repro',
+      description: 'synthetic repro of the scout report Experiment A round-2 gap',
+      targetStats: target,
+      knobs: baseKnobs,
+      overrides: { shadowTint: [-srcA, -srcB], highlightTint: [-srcA, -srcB] },
+    };
+    const t = buildTransform(src, theme, { strength: 1, skinProtection: 0 });
+    const [outA, outB] = meanAB(applyToFrame(t, frame));
+    // Barely moved: shadow/highlight band weight is ~0 for these all-midtone pixels.
+    expect(Math.hypot(outA, outB)).toBeGreaterThan(srcCastMag * 0.8);
+  });
+
+  it('midtoneTint cancels the same cast, driving mean a/b near neutral', () => {
+    const theme: Theme = {
+      name: 'midtone-cast-fixed',
+      description: 'same repro, with midtoneTint added',
+      targetStats: target,
+      knobs: baseKnobs,
+      overrides: {
+        shadowTint: [-srcA, -srcB],
+        highlightTint: [-srcA, -srcB],
+        midtoneTint: [-srcA, -srcB],
+      },
+    };
+    const t = buildTransform(src, theme, { strength: 1, skinProtection: 0 });
+    const [outA, outB] = meanAB(applyToFrame(t, frame));
+    expect(Math.hypot(outA, outB)).toBeLessThan(2);
+  });
+
+  it('is a no-op when unset (no regression to shadow/highlight-only behavior)', () => {
+    const withMidtone: Theme = {
+      name: 'a',
+      description: 'a',
+      targetStats: target,
+      knobs: baseKnobs,
+      overrides: { shadowTint: [4, -4], highlightTint: [-4, 4], midtoneTint: undefined },
+    };
+    const without: Theme = { ...withMidtone, overrides: { shadowTint: [4, -4], highlightTint: [-4, 4] } };
+    const px: Vec3 = [0.5, 0.55, 0.42];
+    const outWith = buildTransform(src, withMidtone, { strength: 1, skinProtection: 0 })(px);
+    const outWithout = buildTransform(src, without, { strength: 1, skinProtection: 0 })(px);
+    for (let c = 0; c < 3; c++) expect(outWith[c]).toBeCloseTo(outWithout[c]!, 10);
   });
 });
 
