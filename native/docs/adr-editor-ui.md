@@ -378,3 +378,12 @@ and the build is loaded:
    AE / closing the project leaves no orphan window.
 6. **Undo:** an editor edit is undoable; document how it groups (one step per gesture
    once the companion-AEGP undo group lands).
+7. **Live preview (Phase 4):** the window shows the actual clip frame, centered +
+   letterboxed. Scrubbing the timeline updates it; changing any grade param (in the
+   window or Effect Controls) re-renders it; scrubbing back to a visited time/param
+   state serves instantly from the cache. On a V-Log clip in any LUT Source mode the
+   preview is decoded (not washed-out log).
+8. **Deletion lifecycle (Phase 4):** with a window open, deleting the effect closes the
+   window promptly (no modal, no crash); undo restores the effect and re-opening works;
+   deleting the layer or comp, and swapping/removing the source footage, also close the
+   window without a stale-ref modal.
