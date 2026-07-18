@@ -312,18 +312,28 @@ until the next scrub/param nudge. (c) Scopes + before/after are Phase 5.
   be dismissed out from under the user. Revisit (e.g. defer teardown, or re-open on the
   matching RESETUP) if that surfaces.
 
-- **Effect deletion is detected by the idle hook, not SEQUENCE_SETDOWN.** Phase 4
-  captain verification (round 1) found that deleting the effect while its editor window
-  is open does **not** reliably reach `SEQUENCE_SETDOWN` in time (the window stayed open),
-  and the idle hook then polled the now-stale `AEGP_EffectRefH`: `AEGP_GetNewStreamValue`
-  on the resulting `AEGP_StreamType_NO_DATA` stream raised AE's modal *"Cannot get
-  AEGP_StreamValue2 for NO_DATA streams" (5027::247)* every tick (a modal no `catch(...)`
-  can swallow). Fix: the idle hook probes `EffectRefAlive` (a `AEGP_GetStreamType` on the
-  CG_THEME stream - safe on a stale ref; only `GetNewStreamValue` raises) at the top of
-  each per-window pass; a `NO_DATA` type means the effect was deleted, so it closes the
-  window + disposes the ref, giving the Phase 3 "delete effect -> window closes" behavior.
-  A defensive `NO_DATA` type-check in `ReadStreamOneD` is the belt-and-suspenders guard so
-  the modal can never fire even if a delete races a poll within one tick.
+- **Effect deletion is detected by the idle hook re-enumerating the layer, not by
+  SEQUENCE_SETDOWN and not by touching the effect ref.** Phase 4 captain verification
+  found that deleting the effect while its editor window is open does **not** reliably
+  reach `SEQUENCE_SETDOWN` in time (the window stayed open), leaving the idle hook to use
+  a now-stale effect ref. Any call against that stale ref crashes AE with an uncatchable
+  modal: `AEGP_GetNewStreamValue` on the collapsed stream raised *"...NO_DATA streams"
+  (5027::247)* (round 1), and even `AEGP_GetNewEffectStreamByIndex` / `AEGP_GetStreamType`
+  by index into the collapsed stream group raised *"invalid index in indexed group"* then
+  a hard crash (round 2). **Conclusion: never touch ANY stream of a possibly-stale ref.**
+  Final design: the idle hook keeps **no** persistent `AEGP_EffectRefH`. At button-open it
+  captures only the parent **layer** (`AEGP_GetEffectLayer`) + our **installed-effect key**.
+  Each tick it re-derives a *fresh, valid* ref via `LiveEffectForKey`: enumerate the live
+  layer's effects (`AEGP_GetLayerNumEffects` + `AEGP_GetLayerEffectByIndex`, always safe on
+  a live layer) and match ours by installed key. No match => the effect was deleted =>
+  close the window (Phase 3 "delete effect -> window closes"). All stream/write/render
+  calls that tick run on the fresh handle, which is disposed at the end of the pass. A
+  defensive `NO_DATA` type-check remains in `ReadStreamOneD` as belt-and-suspenders.
+  **Multi-instance limitation:** if two CG effects share one layer, `LiveEffectForKey`
+  matches the *first* by installed key (the layer-effect APIs expose no per-instance id
+  from the idle hook), so two open editors on the same layer could both bind the first
+  effect - acceptable and non-crashing; revisit if per-instance targeting on a shared
+  layer is needed.
 
 ## AE verification checklist (captain-assisted)
 

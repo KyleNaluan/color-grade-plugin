@@ -83,10 +83,22 @@ static SPBasicSuite*    g_spbasic = nullptr;   // cached PICA basic suite (from 
 static AEGP_PluginID    g_aegpId = 0;          // our AEGP id (for stream/undo calls)
 static bool             g_idleHookRegistered = false;
 
-// Per-instance AEGP effect refs, captured on the main thread (button-open), used by
-// the idle hook to reach the effect's param streams. Disposed on close/setdown.
-static std::mutex                                         g_effMutex;
-static std::map<cg::editor::InstanceKey, AEGP_EffectRefH> g_effectRefs;
+// Per-instance effect CONTEXT, captured on the main thread (button-open): the parent
+// layer + our installed-effect key. The idle hook does NOT keep a persistent
+// AEGP_EffectRefH - a captured ref dangles the moment the user deletes the effect, and
+// ANY stream call on that stale ref (even indexing into its stream group) makes AE raise
+// an uncatchable modal + crash. Instead the hook re-enumerates the *live* layer's effects
+// each tick (AEGP_GetLayerEffectByIndex on a live layer is always safe) and matches ours
+// by installed key, so every stream/render call runs on a fresh, valid handle. When no
+// matching effect remains on the layer, the effect was deleted -> close the window.
+// AEGP_LayerH from AEGP_GetEffectLayer is not owned (no dispose); it stays valid while the
+// layer exists (which outlives an effect deletion).
+static std::mutex g_effMutex;
+struct EffectContext {
+    AEGP_LayerH             layerH = nullptr;
+    AEGP_InstalledEffectKey installedKey = AEGP_InstalledEffectKey_NONE;
+};
+static std::map<cg::editor::InstanceKey, EffectContext> g_effectCtx;
 
 // Last param values the idle hook published to each window (touched only from the
 // idle hook, which runs serially on the main thread - so no mutex). Lets the EC->window
@@ -557,38 +569,69 @@ static bool StreamForEdit(const cg::editor::ParamEdit& e, PF_ParamIndex& idx, do
     return false;
 }
 
-// Capture this effect instance's AEGP effect ref (main-thread contexts only), so the
-// idle hook can reach its param streams. Replaces any stale ref for the same key.
-static void CaptureEffectRefForKey(PF_InData* in_data, cg::editor::InstanceKey key) {
+// Capture this effect instance's CONTEXT (parent layer + installed-effect key) at
+// button-open, while in_data->effect_ref is valid. No persistent AEGP_EffectRefH is
+// kept: the idle hook re-derives a fresh handle from the live layer each tick (see
+// LiveEffectForKey), so there is never a stale ref to dereference after deletion.
+static void CaptureEffectContextForKey(PF_InData* in_data, cg::editor::InstanceKey key) {
     if (!g_spbasic || !g_aegpId || !in_data->effect_ref) return;
     try {
         AEGP_SuiteHandler sh(g_spbasic);
-        AEGP_EffectRefH effectH = nullptr;
-        A_Err e = sh.PFInterfaceSuite1()->AEGP_GetNewEffectForEffect(g_aegpId, in_data->effect_ref, &effectH);
-        if (e || !effectH) return;
-        AEGP_EffectRefH stale = nullptr;
-        {
-            std::lock_guard<std::mutex> lk(g_effMutex);
-            auto it = g_effectRefs.find(key);
-            if (it != g_effectRefs.end()) stale = it->second;
-            g_effectRefs[key] = effectH;
+        EffectContext ctx;
+        // Parent layer (not a "New" handle - not owned; stays valid while the layer lives).
+        if (sh.PFInterfaceSuite1()->AEGP_GetEffectLayer(in_data->effect_ref, &ctx.layerH) ||
+            !ctx.layerH) {
+            return;
         }
-        if (stale) sh.EffectSuite4()->AEGP_DisposeEffect(stale);
+        // Our installed-effect key, read from a temporary AEGP ref (disposed immediately).
+        AEGP_EffectRefH tmpH = nullptr;
+        if (!sh.PFInterfaceSuite1()->AEGP_GetNewEffectForEffect(g_aegpId, in_data->effect_ref, &tmpH) &&
+            tmpH) {
+            sh.EffectSuite5()->AEGP_GetInstalledKeyFromLayerEffect(tmpH, &ctx.installedKey);
+            sh.EffectSuite5()->AEGP_DisposeEffect(tmpH);
+        }
+        std::lock_guard<std::mutex> lk(g_effMutex);
+        g_effectCtx[key] = ctx;
     } catch (...) { /* AEGP unavailable - the on-param-change stand-in still applies edits */ }
 }
 
-static void DisposeEffectRefForKey(cg::editor::InstanceKey key) {
-    AEGP_EffectRefH effectH = nullptr;
+static void ForgetEffectContextForKey(cg::editor::InstanceKey key) {
+    std::lock_guard<std::mutex> lk(g_effMutex);
+    g_effectCtx.erase(key);  // layerH is not owned, so nothing to dispose
+}
+
+// Re-derive a FRESH, valid AEGP effect ref for `key` by scanning its captured layer's
+// current effects for one whose installed key matches ours. Returns the matched ref (the
+// CALLER MUST dispose it with AEGP_DisposeEffect) or null if our effect is no longer on
+// the layer (i.e. it was deleted). Every call here is on the live layer or on fresh
+// handles, so none can raise the stale-ref modal. (Multi-instance note: if two CG effects
+// share one layer, this returns the first match - acceptable, non-crashing; documented.)
+static AEGP_EffectRefH LiveEffectForKey(AEGP_SuiteHandler& sh, cg::editor::InstanceKey key) {
+    EffectContext ctx;
     {
         std::lock_guard<std::mutex> lk(g_effMutex);
-        auto it = g_effectRefs.find(key);
-        if (it == g_effectRefs.end()) return;
-        effectH = it->second;
-        g_effectRefs.erase(it);
+        auto it = g_effectCtx.find(key);
+        if (it == g_effectCtx.end()) return nullptr;
+        ctx = it->second;
     }
-    if (effectH && g_spbasic) {
-        try { AEGP_SuiteHandler sh(g_spbasic); sh.EffectSuite4()->AEGP_DisposeEffect(effectH); } catch (...) {}
+    if (!ctx.layerH) return nullptr;
+    A_long num = 0;
+    if (sh.EffectSuite5()->AEGP_GetLayerNumEffects(ctx.layerH, &num) || num <= 0) return nullptr;
+    for (A_long i = 0; i < num; ++i) {
+        AEGP_EffectRefH candH = nullptr;
+        if (sh.EffectSuite5()->AEGP_GetLayerEffectByIndex(g_aegpId, ctx.layerH,
+                                                          static_cast<AEGP_EffectIndex>(i), &candH) ||
+            !candH) {
+            continue;
+        }
+        AEGP_InstalledEffectKey candKey = AEGP_InstalledEffectKey_NONE;
+        A_Err e = sh.EffectSuite5()->AEGP_GetInstalledKeyFromLayerEffect(candH, &candKey);
+        if (!e && candKey == ctx.installedKey && ctx.installedKey != AEGP_InstalledEffectKey_NONE) {
+            return candH;  // caller disposes
+        }
+        sh.EffectSuite5()->AEGP_DisposeEffect(candH);
     }
+    return nullptr;  // our effect is gone (deleted)
 }
 
 // Read one param stream's scalar (one_d) value at t=0 (our value params don't
@@ -641,25 +684,6 @@ static bool PollSnapshotViaAegp(AEGP_SuiteHandler& sh, AEGP_EffectRefH effectH, 
     s.chromaGain = chroma / 100.0;
     s.lutSource = static_cast<int>(lut + 0.5);
     return true;
-}
-
-// Is this captured effect ref still backed by a live effect instance? When the user
-// deletes the effect while its editor window is open, the ref goes stale: AE still hands
-// back a stream for a param index, but its type collapses to NO_DATA (and sampling it
-// raises the 5027::247 modal). CG_THEME is a real value popup (never legitimately
-// NO_DATA), so a NO_DATA type here is a reliable "effect was deleted" signal. Getting the
-// stream + type is safe on a stale ref (it does not raise) - only AEGP_GetNewStreamValue
-// does. Used by the idle hook to detect deletion and tear the window down.
-static bool EffectRefAlive(AEGP_SuiteHandler& sh, AEGP_EffectRefH effectH) {
-    AEGP_StreamRefH streamH = nullptr;
-    if (sh.StreamSuite5()->AEGP_GetNewEffectStreamByIndex(g_aegpId, effectH, CG_THEME, &streamH) ||
-        !streamH) {
-        return false;
-    }
-    AEGP_StreamType stype = AEGP_StreamType_NO_DATA;
-    A_Err e = sh.StreamSuite5()->AEGP_GetStreamType(streamH, &stype);
-    sh.StreamSuite5()->AEGP_DisposeStream(streamH);
-    return !e && stype != AEGP_StreamType_NO_DATA;
 }
 
 static bool SnapshotChanged(const cg::editor::ParamSnapshot& a, const cg::editor::ParamSnapshot& b) {
@@ -810,17 +834,18 @@ static A_Err CG_IdleHook(AEGP_GlobalRefcon, AEGP_IdleRefcon, A_long* max_sleepPL
     auto& host = cg::editor::EditorHost::instance();
     std::vector<cg::editor::InstanceKey> keys = host.openKeys();
 
-    // Reap effect refs whose window is gone (user closed it) - dispose to avoid leaks.
+    // Forget captured context whose window is gone (user closed it). No AEGP handle to
+    // dispose (layerH is not owned); this just frees the map slot.
     {
         std::vector<cg::editor::InstanceKey> orphans;
         {
             std::lock_guard<std::mutex> lk(g_effMutex);
-            for (auto& kv : g_effectRefs) {
+            for (auto& kv : g_effectCtx) {
                 if (std::find(keys.begin(), keys.end(), kv.first) == keys.end()) orphans.push_back(kv.first);
             }
         }
         for (auto k : orphans) {
-            DisposeEffectRefForKey(k);
+            ForgetEffectContextForKey(k);
             g_lastPolled.erase(k);
             g_previewDrivers.erase(k);  // free the closed window's cached preview frames
         }
@@ -828,33 +853,30 @@ static A_Err CG_IdleHook(AEGP_GlobalRefcon, AEGP_IdleRefcon, A_long* max_sleepPL
 
     if (g_spbasic && g_aegpId) {
         for (auto key : keys) {
+            // Re-derive a FRESH, valid effect ref by enumerating the live layer's effects
+            // (never dereference a possibly-stale captured ref - that crashes AE when the
+            // effect was deleted). Null => the effect is no longer on the layer, i.e. it
+            // was deleted with the window open: tear the window down (Phase 3 "delete
+            // effect -> window closes"). Every stream/write/render call below then runs on
+            // this fresh handle, and the window->effect write can't fire on a dead ref
+            // because we already `continue`d.
             AEGP_EffectRefH effectH = nullptr;
-            {
-                std::lock_guard<std::mutex> lk(g_effMutex);
-                auto it = g_effectRefs.find(key);
-                if (it != g_effectRefs.end()) effectH = it->second;
+            try {
+                AEGP_SuiteHandler sh(g_spbasic);
+                effectH = LiveEffectForKey(sh, key);
+            } catch (...) { effectH = nullptr; }
+            if (!effectH) {
+                host.close(key);
+                ForgetEffectContextForKey(key);
+                g_lastPolled.erase(key);
+                g_previewDrivers.erase(key);
+                continue;
             }
-            if (!effectH) continue;
-
-            // Was the effect deleted while its window is still open? If so, tear the
-            // window down and drop the ref so we stop polling a dead stream (which raises
-            // AE 5027::247 every tick) - this is the Phase 3 "delete effect -> window
-            // closes" behavior. Probing before any stream read/write/render also guards
-            // the edit-write and preview paths against the same stale ref.
-            {
-                bool alive = false;
-                try {
-                    AEGP_SuiteHandler sh(g_spbasic);
-                    alive = EffectRefAlive(sh, effectH);
-                } catch (...) { alive = false; }
-                if (!alive) {
-                    host.close(key);
-                    DisposeEffectRefForKey(key);
-                    g_lastPolled.erase(key);
-                    g_previewDrivers.erase(key);
-                    continue;
-                }
-            }
+            // Dispose the fresh ref no matter how we leave this iteration.
+            auto effGuard = cg::editor::makeScopedCheckin([&] {
+                try { AEGP_SuiteHandler sh(g_spbasic); sh.EffectSuite5()->AEGP_DisposeEffect(effectH); }
+                catch (...) {}
+            });
 
             // window -> effect: apply any queued edits (writes param streams).
             if (host.hasPendingEdits(key)) {
@@ -1004,11 +1026,11 @@ static PF_Err SequenceResetup(PF_InData* in_data, PF_OutData* out_data, PF_Param
 }
 
 // Effect instance removed (deleted from the layer, comp closed): close its window,
-// dispose its captured AEGP effect ref, and free the sequence data.
+// forget its captured effect context, and free the sequence data.
 static PF_Err SequenceSetdown(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef*[], PF_LayerDef*) {
     const cg::editor::InstanceKey key = SeqKey(in_data);
     cg::editor::EditorHost::instance().close(key);
-    DisposeEffectRefForKey(key);
+    ForgetEffectContextForKey(key);
     if (in_data->sequence_data) {
         PF_DISPOSE_HANDLE(in_data->sequence_data);
         out_data->sequence_data = NULL;
@@ -1075,8 +1097,10 @@ static PF_Err ParamsSetup(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef*
     // sends PF_Cmd_USER_CHANGED_PARAM on click (buttons require it); the handler
     // opens/focuses the single per-instance window.
     AEFX_CLR_STRUCT(def);
+    // ASCII "..." - AE param names are narrow (CP-1252), so a UTF-8 ellipsis (E2 80 A6)
+    // renders as mojibake ("Open Editorâ€¦"). Round-2 captain finding.
     PF_ADD_BUTTON("Editor",
-                  "Open Editor\xE2\x80\xA6",  // "Open Editor…" (UTF-8 ellipsis)
+                  "Open Editor...",
                   0,
                   PF_ParamFlag_SUPERVISE,
                   CG_OPEN_EDITOR);
@@ -1128,9 +1152,10 @@ static PF_Err UserChangedParam(PF_InData* in_data, PF_OutData* out_data,
             params[CG_LUT_SOURCE]->u.pd.value);
         const cg::editor::InstanceKey key = SeqKey(in_data);
         cg::editor::EditorHost::instance().open(key, seed);
-        // Capture this instance's AEGP effect ref (main-thread context) so the idle
-        // hook can write window edits back onto its param streams.
-        CaptureEffectRefForKey(in_data, key);
+        // Capture this instance's effect context (parent layer + installed key) so the
+        // idle hook can re-derive a fresh, valid effect ref each tick without ever
+        // touching a stale one (see LiveEffectForKey).
+        CaptureEffectContextForKey(in_data, key);
     }
 
     // Flush any edits the editor window produced back onto the params (spike driver:
