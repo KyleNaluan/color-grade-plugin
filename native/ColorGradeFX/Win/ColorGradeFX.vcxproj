@@ -130,6 +130,7 @@
     <ClInclude Include="..\lut\CubeLut.h" />
     <ClInclude Include="..\embedded\EmbeddedLut.h" />
     <ClInclude Include="..\editor\EditorBridge.h" />
+    <ClInclude Include="..\editor\PreviewCache.h" />
     <ClInclude Include="..\editor\EditorWindow.h" />
   </ItemGroup>
   <ItemGroup>

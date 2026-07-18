@@ -17,6 +17,7 @@ npm run native:gen-lut      # (re)generate the embedded default LUT header (comm
 npm run native:parity       # C++ sampleLut vs TS oracle, ~1e-4 (needs g++/clang; not in CI)
 npm run native:core-parity  # full C++ core vs TS oracle end-to-end (needs g++/clang; not in CI)
 npm run native:editor-test  # headless editor<->effect bridge logic (needs g++/clang; not in CI)
+npm run native:preview-test # headless live-preview core: cache/keying/fit/checkin (g++/clang; not in CI)
 
 native/scripts/build.sh Debug            # CPU-only  .aex -> MediaCore
 native/scripts/build.sh Debug --gpu      # CPU + GPU (DirectX + CUDA) .aex + DirectX_Assets

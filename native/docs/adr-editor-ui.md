@@ -236,6 +236,57 @@ live AE. The key is now a uid stored in **sequence data** (flat POD, reseeded on
 SETUP/RESETUP so a duplicated/reloaded effect never shares a key), consistent across
 every command for one instance.
 
+## Phase 4: live clip preview (built on this toolkit)
+
+The editor window now shows a **live preview of the actual clip frame**, centered and
+letterboxed, updating as the captain scrubs the timeline or changes any effect param.
+This is the payoff the ImGui choice was made for (axis 3): a checked-out GPU-renderable
+frame drawn with near-zero impedance.
+
+**Frame source - the decode invariant for free.** The effect's global AEGP idle hook
+(the same one that drives the window<->effect bridge) checks out the layer frame
+**downstream of this effect** via
+`AEGP_LayerRenderOptionsSuite2::AEGP_NewFromDownstreamOfEffect` +
+`AEGP_RenderSuite5::AEGP_RenderAndCheckoutLayerFrame`. "Downstream of effect" = the
+layer output *including* our effect, so the checked-out pixels are already decoded +
+graded. V-Log is therefore **never left undecoded** in the preview under any LUT Source -
+the invariant holds by construction, with no second decode path to keep in sync. The
+options handle is seeded to the layer's current time, which we read back
+(`AEGP_GetTime`) as the scrub position - no separate comp-time lookup needed.
+`AEGP_NewFromDownstreamOfEffect` is **UI-thread only**; the idle hook satisfies that.
+
+**Display.** The 8-bit ARGB receipt world is copied (ARGB->RGBA, decimated so the long
+side is <= 960 px) into a CPU `PreviewFrame`, published to the window, and uploaded on
+the window's own UI thread into a per-window D3D11 texture
+(`DXGI_FORMAT_R8G8B8A8_UNORM`), drawn with `ImDrawList::AddImage` centered + letterboxed
+(`letterboxFit`). AE worlds are premultiplied and a footage-clip preview is opaque, so
+the copy forces alpha = 255 (partial-alpha layers look slightly off - accepted for v1).
+
+**Refresh + caching = interactivity.** The idle hook computes a `PreviewKey` = (frame
+time + a fingerprint of the grade-affecting params, read from the same stream poll that
+feeds the controls). A pure state machine (`decidePreviewAction`) decides: window already
+current (do nothing), a **cached** CPU frame matches (publish it - the interactive
+scrub-back path, no AE render), or a fresh render is needed. A bounded per-instance LRU
+cache (16 frames) of decoded frames keeps scrubbing interactive; the render is
+**synchronous** on the idle thread, which is sanctioned here precisely because the cache
+makes repeats free and only genuinely new time/param states pay a render. **Every**
+checkout is checked back in unconditionally (a `ScopedCheckin` RAII guard that fires even
+if the pixel copy throws) - a leaked receipt destabilizes AE, so this is load-bearing.
+
+**Testable seam.** All the risky logic - cache keying/eviction, the scrub/param-change
+decision, the letterbox fit math, and the once-and-always check-in guarantee - lives in
+the pure, AE-free `editor/PreviewCache.h` and is proven headlessly by
+`npm run native:preview-test` (`native/tests/editor/preview_test.cpp`, g++/clang, NOT in
+CI). The AE-side integration (the AEGP checkout + D3D upload) is captain-verified.
+
+**Known limitations / deferred.** (a) Sync UI-thread checkout is flagged in the SDK as
+deprecated for *passive* redraws in favor of `AEGP_RenderAndCheckoutLayerFrame_Async`;
+async (with in-flight request cancellation on fast scrub) is the documented future
+refinement if interactivity needs it - the state machine is already shaped for one
+in-flight request. (b) The cache fingerprint keys on time + *our* params; an unrelated
+change (another effect, a source swap without a time change) can leave the preview stale
+until the next scrub/param nudge. (c) Scopes + before/after are Phase 5.
+
 ## Consequences
 
 - **Positive:** single-file signed `.aex` stays intact; one UI codebase Win+Mac; the
@@ -244,9 +295,10 @@ every command for one instance.
 - **Negative:** `src/panel` Preact controls are not reused as code (the design is).
   Immediate-mode UI is less "designer-friendly" than HTML/CSS for heavy visual
   polish - acceptable for a pro color tool, revisit if that changes.
-- **Follow-ups:** Metal/Cocoa backend for the Mac target; live preview + scopes
-  (Phases 4-5). (The idle-hook write driver, sequence-data uid, and the full
-  Correct/Grade control set landed in Phase 3.)
+- **Follow-ups:** Metal/Cocoa backend for the Mac target; scopes + before/after
+  (Phase 5); async checkout if scrub interactivity needs it. (The idle-hook write
+  driver, sequence-data uid, and the full Correct/Grade control set landed in Phase 3;
+  the live clip preview landed in Phase 4 - see the Phase 4 section above.)
 
 ## Known limitations
 

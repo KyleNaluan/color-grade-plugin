@@ -93,6 +93,26 @@ static std::map<cg::editor::InstanceKey, AEGP_EffectRefH> g_effectRefs;
 // poll publish only when something actually changed, avoiding revision churn.
 static std::map<cg::editor::InstanceKey, cg::editor::ParamSnapshot> g_lastPolled;
 
+// --- Phase 4 live-preview driver state (idle hook / main thread only) --------
+//
+// The idle hook checks out the layer frame DOWNSTREAM of this effect (so decode + grade
+// is already applied - the pipeline invariant holds by construction), copies it to a
+// PreviewFrame, and publishes it to the window. A bounded per-instance LRU cache keyed
+// by (frame time + grade-param fingerprint) keeps scrubbing interactive: revisiting a
+// visited time/param state serves the cached CPU frame instead of re-rendering. All of
+// this runs serially on AE's main thread, so no mutex is needed here (the cache/keying
+// LOGIC lives in the pure, unit-tested editor/PreviewCache.h).
+#define CG_PREVIEW_CACHE_CAP  16    // bounded LRU: keep ~16 decoded frames for scrub-back
+#define CG_PREVIEW_MAX_DIM    960   // decimate the checked-out frame to <= this on the long side
+#define CG_PREVIEW_DOWNSAMPLE 2     // render at 50% (preview is small; keeps the sync render cheap)
+
+struct PreviewDriver {
+    cg::editor::PreviewCache cache{CG_PREVIEW_CACHE_CAP};
+    cg::editor::PreviewKey   lastKey;      // key of the frame currently shown by the window
+    bool                     hasLast = false;
+};
+static std::map<cg::editor::InstanceKey, PreviewDriver> g_previewDrivers;
+
 // Flat POD sequence data: just a stable per-instance uid for the window registry.
 #define CG_SEQ_MAGIC   0x43475351u  // 'CGSQ'
 #define CG_SEQ_VERSION 1u
@@ -620,6 +640,139 @@ static bool SnapshotChanged(const cg::editor::ParamSnapshot& a, const cg::editor
            std::fabs(a.chromaGain - b.chromaGain) > 1e-6;
 }
 
+/* ============= Live preview: layer-frame checkout via AEGP (Phase 4) ======= */
+//
+// Render the layer frame with an already-configured AEGP_LayerRenderOptionsH into `out`
+// (ARGB8 world -> RGBA8, decimated so the long side is <= CG_PREVIEW_MAX_DIM), then check
+// the AE frame receipt straight back in - unconditionally, via ScopedCheckin, so an
+// exception while copying can never leak the checkout (leaked checkouts destabilize AE).
+// Returns false on any AEGP failure; the window then keeps its previous frame.
+static bool RenderPreviewFromOptions(AEGP_SuiteHandler& sh, AEGP_LayerRenderOptionsH optsH,
+                                     cg::editor::PreviewFrame& out) {
+    AEGP_FrameReceiptH receiptH = nullptr;
+    // Synchronous checkout on the UI (idle) thread: sanctioned here because the cache
+    // makes repeats free and only genuinely new (time/param) frames pay a render. The
+    // async variant is a documented future refinement (see native/docs/adr-editor-ui.md).
+    if (sh.RenderSuite5()->AEGP_RenderAndCheckoutLayerFrame(optsH, nullptr, nullptr, &receiptH) ||
+        !receiptH) {
+        return false;
+    }
+    auto checkin = cg::editor::makeScopedCheckin(
+        [&] { sh.RenderSuite5()->AEGP_CheckinFrame(receiptH); });
+
+    AEGP_WorldH worldH = nullptr;
+    if (sh.RenderSuite5()->AEGP_GetReceiptWorld(receiptH, &worldH) || !worldH) return false;
+
+    AEGP_WorldSuite3* ws = sh.WorldSuite3();
+    AEGP_WorldType wt = AEGP_WorldType_NONE;
+    if (ws->AEGP_GetType(worldH, &wt) || wt != AEGP_WorldType_8) return false;  // we asked for 8-bit
+
+    A_long w = 0, h = 0;
+    A_u_long rowBytes = 0;
+    PF_Pixel8* base = nullptr;
+    if (ws->AEGP_GetSize(worldH, &w, &h) || w <= 0 || h <= 0) return false;
+    if (ws->AEGP_GetRowBytes(worldH, &rowBytes)) return false;
+    if (ws->AEGP_GetBaseAddr8(worldH, &base) || !base) return false;
+
+    // Nearest-neighbour decimation to cap the CPU frame (and thus texture + cache memory)
+    // at CG_PREVIEW_MAX_DIM on the long side. AE already downsampled by CG_PREVIEW_DOWNSAMPLE.
+    const int longSide = w > h ? w : h;
+    int step = 1;
+    if (longSide > CG_PREVIEW_MAX_DIM) step = (longSide + CG_PREVIEW_MAX_DIM - 1) / CG_PREVIEW_MAX_DIM;
+    const int outW = (w + step - 1) / step;
+    const int outH = (h + step - 1) / step;
+    out.width = outW;
+    out.height = outH;
+    out.rgba.assign(static_cast<size_t>(outW) * outH * 4u, 0);
+
+    for (int y = 0; y < outH; ++y) {
+        const PF_Pixel8* srcRow = reinterpret_cast<const PF_Pixel8*>(
+            reinterpret_cast<const uint8_t*>(base) + static_cast<size_t>(y * step) * rowBytes);
+        uint8_t* dstRow = out.rgba.data() + static_cast<size_t>(y) * outW * 4u;
+        for (int x = 0; x < outW; ++x) {
+            const PF_Pixel8& p = srcRow[x * step];  // AE PF_Pixel8 is A,R,G,B
+            uint8_t* d = dstRow + static_cast<size_t>(x) * 4u;
+            d[0] = p.red;
+            d[1] = p.green;
+            d[2] = p.blue;
+            // Force opaque: AE worlds are premultiplied and a footage-clip preview is
+            // opaque; drawing straight-alpha premult pixels would darken any partial-alpha
+            // edges against the pane. (Partial-alpha layers look slightly off - accepted.)
+            d[3] = 255;
+        }
+    }
+    return true;  // checkin fires here as `checkin` unwinds
+}
+
+// Drive the live preview for one open window: read the current frame time, decide via the
+// pure state machine whether the window is already current / a cached frame serves / a
+// fresh AE render is needed, and act. UI-thread only (AEGP_NewFromDownstreamOfEffect
+// requires it - the idle hook satisfies that). Best-effort: any AEGP failure just leaves
+// the last frame up.
+static void DrivePreviewForKey(AEGP_SuiteHandler& sh, cg::editor::InstanceKey key,
+                               AEGP_EffectRefH effectH) {
+    AEGP_LayerRenderOptionsSuite2* lro = sh.LayerRenderOptionsSuite2();
+    AEGP_LayerRenderOptionsH optsH = nullptr;
+    // "Downstream of effect" = the layer output INCLUDING this effect, so the checked-out
+    // pixels are already decoded + graded. AEGP_NewFrom* seeds the options' Time to the
+    // layer's current time (the scrub position), so we read it back for the cache key.
+    if (lro->AEGP_NewFromDownstreamOfEffect(g_aegpId, effectH, &optsH) || !optsH) return;
+    bool disposed = false;
+    auto dispose = [&] {
+        if (!disposed) {
+            lro->AEGP_Dispose(optsH);
+            disposed = true;
+        }
+    };
+
+    A_Time t;
+    AEFX_CLR_STRUCT(t);
+    t.scale = 1;
+    if (lro->AEGP_GetTime(optsH, &t)) { dispose(); return; }
+
+    // Fingerprint the grade-affecting params from the last polled snapshot (the values the
+    // window shows, read straight from the effect's streams by the poll above).
+    cg::editor::ParamSnapshot ps;
+    auto pit = g_lastPolled.find(key);
+    if (pit != g_lastPolled.end()) ps = pit->second;
+    cg::editor::PreviewKey pk;
+    pk.timeValue = static_cast<int64_t>(t.value);
+    pk.timeScale = t.scale ? static_cast<uint32_t>(t.scale) : 1u;
+    pk.paramFingerprint = cg::editor::previewParamFingerprint(
+        ps.footageProfile, ps.theme, ps.lutSource, ps.strength, ps.skinProtection, ps.chromaGain);
+
+    PreviewDriver& drv = g_previewDrivers[key];
+    cg::editor::PreviewAction action =
+        cg::editor::decidePreviewAction(drv.hasLast, drv.lastKey, pk, drv.cache.contains(pk));
+
+    if (action == cg::editor::PreviewAction::UpToDate) { dispose(); return; }
+
+    if (action == cg::editor::PreviewAction::ServeCached) {
+        auto f = drv.cache.get(pk);
+        if (f) {
+            cg::editor::EditorHost::instance().publishPreviewFrame(key, f);
+            drv.lastKey = pk;
+            drv.hasLast = true;
+        }
+        dispose();
+        return;
+    }
+
+    // Render a fresh frame at reduced resolution, 8-bit (uniform RGBA upload path).
+    lro->AEGP_SetWorldType(optsH, AEGP_WorldType_8);
+    lro->AEGP_SetDownsampleFactor(optsH, CG_PREVIEW_DOWNSAMPLE, CG_PREVIEW_DOWNSAMPLE);
+    auto frame = std::make_shared<cg::editor::PreviewFrame>();
+    bool ok = RenderPreviewFromOptions(sh, optsH, *frame);
+    dispose();
+    if (ok && frame->valid()) {
+        std::shared_ptr<const cg::editor::PreviewFrame> cf = frame;
+        drv.cache.put(pk, cf);
+        cg::editor::EditorHost::instance().publishPreviewFrame(key, cf);
+        drv.lastKey = pk;
+        drv.hasLast = true;
+    }
+}
+
 // The AEGP idle hook: main thread, fires while AE is idle. Cheap-noops unless a window
 // has pending edits, so it never burdens AE. Applies drained edits inside one undo
 // group per tick, polls Effect Controls -> window on change, and reaps effect refs
@@ -640,6 +793,7 @@ static A_Err CG_IdleHook(AEGP_GlobalRefcon, AEGP_IdleRefcon, A_long* max_sleepPL
         for (auto k : orphans) {
             DisposeEffectRefForKey(k);
             g_lastPolled.erase(k);
+            g_previewDrivers.erase(k);  // free the closed window's cached preview frames
         }
     }
 
@@ -697,6 +851,15 @@ static A_Err CG_IdleHook(AEGP_GlobalRefcon, AEGP_IdleRefcon, A_long* max_sleepPL
                     }
                 }
             } catch (...) { /* swallow */ }
+
+            // Live preview (Phase 4): keep the window's centered clip frame current with
+            // the scrub position + params. Runs after the poll so the fingerprint uses
+            // the freshly-read params. Guarded independently so a preview hiccup never
+            // affects the edit/poll paths above.
+            try {
+                AEGP_SuiteHandler sh(g_spbasic);
+                DrivePreviewForKey(sh, key, effectH);
+            } catch (...) { /* swallow: preview must never destabilize AE */ }
         }
     }
     // With a window open, poll promptly (sub-second) so EC edits track; otherwise let
