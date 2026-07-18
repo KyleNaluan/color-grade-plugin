@@ -231,6 +231,10 @@ export function buildTransform(src: FootageStats, theme: Theme, opts: EngineOpti
       a += ov.highlightTint[0] * wh;
       bb += ov.highlightTint[1] * wh;
     }
+    if (ov.midtoneTint) {
+      a += ov.midtoneTint[0] * wm;
+      bb += ov.midtoneTint[1] * wm;
+    }
 
     // 3b. Authored chroma shaping on the final chroma vector.
     let chroma = Math.hypot(a, bb);

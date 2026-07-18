@@ -33,10 +33,25 @@ export interface ChromaShape {
  * stats cannot express. All optional.
  */
 export interface ThemeOverrides {
-  /** LAB [a, b] tint added in the shadows band (weighted by band membership). */
+  /**
+   * LAB [a, b] tint added in the shadows band (weighted by band membership).
+   * Typically 1-20 LAB units; values much past ~20 read as an obvious color cast.
+   */
   shadowTint?: [number, number];
-  /** LAB [a, b] tint added in the highlights band. */
+  /**
+   * LAB [a, b] tint added in the highlights band (weighted by band membership).
+   * Typically 1-20 LAB units; values much past ~20 read as an obvious color cast.
+   */
   highlightTint?: [number, number];
+  /**
+   * LAB [a, b] tint added in the midtones band (weighted by band membership,
+   * same feathered shadow/mid/highlight split as shadowTint/highlightTint).
+   * Use this to cancel a cast that sits mostly in the midtones - shadowTint and
+   * highlightTint alone cannot reach it, since their band weights fall off
+   * toward zero exactly where the midtone band peaks.
+   * Typically 1-20 LAB units; values much past ~20 read as an obvious color cast.
+   */
+  midtoneTint?: [number, number];
   /** Global multiplier on LAB chroma after stat matching (1 = none). */
   chromaGain?: number;
   /**

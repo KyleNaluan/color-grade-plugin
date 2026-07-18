@@ -108,6 +108,7 @@ function printOverrides(t: typeof theme): void {
   const curve = (pts: Array<[number, number]>) => pts.map(([x, y]) => `${x}→${y}`).join('  ');
   if (ov.shadowTint) console.log(`  shadowTint    a ${ov.shadowTint[0]}  b ${ov.shadowTint[1]}`);
   if (ov.highlightTint) console.log(`  highlightTint a ${ov.highlightTint[0]}  b ${ov.highlightTint[1]}`);
+  if (ov.midtoneTint) console.log(`  midtoneTint   a ${ov.midtoneTint[0]}  b ${ov.midtoneTint[1]}`);
   if (ov.chromaGain !== undefined) console.log(`  chromaGain    ${ov.chromaGain}`);
   if (ov.toneCurve) console.log(`  toneCurve     ${curve(ov.toneCurve)}`);
   for (const ch of ['r', 'g', 'b'] as const) {
