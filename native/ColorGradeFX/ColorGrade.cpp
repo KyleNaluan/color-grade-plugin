@@ -114,6 +114,11 @@ static cg::core::Theme ThemeFromPopup(A_long themePopup) {
     }
 }
 
+// Map the footage-profile popup (1-based) to a ported log profile.
+static const cg::core::LogProfile& ProfileFromFootagePopup(A_long footagePopup) {
+    return footagePopup == CG_FOOT_VLOG ? cg::core::VLOG_PROFILE() : cg::core::REC709_PROFILE();
+}
+
 // Bake the Auto-mode grade LUT natively: the popup theme supplies the look, the
 // arb-data recipe supplies the measured source stats, and the sliders drive the
 // engine knobs (strength / skinProtection as EngineOptions, chroma-gain as a
@@ -121,8 +126,8 @@ static cg::core::Theme ThemeFromPopup(A_long themePopup) {
 // counterpart to the TS bakeGradeLut; the cross-engine golden harness proves the
 // two agree. The chromaGain arg is the slider fraction (slider/100), so 100% (=1.0)
 // preserves each theme's authored chromaGain exactly and the slider scales from there.
-static void BakeAutoLut(A_long themePopup, double strength01, double skin01, double chromaGain,
-                        const cg::core::RecipeData& recipe, cg::Lut3D& dst) {
+static void BakeAutoLut(A_long themePopup, A_long footagePopup, double strength01, double skin01,
+                        double chromaGain, const cg::core::RecipeData& recipe, cg::Lut3D& dst) {
     cg::core::Theme theme = ThemeFromPopup(themePopup);
     cg::core::ThemeOverrides ov = theme.overrides.value_or(cg::core::ThemeOverrides{});
     const double authored = ov.chromaGain.value_or(1.0);
@@ -133,7 +138,24 @@ static void BakeAutoLut(A_long themePopup, double strength01, double skin01, dou
     cg::core::EngineOptions opts;
     opts.strength = strength01;
     opts.skinProtection = skin01;
-    dst = cg::core::bakeGradeLut(src, theme, opts, CG_GRADE_LUT_SIZE);
+
+    // Correct + Grade in one baked LUT. When the clip is a log profile (V-Log), the
+    // Correct stage decodes each pixel to Rec.709 *before* the grade; baking the
+    // composition into a single LUT keeps the CPU and GPU apply paths identical (no
+    // per-pixel decode in the kernel). Rec.709 footage decodes to itself, so the
+    // standard profile bakes the plain grade unchanged. (The decode stage applies to
+    // the Auto path; the Embedded/External raw-LUT modes are unaffected by design.)
+    auto grade = cg::core::buildTransform(src, theme, opts);
+    if (footagePopup == CG_FOOT_VLOG) {
+        const cg::core::LogProfile& profile = ProfileFromFootagePopup(footagePopup);
+        dst = cg::core::bakeLut(
+            [&grade, &profile](const cg::core::Vec3d& x) {
+                return grade(cg::core::decodePixelToRec709(x, profile));
+            },
+            CG_GRADE_LUT_SIZE, theme.name + " correct+grade");
+    } else {
+        dst = cg::core::bakeLut(grade, CG_GRADE_LUT_SIZE, theme.name + " grade");
+    }
 }
 
 /* ========================== Arb-data (recipe) ============================ */
@@ -271,11 +293,11 @@ static RecipeData RecipeFromHandle(PF_InData* in_data, PF_ArbitraryH h) {
 
 // Resolve the LUT + post-blend for a frame from the resolved param values. Auto
 // bakes natively (strength baked in); embedded/external keep the Phase 1 blend.
-static void ResolveRenderData(PF_InData* in_data, A_long source, A_long themePopup,
+static void ResolveRenderData(PF_InData* in_data, A_long source, A_long themePopup, A_long footagePopup,
                               double strength01, double skin01, double chromaGain,
                               const RecipeData& recipe, CG_RenderData& d) {
     if (source == CG_SRC_AUTO) {
-        BakeAutoLut(themePopup, strength01, skin01, chromaGain, recipe, d.lut);
+        BakeAutoLut(themePopup, footagePopup, strength01, skin01, chromaGain, recipe, d.lut);
         d.applyStrength = 1.0f;
     } else {
         ResolveLut(source, d.lut);
@@ -311,9 +333,10 @@ static cg::editor::InstanceKey EffectKey(PF_InData* in_data) {
 // a stale one and never stomp the control the user is mid-drag on.
 static std::atomic<uint64_t> g_snapshotRevision{1};
 
-static cg::editor::ParamSnapshot MakeSnapshot(A_long theme, double strength01, double skin01,
-                                              double chromaFrac, A_long source) {
+static cg::editor::ParamSnapshot MakeSnapshot(A_long footage, A_long theme, double strength01,
+                                              double skin01, double chromaFrac, A_long source) {
     cg::editor::ParamSnapshot s;
+    s.footageProfile = static_cast<int>(footage);
     s.theme = static_cast<int>(theme);
     s.strength = strength01;
     s.skinProtection = skin01;
@@ -324,10 +347,10 @@ static cg::editor::ParamSnapshot MakeSnapshot(A_long theme, double strength01, d
 }
 
 // Push the effect's current params to the editor window (if open).
-static void PublishEditorSnapshot(PF_InData* in_data, A_long theme, double strength01,
+static void PublishEditorSnapshot(PF_InData* in_data, A_long footage, A_long theme, double strength01,
                                   double skin01, double chromaFrac, A_long source) {
     cg::editor::EditorHost::instance().publishSnapshot(
-        EffectKey(in_data), MakeSnapshot(theme, strength01, skin01, chromaFrac, source));
+        EffectKey(in_data), MakeSnapshot(footage, theme, strength01, skin01, chromaFrac, source));
 }
 
 // Drain any edits the window produced and write them onto params[] (CHANGED_VALUE so
@@ -336,6 +359,10 @@ static void ApplyEditorEdits(PF_InData* in_data, PF_ParamDef* params[]) {
     auto edits = cg::editor::EditorHost::instance().drainEdits(EffectKey(in_data));
     for (const auto& e : edits) {
         switch (e.field) {
+            case cg::editor::EditField::FootageProfile:
+                params[CG_FOOTAGE_PROFILE]->u.pd.value = static_cast<A_long>(e.value + 0.5);
+                params[CG_FOOTAGE_PROFILE]->uu.change_flags |= PF_ChangeFlag_CHANGED_VALUE;
+                break;
             case cg::editor::EditField::Theme:
                 params[CG_THEME]->u.pd.value = static_cast<A_long>(e.value + 0.5);
                 params[CG_THEME]->uu.change_flags |= PF_ChangeFlag_CHANGED_VALUE;
@@ -408,6 +435,15 @@ static PF_Err ParamsSetup(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef*
     PF_ParamDef def;
 
     // Order must match the CG_* param enum (after CG_INPUT).
+    // Correct: footage log-format selector (drives the decode stage baked into the
+    // Auto LUT). Rec.709 = no decode; V-Log decodes to Rec.709 before the grade.
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_POPUP("Footage",
+                 2 /* num choices */,
+                 CG_FOOT_REC709,
+                 CG_FOOTAGE_CHOICES,
+                 CG_FOOTAGE_PROFILE);
+
     // SUPERVISE so AE sends PF_Cmd_USER_CHANGED_PARAM when the theme changes; that
     // handler resets the Strength/Skin sliders to the new theme's authored knobs.
     AEFX_CLR_STRUCT(def);
@@ -498,6 +534,7 @@ static PF_Err UserChangedParam(PF_InData* in_data, PF_OutData* out_data,
         // Open (or focus) the editor window, seeded with the current params so its
         // controls start in sync with Effect Controls.
         cg::editor::ParamSnapshot seed = MakeSnapshot(
+            params[CG_FOOTAGE_PROFILE]->u.pd.value,
             params[CG_THEME]->u.pd.value,
             params[CG_STRENGTH]->u.fs_d.value / 100.0,
             params[CG_SKIN_PROTECTION]->u.fs_d.value / 100.0,
@@ -575,9 +612,10 @@ static PF_Err LegacyRender(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef
     const double skin01 = params[CG_SKIN_PROTECTION]->u.fs_d.value / 100.0;
     const double chromaGain = params[CG_CHROMA_GAIN]->u.fs_d.value / 100.0;
     const A_long theme = params[CG_THEME]->u.pd.value;
+    const A_long footage = params[CG_FOOTAGE_PROFILE]->u.pd.value;
     const A_long source = params[CG_LUT_SOURCE]->u.pd.value;
     const RecipeData recipe = RecipeFromHandle(in_data, params[CG_RECIPE]->u.arb_d.value);
-    ResolveRenderData(in_data, source, theme, strength01, skin01, chromaGain, recipe, data);
+    ResolveRenderData(in_data, source, theme, footage, strength01, skin01, chromaGain, recipe, data);
 
     PF_EffectWorld* input = &params[CG_INPUT]->u.ld;
     AEFX_SuiteScoper<PF_Iterate8Suite2> iterate8(in_data, kPFIterate8Suite, kPFIterate8SuiteVersion2, out_data);
@@ -623,6 +661,11 @@ static PF_Err PreRender(PF_InData* in_data, PF_OutData* out_data, PF_PreRenderEx
     ERR2(PF_CHECKIN_PARAM(in_data, &p));
 
     AEFX_CLR_STRUCT(p);
+    ERR(PF_CHECKOUT_PARAM(in_data, CG_FOOTAGE_PROFILE, in_data->current_time, in_data->time_step, in_data->time_scale, &p));
+    const A_long footage = p.u.pd.value;
+    ERR2(PF_CHECKIN_PARAM(in_data, &p));
+
+    AEFX_CLR_STRUCT(p);
     ERR(PF_CHECKOUT_PARAM(in_data, CG_LUT_SOURCE, in_data->current_time, in_data->time_step, in_data->time_scale, &p));
     const A_long source = p.u.pd.value;
     ERR2(PF_CHECKIN_PARAM(in_data, &p));
@@ -634,12 +677,12 @@ static PF_Err PreRender(PF_InData* in_data, PF_OutData* out_data, PF_PreRenderEx
     const RecipeData recipe = RecipeFromHandle(in_data, p.u.arb_d.value);
     ERR2(PF_CHECKIN_PARAM(in_data, &p));
 
-    ResolveRenderData(in_data, source, theme, strength01, skin01, chromaGain, recipe, *d);
+    ResolveRenderData(in_data, source, theme, footage, strength01, skin01, chromaGain, recipe, *d);
 
     // Mirror the current params into the editor window (if one is open for this
     // instance), so its controls track Effect Controls. Safe from any render thread:
     // it is a locked value copy. Also reaps a window the user has since closed.
-    PublishEditorSnapshot(in_data, theme, strength01, skin01, chromaGain, source);
+    PublishEditorSnapshot(in_data, footage, theme, strength01, skin01, chromaGain, source);
 
     extra->output->pre_render_data = d;
     extra->output->delete_pre_render_data_func = DisposePreRenderData;

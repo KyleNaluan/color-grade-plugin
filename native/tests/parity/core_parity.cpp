@@ -169,6 +169,33 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    if (cmd == "gradedecode" && argc == 12) {
+        // Exercise the effect's Correct+Grade Auto path (BakeAutoLut, log profile):
+        // decode each grid node to Rec.709, then grade, baked into one LUT. Mirrors
+        // BakeAutoLut's compose-when-V-Log branch so the Correct decode stage is
+        // proven against the TS oracle, not just eyeballed.
+        const size_t n = static_cast<size_t>(std::strtoull(argv[3], nullptr, 10));
+        std::vector<float> px = readF32(argv[2], n);
+        Theme theme;
+        if (!getTheme(argv[4], theme)) {
+            std::fprintf(stderr, "core_parity: unknown theme %s\n", argv[4]);
+            return 2;
+        }
+        EngineOptions opts;
+        if (std::atoi(argv[5])) opts.strength = std::atof(argv[6]);
+        if (std::atoi(argv[7])) opts.skinProtection = std::atof(argv[8]);
+        const int size = std::atoi(argv[9]);
+        const LogProfile* profile = getProfile(argv[10]);
+        if (!profile) { std::fprintf(stderr, "core_parity: unknown profile %s\n", argv[10]); return 2; }
+        FootageStats stats = computeStats(px.data(), px.size());
+        auto grade = buildTransform(stats, theme, opts);
+        cg::Lut3D lut = bakeLut(
+            [&grade, profile](const Vec3d& x) { return grade(decodePixelToRec709(x, *profile)); },
+            size);
+        writeF32(argv[11], lut.data);
+        return 0;
+    }
+
     if (cmd == "decode" && argc == 5) {
         const LogProfile* profile = getProfile(argv[2]);
         if (!profile) { std::fprintf(stderr, "core_parity: unknown profile %s\n", argv[2]); return 2; }

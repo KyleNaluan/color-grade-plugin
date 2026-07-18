@@ -109,8 +109,9 @@ static void test_mapping() {
 
 // --- applyEdit: a drained edit lands back in the visible snapshot ------------
 static void test_apply_roundtrip() {
-    ParamSnapshot s;  // defaults: theme=1, strength=0.8, skin=0.75, chroma=1.0, lut=1
+    ParamSnapshot s;  // defaults: footage=1, theme=1, strength=0.8, skin=0.75, chroma=1.0, lut=1
     EditQueue q;
+    q.push({EditField::FootageProfile, 2});
     q.push({EditField::Theme, 2});
     q.push({EditField::Strength, 0.42});
     q.push({EditField::SkinProtection, 0.10});
@@ -119,6 +120,7 @@ static void test_apply_roundtrip() {
 
     for (const auto& e : q.drain()) applyEdit(s, e);
 
+    CHECK(s.footageProfile == 2, "footage profile applied");
     CHECK(s.theme == 2, "theme applied");
     CHECK(approx(s.strength, 0.42), "strength applied");
     CHECK(approx(s.skinProtection, 0.10), "skin applied");

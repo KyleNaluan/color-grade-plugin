@@ -4,13 +4,12 @@
  * registry of modeless windows, each on its own UI thread, wired to the effect
  * through the pure EditorBridge.h seam.
  *
- * This is the toolkit de-risk (see native/docs/adr-editor-ui.md): it proves Dear
- * ImGui compiles/links into the .aex as a single-file drop-in (zero external
- * runtime deps - D3D11/DXGI are OS-provided) and that the window lifecycle + the
- * effect<->window bridge are real code, not hand-waving. The control set here is
- * deliberately MINIMAL (Grade sliders + Theme/LUT popups round-trip; Correct tab,
- * live preview, and scopes are laid out as placeholders): the full control set is
- * gated behind the captain's toolkit decision (Phase 3 acceptance criterion 3).
+ * Toolkit chosen in native/docs/adr-editor-ui.md (captain-approved: Dear ImGui,
+ * vendored/compiled into the .aex - zero external runtime deps, D3D11/DXGI are
+ * OS-provided). This hosts the full Correct/Grade control set: Correct = Footage
+ * profile; Grade = Theme, Strength, Skin Protection, Chroma Gain, LUT Source - each
+ * round-trips through the bridge to the effect's params. Live preview + scopes
+ * (Phases 4-5) are laid out as the center placeholder.
  *
  * Windows-only. On any non-Windows build every EditorHost method is a no-op stub
  * (bottom of file) so the interface still links; the macOS backend (Cocoa + Metal)
@@ -180,6 +179,7 @@ void EnsureWindowClass() {
 
 // --- the per-window UI content (the editor's controls) ----------------------
 
+const char* const kFootageNames[] = {"Rec.709 (standard)", "V-Log"};
 const char* const kThemeNames[] = {"Teal-Orange", "Warm-Film", "Cool-Noir"};
 const char* const kLutSourceNames[] = {"Auto (Theme + Analysis)", "Embedded (Teal-Orange)",
                                        "External .cube file"};
@@ -197,7 +197,7 @@ void DrawEditorUI(WindowImpl* w, ParamSnapshot& ui) {
 
     ImGui::TextUnformatted("Color Grade");
     ImGui::SameLine();
-    ImGui::TextDisabled("(editor spike - Phase 3)");
+    ImGui::TextDisabled("(editor - Correct / Grade)");
     ImGui::Separator();
 
     // Two-column layout: controls left, live preview (Phase 4 placeholder) right.
@@ -206,15 +206,24 @@ void DrawEditorUI(WindowImpl* w, ParamSnapshot& ui) {
 
     if (ImGui::BeginTabBar("tabs")) {
         if (ImGui::BeginTabItem("Correct")) {
-            ImGui::TextWrapped("Footage profile + Analyze land with the full control set "
-                               "(gated behind the toolkit decision).");
-            static int footage = 0;
+            ImGui::TextWrapped("Footage log format. V-Log decodes to Rec.709 before the "
+                               "grade - applied live (this is an effect; no separate "
+                               "Apply step).");
+            ImGui::Spacing();
+            // --- Footage profile: writes EditField::FootageProfile (1-based, CG_FOOT_*) ---
+            int footIdx = ui.footageProfile - 1;
+            if (footIdx < 0) footIdx = 0;
+            if (footIdx > 1) footIdx = 1;
+            if (ImGui::Combo("Footage", &footIdx, kFootageNames, 2)) {
+                ui.footageProfile = footIdx + 1;
+                w->edits.push({EditField::FootageProfile, static_cast<double>(ui.footageProfile)});
+            }
+            ImGui::Spacing();
             ImGui::BeginDisabled();
-            ImGui::Combo("Footage", &footage, "Rec.709 (standard)\0V-Log\0");
-            ImGui::Button("Apply correction");
-            ImGui::SameLine();
-            ImGui::Button("Analyze frame");
+            ImGui::Button("Analyze frame");  // in-effect analysis: Phase 5
             ImGui::EndDisabled();
+            ImGui::SameLine();
+            ImGui::TextDisabled("(analysis: Phase 5)");
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem("Grade")) {

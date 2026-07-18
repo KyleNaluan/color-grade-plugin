@@ -33,11 +33,12 @@ namespace editor {
 // Which effect param an edit targets. Kept independent of the effect's CG_* enum
 // so this header stays free of ColorGrade.h (host coupling lives in EditorWindow).
 enum class EditField : int {
-    Theme = 0,       // 1-based popup index (CG_THEME_*)
-    Strength,        // fraction 0..1
-    SkinProtection,  // fraction 0..1
-    ChromaGain,      // fraction; 1.0 == 100% (theme's authored gain)
-    LutSource,       // 1-based popup index (CG_SRC_*)
+    FootageProfile = 0,  // Correct: 1-based popup index (CG_FOOT_*)
+    Theme,               // 1-based popup index (CG_THEME_*)
+    Strength,            // fraction 0..1
+    SkinProtection,      // fraction 0..1
+    ChromaGain,          // fraction; 1.0 == 100% (theme's authored gain)
+    LutSource,           // 1-based popup index (CG_SRC_*)
 };
 
 // A single control edit produced by the window, consumed by the effect side.
@@ -48,6 +49,7 @@ struct ParamEdit {
 
 // The effect's current param values, published to the window for display.
 struct ParamSnapshot {
+    int    footageProfile = 1;  // Correct: 1-based popup index (1 = Rec.709)
     int    theme = 1;           // 1-based popup index
     double strength = 0.8;      // fraction 0..1
     double skinProtection = 0.75;
@@ -119,6 +121,7 @@ private:
 // assert "an edit round-trips back into the visible param state" without AE.
 inline void applyEdit(ParamSnapshot& s, const ParamEdit& e) {
     switch (e.field) {
+        case EditField::FootageProfile: s.footageProfile = static_cast<int>(e.value + 0.5); break;
         case EditField::Theme:          s.theme = static_cast<int>(e.value + 0.5); break;
         case EditField::Strength:       s.strength = clamp01(e.value); break;
         case EditField::SkinProtection: s.skinProtection = clamp01(e.value); break;

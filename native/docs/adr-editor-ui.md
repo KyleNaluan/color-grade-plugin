@@ -1,6 +1,7 @@
 # ADR: Editor-window UI toolkit - native (Dear ImGui) vs embedded webview
 
-- **Status:** PROPOSED - awaiting captain decision (Phase 3 checkpoint).
+- **Status:** ACCEPTED - captain approved native Dear ImGui + Win32/D3D11 at the
+  Phase 3 checkpoint; the full Correct/Grade control set was then built on it (below).
 - **Phase:** Native re-platform Phase 3 (editor window shell + effect<->window bridge).
 - **Decision owner:** captain (this is the deliberate product-direction call Phase 3 owns).
 - **Author:** crewmate (native-phase3 lane).
@@ -169,9 +170,28 @@ configs** (Debug/Release x CPU/`--gpu`) via `native/scripts/build.sh`:
   window; `PreRender` publishes the current params so the window mirrors Effect
   Controls; `UserChangedParam` drains editor edits back onto the params.
 
-What the spike deliberately does **not** do (gated on this decision / captain AE
-verification): the full control set, the live preview + scopes (Phases 4-5), and the
-production continuous write driver (below).
+What the spike deliberately did **not** do at the checkpoint (gated on the decision):
+the full control set, the live preview + scopes (Phases 4-5), and the production
+continuous write driver (below).
+
+### Post-approval: the full Correct/Grade control set (built on ImGui)
+
+After the captain approved ImGui, the full control set landed on it:
+
+- **Correct tab:** a **Footage** profile popup (Rec.709 / V-Log) - a real, persisted
+  effect param (`CG_FOOTAGE_PROFILE`). It drives a native **decode stage**: the Auto
+  bake composes `grade(decode(x))` into one LUT when the clip is a log profile, so a
+  V-Log clip is decoded to Rec.709 *before* the grade, baked into a single LUT (CPU
+  and GPU apply paths stay identical - no per-pixel decode in the kernel). This
+  composition is proven bit-exact against the TS oracle by a new `gradedecode` case in
+  `npm run native:core-parity`. (Analyze/scopes stay Phase 5; the raw Embedded/
+  External LUT modes are unaffected by the decode stage, by design.)
+- **Grade tab:** Theme popup, Strength / Skin Protection / Chroma Gain sliders, LUT
+  Source popup - all round-trip through the bridge to their params.
+- **Every control** reads (via `publishSnapshot`) and writes (via `drainEdits` ->
+  `CHANGED_VALUE`) the effect's params. The headless bridge test covers the new
+  `FootageProfile` field; all four build configs (Debug/Release x CPU/`--gpu`) compile
+  clean.
 
 ## The effect <-> window bridge (design)
 
@@ -226,9 +246,11 @@ and the build is loaded:
    the editor window; AE stays responsive (window is on its own thread).
 2. **Single instance:** clicking the button again focuses the existing window (no
    second window).
-3. **Controls round-trip:** editing Theme/Strength/Skin/Chroma/LUT-Source in the
-   window updates the corresponding Effect Controls param and re-renders the comp;
-   changing a param in Effect Controls updates the window's control.
+3. **Controls round-trip:** editing Footage (Correct) or
+   Theme/Strength/Skin/Chroma/LUT-Source (Grade) in the window updates the
+   corresponding Effect Controls param and re-renders the comp; changing a param in
+   Effect Controls updates the window's control. Setting Footage = V-Log on a V-Log
+   clip visibly corrects it (decode + grade) in the Auto LUT-Source mode.
 4. **No dialogs / no hangs:** no modal/error dialogs; the window never blocks AE.
 5. **Lifecycle:** closing the window's close-box leaves no orphan window and AE
    stays healthy; deleting the effect / closing the comp closes the window; quitting

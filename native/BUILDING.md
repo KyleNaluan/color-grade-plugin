@@ -244,10 +244,11 @@ A build cannot prove the effect works in AE; that needs a human at the GUI. When
 is ready, verify in AE 2025:
 
 1. **Registers & drags:** AE launched, the effect appears under **Effects & Presets ->
-   Color Grade -> "CG Color Grade"**, and drags onto a layer. Effect Controls now shows
-   (Phase 2): **Theme** (Teal-Orange / Warm-Film / Cool-Noir), **Strength**,
-   **Skin Protection**, **Chroma Gain**, and **LUT Source** (Auto / Embedded / External).
-   The **Grade Recipe** arb-data param is data-only (no visible control) but persists in the
+   Color Grade -> "CG Color Grade"**, and drags onto a layer. Effect Controls shows:
+   **Footage** (Rec.709 / V-Log - Correct), **Theme** (Teal-Orange / Warm-Film /
+   Cool-Noir), **Strength**, **Skin Protection**, **Chroma Gain**, **LUT Source**
+   (Auto / Embedded / External), and **Open Editor…** (Phase 3 button). The **Grade
+   Recipe** arb-data param is data-only (no visible control) but persists in the
    project - save, reopen the `.aep`, and confirm the grade survives.
 2. **Auto grade (Phase 2 engine path):** with LUT Source = "Auto (Theme + Analysis)", the
    layer takes on the selected **Theme**'s look, baked natively in-effect from the ported
@@ -265,6 +266,13 @@ is ready, verify in AE 2025:
    (RTX 3090 + AMD) AE offers only CUDA, so expect the CUDA tracer lines; DirectX would
    engage only on a host that offers it. If it falls back to CPU, adapter/framework
    selection is the suspect - check the `GPUDeviceSetup` trace for which framework AE offered.
+6. **Correct (Footage):** on a V-Log clip, set **Footage** = "V-Log" with LUT Source =
+   "Auto"; the clip is decoded to Rec.709 then graded (looks corrected, not washed-out
+   log). "Rec.709 (standard)" leaves the decode out. (Decode applies to the Auto path.)
+7. **Editor window (Phase 3):** click **Open Editor…**; the native editor window opens and
+   AE stays responsive. Run the full editor checklist in
+   `native/docs/adr-editor-ui.md` (button opens, single instance, controls round-trip
+   both ways, no dialogs/hangs, sane close/reopen/project-close lifecycle, undo).
 
 The numerical correctness of the ported engine is proven unattended by the cross-engine
 golden harness (`npm run native:core-parity`), so AE verification here is about the SDK glue
