@@ -321,26 +321,33 @@ until the next scrub/param nudge. (c) Scopes + before/after are Phase 5.
   (5027::247)* (round 1), and even `AEGP_GetNewEffectStreamByIndex` / `AEGP_GetStreamType`
   by index into the collapsed stream group raised *"invalid index in indexed group"* then
   a hard crash (round 2). **Conclusion: never touch ANY stream of a possibly-stale ref.**
-  Final design: the idle hook keeps **no** persistent `AEGP_EffectRefH`. At button-open it
-  captures only the parent **layer** (`AEGP_GetEffectLayer`) + our **installed-effect key**.
-  Each tick it re-derives a *fresh, valid* ref via `ResolveLiveEffect`, which returns a
-  **tri-state**: enumerate the live layer's effects (`AEGP_GetLayerNumEffects` +
-  `AEGP_GetLayerEffectByIndex`, always safe on a live layer) and match ours by installed
-  key -> **Alive** (use the fresh handle, disposed at end of pass); a live layer with
-  effects but no match -> **ConfirmedGone** (the effect was deleted: close the window
-  promptly - Phase 3 "delete effect -> window closes"); no/partial context or the layer no
-  longer enumerates -> **CannotVerify**. The tri-state exists because a single
-  `CannotVerify` must **not** force-close a live window (a transient/failed capture would
-  otherwise kill it - review finding), yet a **persistent** `CannotVerify` means the parent
-  **layer or comp** was deleted (captain-verified: those calls are crash-safe, but the
-  window would otherwise linger open). So the idle hook counts consecutive `CannotVerify`
-  ticks per instance and closes only at `CG_VERIFY_FAIL_LIMIT` (~0.8 s), resetting the
-  counter on any `Alive`. A defensive `NO_DATA` type-check remains in `ReadStreamOneD` as
-  belt-and-suspenders. **Multi-instance limitation:** if two CG effects share one layer,
-  `ResolveLiveEffect` matches the *first* by installed key (the layer-effect APIs expose no
-  per-instance id from the idle hook), so two open editors on the same layer could both
-  bind the first effect - acceptable and non-crashing; revisit if per-instance targeting on
-  a shared layer is needed.
+  Final design: the idle hook keeps **no** persistent `AEGP_EffectRefH` **and no cached
+  `AEGP_LayerH`** - both go stale across delete/undo. At button-open it captures the parent
+  **comp** (`AEGP_GetLayerParentComp`), the layer's **stable layer-ID** (`AEGP_GetLayerID`),
+  and our **installed-effect key**. Each tick `ResolveLiveEffect` returns a **tri-state**:
+  first the **comp-membership** test - re-resolve the *current* layer handle from
+  (comp, layer-ID) via `AEGP_GetLayerFromLayerID`, which fails exactly when the layer is no
+  longer in the comp's live layer list; then enumerate *that* handle's effects and match by
+  installed key. -> **Alive** (use the fresh ref for read/write/render, disposed at end of
+  pass); live comp-resident layer but no match -> **ConfirmedGone** (effect deleted: close
+  promptly - Phase 3 "delete effect -> window closes"); not a comp member, or partial
+  context -> **CannotVerify**.
+
+  **Why membership, not call-failure (round-4 finding):** deleting a layer moves it into
+  AE's *undo buffer* as a "zombie" - a cached `AEGP_LayerH` keeps enumerating against it, so
+  an earlier "N consecutive failed enumerations" counter **never fired** and the window
+  lingered. `AEGP_GetLayerFromLayerID` resolves through the comp's *current* layer list, so a
+  deleted layer (or a layer whose source footage was removed, or a closed comp) fails the
+  lookup, and an **undo** that restores the layer (same id) makes it succeed again - and
+  hands back the *current* handle, so the write path re-derives the live effect and no
+  longer writes onto a stale ref (that stale write was the intermittent
+  "internal verification" modal on edit-after-undo). A single `CannotVerify` still never
+  force-closes (transient guard); a persistent run closes at `CG_VERIFY_FAIL_LIMIT` (~0.8 s).
+  While not `Alive`, the hook also **drops any edits the orphaned window queued** (writes
+  happen only in the `Alive` branch, on the fresh ref). A defensive `NO_DATA` type-check
+  remains in `ReadStreamOneD`. **Multi-instance limitation:** two CG effects on one layer ->
+  `ResolveLiveEffect` matches the *first* by installed key (no per-instance id available from
+  the idle hook); acceptable and non-crashing; revisit if per-instance targeting is needed.
 
 ## AE verification checklist (captain-assisted)
 

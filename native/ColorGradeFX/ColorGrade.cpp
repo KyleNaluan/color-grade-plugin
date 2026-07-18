@@ -95,7 +95,8 @@ static bool             g_idleHookRegistered = false;
 // layer exists (which outlives an effect deletion).
 static std::mutex g_effMutex;
 struct EffectContext {
-    AEGP_LayerH             layerH = nullptr;
+    AEGP_CompH              compH = nullptr;   // parent comp (stable while the comp is open)
+    AEGP_LayerIDVal         layerID = AEGP_LayerIDVal_NONE;  // STABLE layer identity
     AEGP_InstalledEffectKey installedKey = AEGP_InstalledEffectKey_NONE;
 };
 static std::map<cg::editor::InstanceKey, EffectContext> g_effectCtx;
@@ -578,18 +579,25 @@ static bool StreamForEdit(const cg::editor::ParamEdit& e, PF_ParamIndex& idx, do
     return false;
 }
 
-// Capture this effect instance's CONTEXT (parent layer + installed-effect key) at
-// button-open, while in_data->effect_ref is valid. No persistent AEGP_EffectRefH is
-// kept: the idle hook re-derives a fresh handle from the live layer each tick (see
-// LiveEffectForKey), so there is never a stale ref to dereference after deletion.
+// Capture this effect instance's CONTEXT at button-open, while in_data->effect_ref is
+// valid: the parent COMP, the layer's STABLE layer-ID, and our installed-effect key. No
+// persistent AEGP_EffectRefH or AEGP_LayerH is kept - both go stale across delete/undo.
+// The idle hook re-resolves the *current* layer handle from (comp, layerID) each tick and
+// enumerates its effects, so it always works on live handles (see ResolveLiveEffect).
 static void CaptureEffectContextForKey(PF_InData* in_data, cg::editor::InstanceKey key) {
     if (!g_spbasic || !g_aegpId || !in_data->effect_ref) return;
     try {
         AEGP_SuiteHandler sh(g_spbasic);
         EffectContext ctx;
-        // Parent layer (not a "New" handle - not owned; stays valid while the layer lives).
-        if (sh.PFInterfaceSuite1()->AEGP_GetEffectLayer(in_data->effect_ref, &ctx.layerH) ||
-            !ctx.layerH) {
+        AEGP_LayerH layerH = nullptr;
+        if (sh.PFInterfaceSuite1()->AEGP_GetEffectLayer(in_data->effect_ref, &layerH) || !layerH) {
+            return;
+        }
+        // Parent comp + stable layer-ID: the identity we re-resolve from each tick. The
+        // layer-ID survives a delete+undo (AE restores the same id), unlike a cached handle.
+        if (sh.LayerSuite9()->AEGP_GetLayerParentComp(layerH, &ctx.compH) || !ctx.compH) return;
+        if (sh.LayerSuite9()->AEGP_GetLayerID(layerH, &ctx.layerID) ||
+            ctx.layerID == AEGP_LayerIDVal_NONE) {
             return;
         }
         // Our installed-effect key, read from a temporary AEGP ref (disposed immediately).
@@ -606,26 +614,26 @@ static void CaptureEffectContextForKey(PF_InData* in_data, cg::editor::InstanceK
 
 static void ForgetEffectContextForKey(cg::editor::InstanceKey key) {
     std::lock_guard<std::mutex> lk(g_effMutex);
-    g_effectCtx.erase(key);  // layerH is not owned, so nothing to dispose
+    g_effectCtx.erase(key);  // compH is not owned, so nothing to dispose
 }
 
 // Outcome of trying to re-derive a live effect ref for an open window this tick.
 enum class EffectResolution {
-    Alive,         // found our effect on its live layer; outH is set (caller disposes)
-    ConfirmedGone, // the layer is live and has effects, but none are ours -> effect deleted
-    CannotVerify,  // couldn't determine: no/partial context, or the layer no longer enumerates
-                   // (layer/comp deleted) - treated as transient until it PERSISTS (see hook)
+    Alive,         // found our effect on its live, comp-resident layer; outH set (caller disposes)
+    ConfirmedGone, // the layer is a live comp member but no longer carries our effect -> deleted
+    CannotVerify,  // couldn't determine: no/partial context, or the layer is not a current comp
+                   // member (layer/comp deleted) - transient until it PERSISTS (see the hook)
 };
 
-// Re-derive a FRESH, valid AEGP effect ref for `key` by scanning its captured layer's
-// current effects for one whose installed key matches ours. On EffectResolution::Alive,
-// `outH` receives the matched ref and the CALLER MUST dispose it (AEGP_DisposeEffect).
-// Every call here is on the live layer or on fresh handles, so none can raise the
-// stale-ref modal. The tri-state lets the idle hook close promptly on a confirmed effect
-// deletion (live layer, no match) yet tolerate a transient "cannot verify" - only closing
-// on that once it persists (the layer/comp itself was deleted; captain-verified crash-safe
-// but otherwise leaves the window lingering). (Multi-instance note: if two CG effects share
-// one layer, this returns the first match - acceptable, non-crashing; documented.)
+// Re-derive a FRESH, valid AEGP effect ref for `key`. The liveness test is COMP MEMBERSHIP,
+// not call success: AE moves a deleted layer into the undo buffer, where a cached AEGP_LayerH
+// keeps enumerating ("zombie" layer) so call-failure counting never fires. Instead we
+// re-resolve the layer by its stable id within its parent comp (AEGP_GetLayerFromLayerID) -
+// which fails exactly when the layer is no longer in the comp's live layer list (deleted, or
+// source footage removed, or comp gone) and re-succeeds after an undo restores it. On
+// EffectResolution::Alive, `outH` receives the matched ref and the CALLER MUST dispose it.
+// Every call is on live handles, so none can raise the stale-ref modal. (Multi-instance note:
+// two CG effects on one layer -> first match; acceptable, non-crashing; documented.)
 static EffectResolution ResolveLiveEffect(AEGP_SuiteHandler& sh, cg::editor::InstanceKey key,
                                           AEGP_EffectRefH& outH) {
     outH = nullptr;
@@ -636,20 +644,27 @@ static EffectResolution ResolveLiveEffect(AEGP_SuiteHandler& sh, cg::editor::Ins
         if (it == g_effectCtx.end()) return EffectResolution::CannotVerify;  // never captured
         ctx = it->second;
     }
-    // No layer, or a partial capture with no installed key to match on: not a confirmed
-    // deletion, just unverifiable. (A capture failure at open lands here; the idle hook's
-    // counter still closes it if it never recovers, without a first-tick force-close.)
-    if (!ctx.layerH || ctx.installedKey == AEGP_InstalledEffectKey_NONE) {
+    // Partial/failed capture: nothing to match on. Not a confirmed deletion, just
+    // unverifiable (the idle hook's counter still closes it if it never recovers).
+    if (!ctx.compH || ctx.layerID == AEGP_LayerIDVal_NONE ||
+        ctx.installedKey == AEGP_InstalledEffectKey_NONE) {
         return EffectResolution::CannotVerify;
     }
-    A_long num = 0;
-    if (sh.EffectSuite5()->AEGP_GetLayerNumEffects(ctx.layerH, &num)) {
-        return EffectResolution::CannotVerify;  // layer no longer enumerates (layer/comp gone)
+    // Membership test: is the layer still in its comp's live layer list? Re-resolves the
+    // CURRENT handle (robust across delete+undo). Failure == not a member == gone.
+    AEGP_LayerH liveLayerH = nullptr;
+    if (sh.LayerSuite9()->AEGP_GetLayerFromLayerID(ctx.compH, ctx.layerID, &liveLayerH) ||
+        !liveLayerH) {
+        return EffectResolution::CannotVerify;  // layer/comp not resident -> persistent -> close
     }
-    if (num <= 0) return EffectResolution::CannotVerify;  // empty enumeration -> treat as failure
+    // Enumerate the CURRENT layer's effects (never the cached handle) and match ours.
+    A_long num = 0;
+    if (sh.EffectSuite5()->AEGP_GetLayerNumEffects(liveLayerH, &num) || num <= 0) {
+        return EffectResolution::ConfirmedGone;  // live layer, no effects -> ours is gone
+    }
     for (A_long i = 0; i < num; ++i) {
         AEGP_EffectRefH candH = nullptr;
-        if (sh.EffectSuite5()->AEGP_GetLayerEffectByIndex(g_aegpId, ctx.layerH,
+        if (sh.EffectSuite5()->AEGP_GetLayerEffectByIndex(g_aegpId, liveLayerH,
                                                           static_cast<AEGP_EffectIndex>(i), &candH) ||
             !candH) {
             continue;
@@ -657,12 +672,12 @@ static EffectResolution ResolveLiveEffect(AEGP_SuiteHandler& sh, cg::editor::Ins
         AEGP_InstalledEffectKey candKey = AEGP_InstalledEffectKey_NONE;
         A_Err e = sh.EffectSuite5()->AEGP_GetInstalledKeyFromLayerEffect(candH, &candKey);
         if (!e && candKey == ctx.installedKey) {
-            outH = candH;  // caller disposes
+            outH = candH;  // caller disposes; write/read/render this tick use this live ref
             return EffectResolution::Alive;
         }
         sh.EffectSuite5()->AEGP_DisposeEffect(candH);
     }
-    // Live layer, enumerated its effects, none are ours: our effect was deleted.
+    // Live comp-resident layer, but our effect is no longer on it: it was deleted.
     return EffectResolution::ConfirmedGone;
 }
 
@@ -894,13 +909,17 @@ static A_Err CG_IdleHook(AEGP_GlobalRefcon, AEGP_IdleRefcon, A_long* max_sleepPL
             // (never dereference a possibly-stale captured ref - that crashes AE when the
             // effect was deleted). The tri-state resolution decides how to react:
             //   Alive         -> use the fresh handle this tick; reset the failure counter.
-            //   ConfirmedGone -> the effect was deleted (live layer, no match): close the
-            //                    window promptly (Phase 3 "delete effect -> window closes").
-            //   CannotVerify  -> couldn't confirm (partial/failed capture, or the layer/comp
-            //                    was deleted so the layer no longer enumerates). A single
-            //                    such tick is treated as transient and never force-closes a
-            //                    live window; only a PERSISTENT run (>= CG_VERIFY_FAIL_LIMIT
-            //                    consecutive) closes the lingering window.
+            //   ConfirmedGone -> our effect is gone from its live comp-resident layer: close
+            //                    the window promptly (Phase 3 "delete effect -> window closes").
+            //   CannotVerify  -> the layer is not a current comp member (layer/comp deleted or
+            //                    source removed), or the capture was partial. A single such
+            //                    tick is treated as transient and never force-closes a live
+            //                    window; only a PERSISTENT run (>= CG_VERIFY_FAIL_LIMIT) closes
+            //                    the lingering window.
+            // In BOTH not-Alive cases the effect is not confirmed live, so we drop any edits
+            // the (now-orphaned) window queued rather than writing them onto a stale/absent
+            // effect - which is what replayed the "internal verification" modal after a
+            // delete+undo. Writes only ever happen in the Alive branch, on the fresh ref.
             auto closeAndForget = [&](cg::editor::InstanceKey k) {
                 host.close(k);
                 ForgetEffectContextForKey(k);
@@ -920,6 +939,7 @@ static A_Err CG_IdleHook(AEGP_GlobalRefcon, AEGP_IdleRefcon, A_long* max_sleepPL
                 continue;
             }
             if (res == EffectResolution::CannotVerify) {
+                (void)host.drainEdits(key);  // discard: never write to an unconfirmed effect
                 int fails = ++g_verifyFailures[key];
                 if (fails >= CG_VERIFY_FAIL_LIMIT) closeAndForget(key);
                 continue;  // transient: leave the window open and retry next tick
