@@ -99,10 +99,13 @@ const AUTO_CEIL_TIGHT = 3; // multiple of target band chroma at full severity
  * Experiment A). The stretch ratio (output luma range / input luma range) is a
  * principled proxy for how much relocation, and thus overshoot, will occur.
  *
- * The guard damps only this stat-derived *automatic* amplification and, when the
- * theme authored no chroma ceiling, derives one from the target's own chroma.
- * Authored chromaGain / chromaShape always still apply on top - the guard bounds
- * the auto behavior, it never overrides hand-authored intent.
+ * In the large-stretch safety regime the guard's gain bounds the *total*
+ * auto-driven per-band chroma amplification - which includes any authored
+ * chromaGain, since gain folds into the same `scale` product - by design: this is
+ * exactly the blowout-prevention regime. The auto soft ceiling, by contrast, is
+ * only adopted when the theme authored no chromaShape.softLimit, so a hand-set
+ * ceiling always wins. Outside the guard's engaged regime hand-authored intent is
+ * untouched.
  */
 export function toneStretchChromaGuard(src: FootageStats, tgt: FootageStats): ChromaGuard {
   const srcRange = Math.max(src.lumaPercentiles.p95 - src.lumaPercentiles.p5, 1e-3);
@@ -215,6 +218,8 @@ export function buildTransform(src: FootageStats, theme: Theme, opts: EngineOpti
     // 3. Per-band chroma scaling + overrides.
     const y1 = luma709(r1, g1, b1);
     const [ws, wm, wh] = bandWeights(y1);
+    // guard.gain bounds the total auto-driven amplification here, including the
+    // authored chromaGain, when a large stretch would otherwise neon-blow-up.
     const scale = (ws * bandScale[0] + wm * bandScale[1] + wh * bandScale[2]) * chromaGain * guard.gain;
     a *= scale;
     bb *= scale;
