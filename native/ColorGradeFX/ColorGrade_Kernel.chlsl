@@ -1,0 +1,4 @@
+// ColorGrade_Kernel.chlsl - HLSL entry point for the DirectX build.
+// The build preprocesses this (cl /P -> ParseHLSL.py -> DXC) into DirectX_Assets/
+// ColorGradeKernel.cso + .rs. It just includes the shared GF-macro kernel source.
+#include "ColorGrade_Kernel.cu"
