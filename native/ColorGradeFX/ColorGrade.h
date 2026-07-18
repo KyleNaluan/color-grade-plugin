@@ -31,11 +31,17 @@
 #include <Windows.h>
 #endif
 
-// Enable the DirectX GPU path only where the HLSL toolchain is present. The build
-// defines HAS_HLSL=1 for the GPU configuration; the CPU-only configuration leaves it 0.
+// GPU paths are compiled in per-framework by the build: CG_GPU=true defines HAS_HLSL=1
+// (DirectX) and HAS_CUDA=1 (NVIDIA). The CPU-only configuration leaves both 0. DirectX is
+// the vendor-neutral path; CUDA is what AE's Mercury actually offers on the NVIDIA dev box
+// (AE 2025 there exposes only CUDA/OpenCL/Software - no DirectX), so both are shipped.
 #ifndef HAS_HLSL
 #define HAS_HLSL 0
 #endif
+#ifndef HAS_CUDA
+#define HAS_CUDA 0
+#endif
+#define HAS_ANY_GPU (HAS_HLSL || HAS_CUDA)
 
 #include "lut/CubeLut.h"
 #include "embedded/EmbeddedLut.h"

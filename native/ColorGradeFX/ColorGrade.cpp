@@ -10,6 +10,15 @@
  * falling back to the embedded LUT on any failure (so render never fails for a bad path).
  */
 
+// cuda_runtime.h must precede ColorGrade.h: it defines MAJOR_VERSION/MINOR_VERSION macros
+// that would clash with ours, so undef them here (mirrors the SDK's SDK_Invert_ProcAmp).
+// HAS_CUDA is a project define (CG_GPU=true); undefined -> this #if is 0 and skips.
+#if HAS_CUDA
+#include <cuda_runtime.h>
+#undef MAJOR_VERSION
+#undef MINOR_VERSION
+#endif
+
 #include "ColorGrade.h"
 
 #include <fstream>
@@ -97,11 +106,15 @@ static PF_Err GlobalSetup(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef*
                            PF_OutFlag2_SUPPORTS_SMART_RENDER |
                            PF_OutFlag2_SUPPORTS_THREADED_RENDERING;
 
-#if HAS_HLSL
-    // The GPU path is advertised only outside Premiere. DirectX is the primary path;
-    // this flag must match the PiPL's Global_OutFlags_2 or AE silently falls back to CPU.
+#if HAS_ANY_GPU
+    // GPU support is advertised only outside Premiere. GPU_RENDER_F32 declares the effect is
+    // GPU-capable (covers CUDA); the DirectX flag additionally opts into that framework. These
+    // must match the PiPL's Global_OutFlags_2 or AE silently falls back to CPU.
     if (in_data->appl_id != 'PrMr') {
-        out_data->out_flags2 |= PF_OutFlag2_SUPPORTS_GPU_RENDER_F32 | PF_OutFlag2_SUPPORTS_DIRECTX_RENDERING;
+        out_data->out_flags2 |= PF_OutFlag2_SUPPORTS_GPU_RENDER_F32;
+#if HAS_HLSL
+        out_data->out_flags2 |= PF_OutFlag2_SUPPORTS_DIRECTX_RENDERING;
+#endif
     }
 #endif
     return PF_Err_NONE;
@@ -262,8 +275,8 @@ static PF_Err SmartRenderCPU(PF_InData* in_data, PF_OutData* out_data, PF_PixelF
     return err;
 }
 
-#if HAS_HLSL
-#include "ColorGradeGPU.inc"  // GPUDeviceSetup/Setdown + SmartRenderGPU (DirectX)
+#if HAS_ANY_GPU
+#include "ColorGradeGPU.inc"  // GPUDeviceSetup/Setdown + SmartRenderGPU (DirectX + CUDA)
 #endif
 
 static PF_Err SmartRender(PF_InData* in_data, PF_OutData* out_data, PF_SmartRenderExtra* extra, bool isGPU) {
@@ -282,7 +295,7 @@ static PF_Err SmartRender(PF_InData* in_data, PF_OutData* out_data, PF_SmartRend
 
     if (!err) {
         if (isGPU) {
-#if HAS_HLSL
+#if HAS_ANY_GPU
             ERR(SmartRenderGPU(in_data, out_data, fmt, input, output, extra, d));
 #else
             err = SmartRenderCPU(in_data, out_data, fmt, input, output, d);
@@ -327,7 +340,7 @@ PF_Err EffectMain(PF_Cmd cmd, PF_InData* in_data, PF_OutData* out_data,
             case PF_Cmd_PARAMS_SETUP:
                 err = ParamsSetup(in_data, out_data, params, output);
                 break;
-#if HAS_HLSL
+#if HAS_ANY_GPU
             case PF_Cmd_GPU_DEVICE_SETUP:
                 err = GPUDeviceSetup(in_data, out_data, (PF_GPUDeviceSetupExtra*)extra);
                 break;

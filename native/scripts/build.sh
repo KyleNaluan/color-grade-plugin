@@ -9,7 +9,7 @@
 #
 # Usage: native/scripts/build.sh [Debug|Release] [--gpu]
 #   Debug (default) | Release   build configuration
-#   --gpu                       (reserved) build the DirectX GPU configuration
+#   --gpu                       build the GPU config (DirectX + CUDA) instead of CPU-only
 #
 # Requires: VS 2022 MSBuild, the four AE SDK env vars (see native/BUILDING.md).
 set -euo pipefail

@@ -22,11 +22,20 @@
     <AE_SDK_PATH Condition="'$(AE_SDK_PATH)'==''">C:\dev\AfterEffectsSDK_25.6_61_win\ae25.6_61.64bit.AfterEffectsSDK</AE_SDK_PATH>
     <AE_SDK_EXAMPLES>$(AE_SDK_PATH)\Examples</AE_SDK_EXAMPLES>
     <CG_GPU Condition="'$(CG_GPU)'==''">false</CG_GPU>
-    <!-- GPU-only bits, folded into the shared ItemDefinitionGroups below. -->
-    <CG_ExtraDefines Condition="'$(CG_GPU)'=='true'">HAS_HLSL=1;</CG_ExtraDefines>
-    <CG_ExtraIncludes Condition="'$(CG_GPU)'=='true'">$(BOOST_BASE_PATH)\;</CG_ExtraIncludes>
-    <CG_ExtraLibs Condition="'$(CG_GPU)'=='true'">d3d12.lib;d3dcompiler.lib;dxgi.lib;</CG_ExtraLibs>
+    <!-- GPU-only bits, folded into the shared ItemDefinitionGroups below. CG_GPU=true builds
+         both DirectX (HAS_HLSL) and CUDA (HAS_CUDA); AE picks the framework at runtime. -->
+    <CG_ExtraDefines Condition="'$(CG_GPU)'=='true'">HAS_HLSL=1;HAS_CUDA=1;</CG_ExtraDefines>
+    <CG_ExtraIncludes Condition="'$(CG_GPU)'=='true'">$(BOOST_BASE_PATH)\;$(CUDA_SDK_BASE_PATH)\include\;</CG_ExtraIncludes>
+    <CG_ExtraLibs Condition="'$(CG_GPU)'=='true'">d3d12.lib;d3dcompiler.lib;dxgi.lib;cudart_static.lib;</CG_ExtraLibs>
+    <CG_ExtraLibDirs Condition="'$(CG_GPU)'=='true'">$(CUDA_SDK_BASE_PATH)\lib\x64;</CG_ExtraLibDirs>
+    <!-- cudart_static.lib pulls the static CRT (LIBCMT); we use the dynamic CRT (/MD[d]).
+         Ignore the static one so the dynamic CRT wins (silences LNK4098, avoids CRT mixing). -->
+    <CG_IgnoreLibs Condition="'$(CG_GPU)'=='true'">libcmt.lib;libcmtd.lib;</CG_IgnoreLibs>
     <CG_PiPLDefines Condition="'$(CG_GPU)'=='true'">/D HAS_HLSL=1 </CG_PiPLDefines>
+    <!-- nvcc host-compiler flags, matched to the CRT of each config. -->
+    <CG_NvccRuntime Condition="'$(Configuration)'=='Debug'">/MDd</CG_NvccRuntime>
+    <CG_NvccRuntime Condition="'$(Configuration)'=='Release'">/MD</CG_NvccRuntime>
+    <CG_NvccDebug Condition="'$(Configuration)'=='Debug'">-D_DEBUG </CG_NvccDebug>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
@@ -82,6 +91,8 @@
       <ImportLibrary>$(IntDir)$(TargetName).lib</ImportLibrary>
       <TargetMachine>MachineX64</TargetMachine>
       <AdditionalDependencies>$(CG_ExtraLibs)%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalLibraryDirectories>$(CG_ExtraLibDirs)%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <IgnoreSpecificDefaultLibraries>$(CG_IgnoreLibs)%(IgnoreSpecificDefaultLibraries)</IgnoreSpecificDefaultLibraries>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
@@ -109,6 +120,8 @@
       <ImportLibrary>$(IntDir)$(TargetName).lib</ImportLibrary>
       <TargetMachine>MachineX64</TargetMachine>
       <AdditionalDependencies>$(CG_ExtraLibs)%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalLibraryDirectories>$(CG_ExtraLibDirs)%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <IgnoreSpecificDefaultLibraries>$(CG_IgnoreLibs)%(IgnoreSpecificDefaultLibraries)</IgnoreSpecificDefaultLibraries>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
@@ -142,6 +155,15 @@ python "$(AE_SDK_EXAMPLES)\GPUUtils\ParseHLSL.py" -i "$(ProjectDir)%(Filename).i
       <Message>Preprocessing HLSL to CSO/RS for %(Filename).chlsl</Message>
       <Outputs>$(ProjectDir)%(Filename).i;$(IntDir)ColorGradeKernel.hlsl;$(IntDir)DirectX_Assets\ColorGradeKernel.cso;$(IntDir)DirectX_Assets\ColorGradeKernel.rs</Outputs>
       <AdditionalInputs>%(RelativeDir)%(Filename).cu</AdditionalInputs>
+    </CustomBuild>
+    <!-- GPU only: compile the CUDA kernel with nvcc; the .obj is linked into the .aex.
+         -ccbin resolves to the v143 host compiler under VS 2022 (VS 2026 crashes cudafe++;
+         see BUILDING.md). -arch=sm_50 emits forward-compatible PTX (JITs onto the sm_86 3090). -->
+    <CustomBuild Include="..\ColorGrade_Kernel.cu" Condition="'$(CG_GPU)'=='true'">
+      <FileType>Document</FileType>
+      <Command>"$(CUDA_SDK_BASE_PATH)\bin\nvcc.exe" $(CG_NvccDebug)-arch=sm_50 -Wno-deprecated-gpu-targets -use_fast_math -m64 -c -ccbin "$(VC_ExecutablePath_x64_x64)" -D_MBCS -Xcompiler $(CG_NvccRuntime),/EHsc,/W3,/nologo,/Zi -I"$(CUDA_SDK_BASE_PATH)\include" -I./ -I"$(AE_SDK_EXAMPLES)\GPUUtils" -I$(BOOST_BASE_PATH) -o "$(IntDir)%(Filename).obj" "$(ProjectDir)..\%(Filename).cu"</Command>
+      <Message>Compiling CUDA kernel %(Filename).cu (nvcc)</Message>
+      <Outputs>$(IntDir)%(Filename).obj</Outputs>
     </CustomBuild>
   </ItemGroup>
   <ItemGroup>
