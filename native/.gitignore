@@ -1,0 +1,13 @@
+# Native build artifacts (MSBuild intermediates + generated PiPL resource)
+x64/
+.vs/
+*.aex
+*.pdb
+*.obj
+*.lib
+*.exp
+*.rc
+*.rr
+*.rrc
+*.i
+DirectX_Assets/
