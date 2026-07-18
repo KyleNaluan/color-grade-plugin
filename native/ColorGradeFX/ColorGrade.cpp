@@ -230,10 +230,12 @@ static PF_Err PreRender(PF_InData* in_data, PF_OutData* out_data, PF_PreRenderEx
     AEFX_CLR_STRUCT(p);
     ERR(PF_CHECKOUT_PARAM(in_data, CG_STRENGTH, in_data->current_time, in_data->time_step, in_data->time_scale, &p));
     d->strength = static_cast<float>(p.u.fs_d.value / 100.0);
+    ERR2(PF_CHECKIN_PARAM(in_data, &p));
 
     AEFX_CLR_STRUCT(p);
     ERR(PF_CHECKOUT_PARAM(in_data, CG_LUT_SOURCE, in_data->current_time, in_data->time_step, in_data->time_scale, &p));
     A_long source = p.u.pd.value;
+    ERR2(PF_CHECKIN_PARAM(in_data, &p));
 
     ResolveLut(source, d->lut);
 
