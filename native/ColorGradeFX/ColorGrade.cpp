@@ -94,9 +94,15 @@ static bool             g_idleHookRegistered = false;
 // AEGP_LayerH from AEGP_GetEffectLayer is not owned (no dispose); it stays valid while the
 // layer exists (which outlives an effect deletion).
 static std::mutex g_effMutex;
+// Only STABLE identities are cached - NO AEGP handles. A deleted comp OR layer zombies in
+// AE's undo buffer, where a cached AEGP_CompH/AEGP_LayerH keeps resolving; identities do
+// not. Each idle tick re-resolves the current comp (by item id, via the live project item
+// list) and the current layer (by layer id, within that comp), so liveness is genuine
+// membership and every handle used is freshly derived (robust across delete+undo of the
+// effect, layer, or comp).
 struct EffectContext {
-    AEGP_CompH              compH = nullptr;   // parent comp (stable while the comp is open)
-    AEGP_LayerIDVal         layerID = AEGP_LayerIDVal_NONE;  // STABLE layer identity
+    A_long                  compItemID = 0;  // comp's project-item id (0 = unset)
+    AEGP_LayerIDVal         layerID = AEGP_LayerIDVal_NONE;  // stable layer identity
     AEGP_InstalledEffectKey installedKey = AEGP_InstalledEffectKey_NONE;
 };
 static std::map<cg::editor::InstanceKey, EffectContext> g_effectCtx;
@@ -579,34 +585,37 @@ static bool StreamForEdit(const cg::editor::ParamEdit& e, PF_ParamIndex& idx, do
     return false;
 }
 
-// Capture this effect instance's CONTEXT at button-open, while in_data->effect_ref is
-// valid: the parent COMP, the layer's STABLE layer-ID, and our installed-effect key. No
-// persistent AEGP_EffectRefH or AEGP_LayerH is kept - both go stale across delete/undo.
-// The idle hook re-resolves the *current* layer handle from (comp, layerID) each tick and
-// enumerates its effects, so it always works on live handles (see ResolveLiveEffect).
+// Compute an effect instance's stable identity (comp project-item id + layer id + installed
+// key) from a LIVE effect_ref (main-thread command context only). Returns false if any AEGP
+// step fails or the identity is incomplete. Shared by capture and the Open-Editor
+// duplicate-window reap so both agree on "which effect is this".
+static bool ComputeEffectContext(AEGP_SuiteHandler& sh, PF_ProgPtr effectRef, EffectContext& out) {
+    AEGP_LayerH layerH = nullptr;
+    if (sh.PFInterfaceSuite1()->AEGP_GetEffectLayer(effectRef, &layerH) || !layerH) return false;
+    AEGP_CompH compH = nullptr;
+    if (sh.LayerSuite9()->AEGP_GetLayerParentComp(layerH, &compH) || !compH) return false;
+    AEGP_ItemH itemH = nullptr;
+    if (sh.CompSuite12()->AEGP_GetItemFromComp(compH, &itemH) || !itemH) return false;
+    if (sh.ItemSuite9()->AEGP_GetItemID(itemH, &out.compItemID) || out.compItemID == 0) return false;
+    if (sh.LayerSuite9()->AEGP_GetLayerID(layerH, &out.layerID) ||
+        out.layerID == AEGP_LayerIDVal_NONE) {
+        return false;
+    }
+    AEGP_EffectRefH tmpH = nullptr;
+    if (!sh.PFInterfaceSuite1()->AEGP_GetNewEffectForEffect(g_aegpId, effectRef, &tmpH) && tmpH) {
+        sh.EffectSuite5()->AEGP_GetInstalledKeyFromLayerEffect(tmpH, &out.installedKey);
+        sh.EffectSuite5()->AEGP_DisposeEffect(tmpH);
+    }
+    return out.installedKey != AEGP_InstalledEffectKey_NONE;
+}
+
+// Capture this effect instance's stable identity at button-open (in_data->effect_ref valid).
 static void CaptureEffectContextForKey(PF_InData* in_data, cg::editor::InstanceKey key) {
     if (!g_spbasic || !g_aegpId || !in_data->effect_ref) return;
     try {
         AEGP_SuiteHandler sh(g_spbasic);
         EffectContext ctx;
-        AEGP_LayerH layerH = nullptr;
-        if (sh.PFInterfaceSuite1()->AEGP_GetEffectLayer(in_data->effect_ref, &layerH) || !layerH) {
-            return;
-        }
-        // Parent comp + stable layer-ID: the identity we re-resolve from each tick. The
-        // layer-ID survives a delete+undo (AE restores the same id), unlike a cached handle.
-        if (sh.LayerSuite9()->AEGP_GetLayerParentComp(layerH, &ctx.compH) || !ctx.compH) return;
-        if (sh.LayerSuite9()->AEGP_GetLayerID(layerH, &ctx.layerID) ||
-            ctx.layerID == AEGP_LayerIDVal_NONE) {
-            return;
-        }
-        // Our installed-effect key, read from a temporary AEGP ref (disposed immediately).
-        AEGP_EffectRefH tmpH = nullptr;
-        if (!sh.PFInterfaceSuite1()->AEGP_GetNewEffectForEffect(g_aegpId, in_data->effect_ref, &tmpH) &&
-            tmpH) {
-            sh.EffectSuite5()->AEGP_GetInstalledKeyFromLayerEffect(tmpH, &ctx.installedKey);
-            sh.EffectSuite5()->AEGP_DisposeEffect(tmpH);
-        }
+        if (!ComputeEffectContext(sh, in_data->effect_ref, ctx)) return;
         std::lock_guard<std::mutex> lk(g_effMutex);
         g_effectCtx[key] = ctx;
     } catch (...) { /* AEGP unavailable - the on-param-change stand-in still applies edits */ }
@@ -614,7 +623,63 @@ static void CaptureEffectContextForKey(PF_InData* in_data, cg::editor::InstanceK
 
 static void ForgetEffectContextForKey(cg::editor::InstanceKey key) {
     std::lock_guard<std::mutex> lk(g_effMutex);
-    g_effectCtx.erase(key);  // compH is not owned, so nothing to dispose
+    g_effectCtx.erase(key);  // nothing owned to dispose - only stable ids are stored
+}
+
+// Re-resolve the CURRENT comp handle for a stored comp project-item id by walking the live
+// project's item list (AEGP_GetFirstProjItem/AEGP_GetNextProjItem). A deleted comp is not in
+// that list (it zombies in the undo buffer, off the live tree), so this returns null exactly
+// when the comp is gone - and re-succeeds after an undo restores it. Null => comp not live.
+static AEGP_CompH ResolveCompByItemID(AEGP_SuiteHandler& sh, A_long compItemID) {
+    if (compItemID == 0) return nullptr;
+    AEGP_ProjectH projH = nullptr;
+    if (sh.ProjSuite6()->AEGP_GetProjectByIndex(0, &projH) || !projH) return nullptr;
+    AEGP_ItemH itemH = nullptr;
+    if (sh.ItemSuite9()->AEGP_GetFirstProjItem(projH, &itemH)) return nullptr;
+    while (itemH) {
+        A_long id = 0;
+        if (!sh.ItemSuite9()->AEGP_GetItemID(itemH, &id) && id == compItemID) {
+            AEGP_ItemType type = AEGP_ItemType_NONE;
+            if (!sh.ItemSuite9()->AEGP_GetItemType(itemH, &type) && type == AEGP_ItemType_COMP) {
+                AEGP_CompH compH = nullptr;
+                if (!sh.CompSuite12()->AEGP_GetCompFromItem(itemH, &compH) && compH) return compH;
+            }
+            return nullptr;  // id present but not a live comp
+        }
+        AEGP_ItemH nextH = nullptr;
+        if (sh.ItemSuite9()->AEGP_GetNextProjItem(projH, itemH, &nextH)) break;
+        itemH = nextH;
+    }
+    return nullptr;  // comp id not found in the live project -> deleted
+}
+
+// Enforce exactly one editor window per effect. Closes any window bound to the SAME effect
+// (same comp-item + layer id) under a DIFFERENT instance key - e.g. a stale orphan left when
+// a delete+undo reseeded this effect's sequence-data uid. Called on Open Editor before
+// opening the current key, so a fresh open REPLACES a lingering orphan rather than spawning a
+// second window fighting over one effect. Main-thread only (button command), like the idle
+// hook, so the un-mutexed idle-hook maps are safe to touch here.
+static void CloseDuplicateWindowsForEffect(AEGP_SuiteHandler& sh, PF_ProgPtr effectRef,
+                                           cg::editor::InstanceKey currentKey) {
+    EffectContext cur;
+    if (!ComputeEffectContext(sh, effectRef, cur)) return;
+    std::vector<cg::editor::InstanceKey> dups;
+    {
+        std::lock_guard<std::mutex> lk(g_effMutex);
+        for (auto& kv : g_effectCtx) {
+            if (kv.first != currentKey && kv.second.compItemID == cur.compItemID &&
+                kv.second.layerID == cur.layerID) {
+                dups.push_back(kv.first);
+            }
+        }
+    }
+    for (auto k : dups) {
+        cg::editor::EditorHost::instance().close(k);
+        ForgetEffectContextForKey(k);
+        g_lastPolled.erase(k);
+        g_verifyFailures.erase(k);
+        g_previewDrivers.erase(k);
+    }
 }
 
 // Outcome of trying to re-derive a live effect ref for an open window this tick.
@@ -625,15 +690,16 @@ enum class EffectResolution {
                    // member (layer/comp deleted) - transient until it PERSISTS (see the hook)
 };
 
-// Re-derive a FRESH, valid AEGP effect ref for `key`. The liveness test is COMP MEMBERSHIP,
-// not call success: AE moves a deleted layer into the undo buffer, where a cached AEGP_LayerH
-// keeps enumerating ("zombie" layer) so call-failure counting never fires. Instead we
-// re-resolve the layer by its stable id within its parent comp (AEGP_GetLayerFromLayerID) -
-// which fails exactly when the layer is no longer in the comp's live layer list (deleted, or
-// source footage removed, or comp gone) and re-succeeds after an undo restores it. On
+// Re-derive a FRESH, valid AEGP effect ref for `key`. Liveness is genuine PROJECT/COMP
+// MEMBERSHIP, not call success: AE moves a deleted comp OR layer into the undo buffer, where
+// a cached AEGP_CompH/AEGP_LayerH keeps resolving ("zombie") so call-failure counting never
+// fires. Instead we re-resolve, from stable ids, every tick: the comp by its project-item id
+// (ResolveCompByItemID - fails when the comp left the live project), then the layer by its id
+// within that comp (AEGP_GetLayerFromLayerID - fails when the layer left the comp), then the
+// effect by installed key. Each fails exactly on real deletion and re-succeeds after an undo,
+// handing back the CURRENT handle so the write path never touches a stale ref. On
 // EffectResolution::Alive, `outH` receives the matched ref and the CALLER MUST dispose it.
-// Every call is on live handles, so none can raise the stale-ref modal. (Multi-instance note:
-// two CG effects on one layer -> first match; acceptable, non-crashing; documented.)
+// (Multi-instance note: two CG effects on one layer -> first match; non-crashing; documented.)
 static EffectResolution ResolveLiveEffect(AEGP_SuiteHandler& sh, cg::editor::InstanceKey key,
                                           AEGP_EffectRefH& outH) {
     outH = nullptr;
@@ -646,16 +712,19 @@ static EffectResolution ResolveLiveEffect(AEGP_SuiteHandler& sh, cg::editor::Ins
     }
     // Partial/failed capture: nothing to match on. Not a confirmed deletion, just
     // unverifiable (the idle hook's counter still closes it if it never recovers).
-    if (!ctx.compH || ctx.layerID == AEGP_LayerIDVal_NONE ||
+    if (ctx.compItemID == 0 || ctx.layerID == AEGP_LayerIDVal_NONE ||
         ctx.installedKey == AEGP_InstalledEffectKey_NONE) {
         return EffectResolution::CannotVerify;
     }
-    // Membership test: is the layer still in its comp's live layer list? Re-resolves the
-    // CURRENT handle (robust across delete+undo). Failure == not a member == gone.
+    // Comp membership: is our comp still a live project item? (Deleted comp zombies off the
+    // live item tree.) Re-resolves the CURRENT comp handle, robust across comp delete+undo.
+    AEGP_CompH compH = ResolveCompByItemID(sh, ctx.compItemID);
+    if (!compH) return EffectResolution::CannotVerify;  // comp not in the live project -> gone
+    // Layer membership within that live comp. Failure == not a member == gone.
     AEGP_LayerH liveLayerH = nullptr;
-    if (sh.LayerSuite9()->AEGP_GetLayerFromLayerID(ctx.compH, ctx.layerID, &liveLayerH) ||
+    if (sh.LayerSuite9()->AEGP_GetLayerFromLayerID(compH, ctx.layerID, &liveLayerH) ||
         !liveLayerH) {
-        return EffectResolution::CannotVerify;  // layer/comp not resident -> persistent -> close
+        return EffectResolution::CannotVerify;  // layer not resident -> persistent -> close
     }
     // Enumerate the CURRENT layer's effects (never the cached handle) and match ours.
     A_long num = 0;
@@ -1225,10 +1294,18 @@ static PF_Err UserChangedParam(PF_InData* in_data, PF_OutData* out_data,
             params[CG_CHROMA_GAIN]->u.fs_d.value / 100.0,
             params[CG_LUT_SOURCE]->u.pd.value);
         const cg::editor::InstanceKey key = SeqKey(in_data);
+        // Exactly one window per effect: close any orphan window bound to this same effect
+        // under a stale key (e.g. from a delete+undo that reseeded the uid) before opening.
+        if (g_spbasic && g_aegpId && in_data->effect_ref) {
+            try {
+                AEGP_SuiteHandler sh(g_spbasic);
+                CloseDuplicateWindowsForEffect(sh, in_data->effect_ref, key);
+            } catch (...) { /* best-effort */ }
+        }
         cg::editor::EditorHost::instance().open(key, seed);
-        // Capture this instance's effect context (parent layer + installed key) so the
-        // idle hook can re-derive a fresh, valid effect ref each tick without ever
-        // touching a stale one (see LiveEffectForKey).
+        // Capture this instance's stable identity (comp item id + layer id + installed key)
+        // so the idle hook re-resolves a fresh, valid effect ref each tick without ever
+        // touching a stale handle (see ResolveLiveEffect).
         CaptureEffectContextForKey(in_data, key);
     }
 

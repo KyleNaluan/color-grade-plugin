@@ -321,33 +321,42 @@ until the next scrub/param nudge. (c) Scopes + before/after are Phase 5.
   (5027::247)* (round 1), and even `AEGP_GetNewEffectStreamByIndex` / `AEGP_GetStreamType`
   by index into the collapsed stream group raised *"invalid index in indexed group"* then
   a hard crash (round 2). **Conclusion: never touch ANY stream of a possibly-stale ref.**
-  Final design: the idle hook keeps **no** persistent `AEGP_EffectRefH` **and no cached
-  `AEGP_LayerH`** - both go stale across delete/undo. At button-open it captures the parent
-  **comp** (`AEGP_GetLayerParentComp`), the layer's **stable layer-ID** (`AEGP_GetLayerID`),
-  and our **installed-effect key**. Each tick `ResolveLiveEffect` returns a **tri-state**:
-  first the **comp-membership** test - re-resolve the *current* layer handle from
-  (comp, layer-ID) via `AEGP_GetLayerFromLayerID`, which fails exactly when the layer is no
-  longer in the comp's live layer list; then enumerate *that* handle's effects and match by
-  installed key. -> **Alive** (use the fresh ref for read/write/render, disposed at end of
-  pass); live comp-resident layer but no match -> **ConfirmedGone** (effect deleted: close
-  promptly - Phase 3 "delete effect -> window closes"); not a comp member, or partial
-  context -> **CannotVerify**.
+  Final design: the idle hook keeps **no AEGP handles at all** - effect ref, layer handle,
+  AND comp handle all go stale across delete/undo. At button-open it captures only **stable
+  ids**: the parent comp's **project-item id** (`AEGP_GetItemFromComp` + `AEGP_GetItemID`),
+  the layer's **layer-ID** (`AEGP_GetLayerID`), and our **installed-effect key**. Each tick
+  `ResolveLiveEffect` re-resolves everything from those ids and returns a **tri-state**:
+  (1) **comp membership** - re-resolve the current comp handle by walking the *live project's*
+  item list (`AEGP_GetFirstProjItem`/`AEGP_GetNextProjItem`) for our item id
+  (`ResolveCompByItemID`); (2) **layer membership** - `AEGP_GetLayerFromLayerID` within that
+  comp; (3) **effect match** - enumerate that layer's effects by installed key. -> **Alive**
+  (use the fresh ref for read/write/render, disposed at end of pass); live comp+layer but no
+  effect match -> **ConfirmedGone** (effect deleted: close promptly); comp or layer not a live
+  member, or partial context -> **CannotVerify**.
 
-  **Why membership, not call-failure (round-4 finding):** deleting a layer moves it into
-  AE's *undo buffer* as a "zombie" - a cached `AEGP_LayerH` keeps enumerating against it, so
-  an earlier "N consecutive failed enumerations" counter **never fired** and the window
-  lingered. `AEGP_GetLayerFromLayerID` resolves through the comp's *current* layer list, so a
-  deleted layer (or a layer whose source footage was removed, or a closed comp) fails the
-  lookup, and an **undo** that restores the layer (same id) makes it succeed again - and
-  hands back the *current* handle, so the write path re-derives the live effect and no
-  longer writes onto a stale ref (that stale write was the intermittent
-  "internal verification" modal on edit-after-undo). A single `CannotVerify` still never
-  force-closes (transient guard); a persistent run closes at `CG_VERIFY_FAIL_LIMIT` (~0.8 s).
-  While not `Alive`, the hook also **drops any edits the orphaned window queued** (writes
-  happen only in the `Alive` branch, on the fresh ref). A defensive `NO_DATA` type-check
-  remains in `ReadStreamOneD`. **Multi-instance limitation:** two CG effects on one layer ->
-  `ResolveLiveEffect` matches the *first* by installed key (no per-instance id available from
-  the idle hook); acceptable and non-crashing; revisit if per-instance targeting is needed.
+  **Why membership, not call-failure (rounds 4-5):** deleting a layer *or a whole comp* moves
+  it into AE's *undo buffer* as a "zombie" - a cached `AEGP_LayerH`/`AEGP_CompH` keeps
+  resolving against it, so a "failed-enumeration" counter never fires and the window lingers.
+  The fix is to re-resolve from the *live* project/comp tree by id: a deleted comp is not in
+  the project item list, a deleted layer (or one whose source footage was removed) is not in
+  the comp's layer list, and an **undo** restores the id and hands back the *current* handle -
+  so the write path re-derives the live effect and never writes onto a stale ref (that stale
+  write was the intermittent "internal verification" modal on edit-after-undo). A single
+  `CannotVerify` never force-closes (transient guard); a persistent run closes at
+  `CG_VERIFY_FAIL_LIMIT` (~0.8 s). While not `Alive`, the hook also **drops any edits the
+  orphaned window queued** (writes happen only in the `Alive` branch, on the fresh ref). A
+  defensive `NO_DATA` type-check remains in `ReadStreamOneD`.
+
+  **Exactly one window per effect:** the registry is keyed on the sequence-data uid, but a
+  delete+undo can reseed that uid (SEQUENCE_RESETUP), which would let a fresh Open Editor
+  spawn a second window while a stale orphan lingers. So Open Editor first calls
+  `CloseDuplicateWindowsForEffect`: it closes any window whose captured (comp-item id, layer
+  id) matches the effect being opened but under a *different* key, then opens/adopts the
+  current key - a fresh open replaces the orphan rather than fighting it.
+
+  **Multi-instance limitation:** two CG effects on one layer -> `ResolveLiveEffect` matches the
+  *first* by installed key (no per-instance id available from the idle hook); acceptable and
+  non-crashing; revisit if per-instance targeting is needed.
 
 ## AE verification checklist (captain-assisted)
 
