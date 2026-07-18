@@ -312,6 +312,19 @@ until the next scrub/param nudge. (c) Scopes + before/after are Phase 5.
   be dismissed out from under the user. Revisit (e.g. defer teardown, or re-open on the
   matching RESETUP) if that surfaces.
 
+- **Effect deletion is detected by the idle hook, not SEQUENCE_SETDOWN.** Phase 4
+  captain verification (round 1) found that deleting the effect while its editor window
+  is open does **not** reliably reach `SEQUENCE_SETDOWN` in time (the window stayed open),
+  and the idle hook then polled the now-stale `AEGP_EffectRefH`: `AEGP_GetNewStreamValue`
+  on the resulting `AEGP_StreamType_NO_DATA` stream raised AE's modal *"Cannot get
+  AEGP_StreamValue2 for NO_DATA streams" (5027::247)* every tick (a modal no `catch(...)`
+  can swallow). Fix: the idle hook probes `EffectRefAlive` (a `AEGP_GetStreamType` on the
+  CG_THEME stream - safe on a stale ref; only `GetNewStreamValue` raises) at the top of
+  each per-window pass; a `NO_DATA` type means the effect was deleted, so it closes the
+  window + disposes the ref, giving the Phase 3 "delete effect -> window closes" behavior.
+  A defensive `NO_DATA` type-check in `ReadStreamOneD` is the belt-and-suspenders guard so
+  the modal can never fire even if a delete races a poll within one tick.
+
 ## AE verification checklist (captain-assisted)
 
 Runtime cannot be automated from WSL; verify in AE 2025 once the toolkit is approved

@@ -598,6 +598,16 @@ static bool ReadStreamOneD(AEGP_SuiteHandler& sh, AEGP_EffectRefH effectH, PF_Pa
     if (sh.StreamSuite5()->AEGP_GetNewEffectStreamByIndex(g_aegpId, effectH, idx, &streamH) || !streamH) {
         return false;
     }
+    // Guard the NO_DATA case: if the effect was deleted out from under an open window, a
+    // stale effect_ref yields a AEGP_StreamType_NO_DATA stream, and AEGP_GetNewStreamValue
+    // on it raises AE's modal "Cannot get AEGP_StreamValue2 for NO_DATA streams" (5027::247)
+    // - which no catch(...) can swallow. Reject exactly NO_DATA (the death signal); any
+    // other type is left readable so this never regresses a live popup/slider read.
+    AEGP_StreamType stype = AEGP_StreamType_NO_DATA;
+    if (sh.StreamSuite5()->AEGP_GetStreamType(streamH, &stype) || stype == AEGP_StreamType_NO_DATA) {
+        sh.StreamSuite5()->AEGP_DisposeStream(streamH);
+        return false;
+    }
     AEGP_StreamValue2 val;
     std::memset(&val, 0, sizeof(val));
     A_Time t;
@@ -631,6 +641,25 @@ static bool PollSnapshotViaAegp(AEGP_SuiteHandler& sh, AEGP_EffectRefH effectH, 
     s.chromaGain = chroma / 100.0;
     s.lutSource = static_cast<int>(lut + 0.5);
     return true;
+}
+
+// Is this captured effect ref still backed by a live effect instance? When the user
+// deletes the effect while its editor window is open, the ref goes stale: AE still hands
+// back a stream for a param index, but its type collapses to NO_DATA (and sampling it
+// raises the 5027::247 modal). CG_THEME is a real value popup (never legitimately
+// NO_DATA), so a NO_DATA type here is a reliable "effect was deleted" signal. Getting the
+// stream + type is safe on a stale ref (it does not raise) - only AEGP_GetNewStreamValue
+// does. Used by the idle hook to detect deletion and tear the window down.
+static bool EffectRefAlive(AEGP_SuiteHandler& sh, AEGP_EffectRefH effectH) {
+    AEGP_StreamRefH streamH = nullptr;
+    if (sh.StreamSuite5()->AEGP_GetNewEffectStreamByIndex(g_aegpId, effectH, CG_THEME, &streamH) ||
+        !streamH) {
+        return false;
+    }
+    AEGP_StreamType stype = AEGP_StreamType_NO_DATA;
+    A_Err e = sh.StreamSuite5()->AEGP_GetStreamType(streamH, &stype);
+    sh.StreamSuite5()->AEGP_DisposeStream(streamH);
+    return !e && stype != AEGP_StreamType_NO_DATA;
 }
 
 static bool SnapshotChanged(const cg::editor::ParamSnapshot& a, const cg::editor::ParamSnapshot& b) {
@@ -806,6 +835,26 @@ static A_Err CG_IdleHook(AEGP_GlobalRefcon, AEGP_IdleRefcon, A_long* max_sleepPL
                 if (it != g_effectRefs.end()) effectH = it->second;
             }
             if (!effectH) continue;
+
+            // Was the effect deleted while its window is still open? If so, tear the
+            // window down and drop the ref so we stop polling a dead stream (which raises
+            // AE 5027::247 every tick) - this is the Phase 3 "delete effect -> window
+            // closes" behavior. Probing before any stream read/write/render also guards
+            // the edit-write and preview paths against the same stale ref.
+            {
+                bool alive = false;
+                try {
+                    AEGP_SuiteHandler sh(g_spbasic);
+                    alive = EffectRefAlive(sh, effectH);
+                } catch (...) { alive = false; }
+                if (!alive) {
+                    host.close(key);
+                    DisposeEffectRefForKey(key);
+                    g_lastPolled.erase(key);
+                    g_previewDrivers.erase(key);
+                    continue;
+                }
+            }
 
             // window -> effect: apply any queued edits (writes param streams).
             if (host.hasPendingEdits(key)) {
