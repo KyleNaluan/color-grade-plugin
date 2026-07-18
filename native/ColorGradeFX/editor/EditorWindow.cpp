@@ -65,6 +65,7 @@ struct WindowImpl {
     std::atomic<bool>    running{false};    // false asks the UI loop to exit
     std::atomic<bool>    finished{false};   // true once the thread fully tore down
     std::atomic<bool>    closeRequested{false};  // user clicked the window's close box
+    std::atomic<bool>    stopRequested{false};   // teardown requested; survives startup
 
     // Bridge: effect -> window (snapshot) guarded; window -> effect (queue) is
     // itself thread-safe. seededTheme etc. let the UI init from the effect's state.
@@ -333,16 +334,20 @@ void RunWindowThread(WindowImpl* w, ParamSnapshot seed) {
     ParamSnapshot ui = seed;
     { std::lock_guard<std::mutex> lk(w->snapMutex); w->snapshot = seed; }
 
-    w->running.store(true);
+    // Enter the UI loop only if a teardown wasn't already requested during startup.
+    // A close()/shutdownAll() that raced ahead of us set stopRequested; honor it so
+    // we fall straight through to teardown instead of spinning a loop no WM_CLOSE
+    // can reach (the HWND may not have been published when close ran).
+    if (!w->stopRequested.load()) w->running.store(true);
     const float clear[4] = {0.10f, 0.10f, 0.11f, 1.0f};
-    while (w->running.load()) {
+    while (w->running.load() && !w->stopRequested.load()) {
         MSG msg;
         while (::PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
             ::TranslateMessage(&msg);
             ::DispatchMessageW(&msg);
             if (msg.message == WM_QUIT) w->running.store(false);
         }
-        if (!w->running.load()) break;
+        if (!w->running.load() || w->stopRequested.load()) break;
 
         // Adopt a newer snapshot from the effect for any control the user is NOT
         // currently editing (ImGui's active-id guards against clobbering a drag).
@@ -396,9 +401,13 @@ void ReapFinishedLocked() {
 }
 
 void DestroyWindowImplLocked(WindowImpl* w) {
+    // stopRequested first: if the UI thread is still starting up (HWND not yet
+    // published), it will see this flag at the loop gate and skip the loop entirely
+    // instead of clobbering running back to true and spinning forever.
+    w->stopRequested.store(true);
     w->running.store(false);
     HWND hwnd = w->hwnd.load();
-    if (hwnd) ::PostMessageW(hwnd, WM_CLOSE, 0, 0);  // nudge the loop out
+    if (hwnd) ::PostMessageW(hwnd, WM_CLOSE, 0, 0);  // nudge a running loop out
     if (w->thread.joinable()) w->thread.join();
     delete w;
 }
