@@ -68,6 +68,7 @@ static PF_Err GPUDeviceSetup(PF_InData* in_data, PF_OutData* out_data, PF_GPUDev
 
         extra->output->gpu_data = gpu_dataH;
         out_data->out_flags2 = PF_OutFlag2_SUPPORTS_GPU_RENDER_F32;
+        CG_DBG("GPUDeviceSetup: DirectX device set up, ColorGradeKernel loaded (GPU offered)");
     }
     // Other frameworks (CUDA/OpenCL) are unsupported here -> AE uses the CPU path.
     return err;
@@ -143,6 +144,7 @@ static PF_Err SmartRenderGPU(PF_InData* in_data, PF_OutData* out_data, PF_PixelF
     params.mStrength = d->strength;
 
     if (!err && extra->input->what_gpu == PF_GPU_Framework_DIRECTX) {
+        CG_DBG("SmartRenderGPU: DirectX GPU render path active");
         PF_Handle gpu_dataH = (PF_Handle)extra->input->gpu_data;
         DirectXGPUData* dx = reinterpret_cast<DirectXGPUData*>(*gpu_dataH);
 

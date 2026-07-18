@@ -129,6 +129,49 @@ Additional pins beyond the checklist:
 
 ---
 
+## Verifying the GPU path (DirectX active vs CPU fallback)
+
+AE silently uses the CPU path when it will not / cannot run the effect's GPU path, so a
+correct-looking image does **not** prove DirectX ran. Two ways to tell them apart:
+
+### A. Cheapest - no debugger: `OutputDebugString` trace (Debug builds)
+
+`ColorGrade.cpp` / `ColorGradeGPU.inc` print one line per render on each path (compiled
+only in Debug, via the `CG_DBG` macro; no-op in Release). Watch them live with
+**Sysinternals DebugView** (run as admin, Capture -> Capture Win32) or in the Visual
+Studio **Output** window while attached. Filter on `[ColorGradeFX]`. You will see:
+
+| Message | Meaning |
+|---|---|
+| `[ColorGradeFX] GPUDeviceSetup: DirectX device set up, ColorGradeKernel loaded (GPU offered)` | AE offered the **DirectX** framework and the shader loaded (fires once at setup). If this never prints, AE is not offering DirectX on this box at all. |
+| `[ColorGradeFX] SmartRenderGPU: DirectX GPU render path active` | **DirectX is actually rendering** frames. This is the confirmation. |
+| `[ColorGradeFX] SmartRenderCPU: CPU render path active` | The **CPU fallback** is rendering (no GPU path used for that frame). |
+
+Trigger a render by scrubbing the playhead or changing Strength. Seeing `SmartRenderGPU`
+= DirectX confirmed; seeing only `SmartRenderCPU` = fallback.
+
+### B. Breakpoints (VS *Attach to Process* -> `AfterFX.exe`)
+
+Set breakpoints on these exact symbols (both in this project's source):
+
+| Path | Symbol | File |
+|---|---|---|
+| **DirectX GPU render** | `SmartRenderGPU` | `native/ColorGradeFX/ColorGradeGPU.inc` |
+| **CPU render** | `SmartRenderCPU` | `native/ColorGradeFX/ColorGrade.cpp` |
+| GPU device offered (once) | `GPUDeviceSetup` | `native/ColorGradeFX/ColorGradeGPU.inc` |
+
+`EffectMain`'s `PF_Cmd_SMART_RENDER_GPU` case dispatches to `SmartRenderGPU`; the
+`PF_Cmd_SMART_RENDER` case dispatches to `SmartRenderCPU`. Whichever breakpoint hits on
+a scrub is the path AE chose. (Requires a Debug build so the symbols resolve; the `.pdb`
+sits next to the `.aex`'s intermediate in the NTFS mirror - point VS at the mirror source
+or load the `.pdb` when prompted.)
+
+Prerequisites for the GPU path to even be eligible: a Debug **or** Release `--gpu` build,
+`DirectX_Assets/` present next to the `.aex`, Project Settings -> Video Rendering and
+Effects -> Mercury GPU Acceleration set to a GPU option, and (dual-GPU caveat) AE may
+prefer CUDA on this NVIDIA box - if `GPUDeviceSetup` never logs DirectX, adapter/framework
+selection is the suspect, and CUDA (currently unwired) may be needed for GPU on this box.
+
 ## Runtime verification (captain-assisted - cannot be automated here)
 
 A build cannot prove the effect works in AE; that needs a human at the GUI. When a build

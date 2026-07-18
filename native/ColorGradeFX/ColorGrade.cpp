@@ -17,6 +17,15 @@
 #include <string>
 #include <new>
 
+// Debug-only path tracer: prints to the debugger / DebugView so the active render
+// path (CPU vs DirectX GPU) can be confirmed WITHOUT attaching a debugger/breakpoint.
+// See native/BUILDING.md "Verifying the GPU path". No-op in Release.
+#if defined(_DEBUG) && defined(AE_OS_WIN)
+#define CG_DBG(msg) ::OutputDebugStringA("[ColorGradeFX] " msg "\n")
+#else
+#define CG_DBG(msg) ((void)0)
+#endif
+
 /* =========================== LUT resolution =============================== */
 
 #ifdef AE_OS_WIN
@@ -229,6 +238,7 @@ static PF_Err PreRender(PF_InData* in_data, PF_OutData* out_data, PF_PreRenderEx
 static PF_Err SmartRenderCPU(PF_InData* in_data, PF_OutData* out_data, PF_PixelFormat fmt,
                              PF_EffectWorld* input, PF_EffectWorld* output, CG_RenderData* d) {
     PF_Err err = PF_Err_NONE;
+    CG_DBG("SmartRenderCPU: CPU render path active");
     switch (fmt) {
         case PF_PixelFormat_ARGB128: {
             AEFX_SuiteScoper<PF_iterateFloatSuite2> s(in_data, kPFIterateFloatSuite, kPFIterateFloatSuiteVersion2, out_data);
