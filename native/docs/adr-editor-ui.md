@@ -253,6 +253,18 @@ every command for one instance.
   non-physical. Full-Strength (the default for a look) is correct; Auto mode is
   unaffected. Acceptable for the raw-LUT advanced modes; revisit if it matters.
 
+## Known limitations
+
+- **SEQUENCE_SETDOWN closes the editor window.** On `PF_Cmd_SEQUENCE_SETDOWN` the
+  effect closes the open editor window and disposes its `AEGP_EffectRefH`. AE issues
+  `SEQUENCE_SETDOWN` not only on true instance removal (delete effect, close comp) but
+  also around sequence-data **flatten/reload** cycles. For the current flows this is
+  captain-verified fine - ordinary flatten / RAM-preview cycles do **not** dismiss the
+  window. But it is a latent edge: if a future change makes setdown fire during an
+  ordinary flatten/RAM-preview cycle for a still-live instance, the open editor would
+  be dismissed out from under the user. Revisit (e.g. defer teardown, or re-open on the
+  matching RESETUP) if that surfaces.
+
 ## AE verification checklist (captain-assisted)
 
 Runtime cannot be automated from WSL; verify in AE 2025 once the toolkit is approved

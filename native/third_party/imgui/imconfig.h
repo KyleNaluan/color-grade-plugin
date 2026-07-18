@@ -136,3 +136,12 @@ namespace ImGui
     void MyFunction(const char* name, MyMatrix44* mtx);
 }
 */
+
+//---- Make the current-context pointer thread-local so each editor window's UI
+// thread has its own current ImGuiContext. Without this, GImGui is a single
+// global and two simultaneously-open editor windows (one per effect instance,
+// each on its own thread) would race it. MyImGuiTLS is defined in one TU
+// (native/ColorGradeFX/editor/EditorWindow.cpp).
+struct ImGuiContext;
+extern thread_local ImGuiContext* MyImGuiTLS;
+#define GImGui MyImGuiTLS

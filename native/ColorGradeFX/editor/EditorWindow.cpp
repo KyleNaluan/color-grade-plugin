@@ -35,6 +35,11 @@
 // Forward-decl of the backend's Win32 message handler (defined in imgui_impl_win32.cpp).
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
+// Storage for imconfig.h's thread-local GImGui override (#define GImGui MyImGuiTLS).
+// Each editor UI thread gets its own current-context pointer so two open windows
+// never race a shared global context.
+thread_local ImGuiContext* MyImGuiTLS = nullptr;
+
 namespace cg {
 namespace editor {
 
@@ -67,7 +72,8 @@ struct WindowImpl {
     ParamSnapshot  snapshot;   // latest published effect params
     EditQueue      edits;      // pending user edits for the effect to drain
 
-    HWND                    hwnd = nullptr;
+    std::atomic<HWND>       hwnd{nullptr};   // written by UI thread, read from main thread
+    ImGuiContext*           imguiCtx = nullptr;  // per-window ImGui context (UI thread only)
     ID3D11Device*           device = nullptr;
     ID3D11DeviceContext*    context = nullptr;
     IDXGISwapChain*         swapChain = nullptr;
@@ -110,7 +116,7 @@ bool CreateDeviceD3D(WindowImpl* w) {
     sd.BufferDesc.RefreshRate.Denominator = 1;
     sd.Flags = DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH;
     sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-    sd.OutputWindow = w->hwnd;
+    sd.OutputWindow = w->hwnd.load();
     sd.SampleDesc.Count = 1;
     sd.SampleDesc.Quality = 0;
     sd.Windowed = TRUE;
@@ -292,29 +298,35 @@ void RunWindowThread(WindowImpl* w, ParamSnapshot seed) {
     ImGui_ImplWin32_EnableDpiAwareness();
     EnsureWindowClass();
 
-    w->hwnd = ::CreateWindowExW(0, kWindowClass, L"Color Grade - Editor",
-                                WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, 900, 560,
-                                nullptr, nullptr, PluginInstance(), nullptr);
-    if (!w->hwnd) { w->finished.store(true); return; }
-    ::SetWindowLongPtrW(w->hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(w));
+    HWND hwnd = ::CreateWindowExW(0, kWindowClass, L"Color Grade - Editor",
+                                  WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, 900, 560,
+                                  nullptr, nullptr, PluginInstance(), nullptr);
+    if (!hwnd) { w->finished.store(true); return; }
+    // Publish the HWND for the main thread only once it is fully valid.
+    w->hwnd.store(hwnd);
+    ::SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(w));
 
     if (!CreateDeviceD3D(w)) {
-        ::DestroyWindow(w->hwnd);
-        w->hwnd = nullptr;
+        w->hwnd.store(nullptr);
+        ::DestroyWindow(hwnd);
         w->finished.store(true);
         return;
     }
 
-    ::ShowWindow(w->hwnd, SW_SHOWDEFAULT);
-    ::UpdateWindow(w->hwnd);
+    ::ShowWindow(hwnd, SW_SHOWDEFAULT);
+    ::UpdateWindow(hwnd);
 
+    // Per-window ImGui context, made current on THIS thread. With the thread-local
+    // GImGui override (imconfig.h) each window's thread has its own current context,
+    // so multiple open editors never race one shared global context.
     IMGUI_CHECKVERSION();
-    ImGui::CreateContext();
+    w->imguiCtx = ImGui::CreateContext();
+    ImGui::SetCurrentContext(w->imguiCtx);
     ImGuiIO& io = ImGui::GetIO();
     io.IniFilename = nullptr;  // don't litter the user's disk with imgui.ini
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     ImGui::StyleColorsDark();
-    ImGui_ImplWin32_Init(w->hwnd);
+    ImGui_ImplWin32_Init(hwnd);
     ImGui_ImplDX11_Init(w->device, w->context);
 
     // The UI's working copy of the params; starts from the seed the effect passed.
@@ -351,9 +363,12 @@ void RunWindowThread(WindowImpl* w, ParamSnapshot seed) {
 
     ImGui_ImplDX11_Shutdown();
     ImGui_ImplWin32_Shutdown();
-    ImGui::DestroyContext();
+    ImGui::DestroyContext(w->imguiCtx);
+    w->imguiCtx = nullptr;
+    ImGui::SetCurrentContext(nullptr);
     CleanupDeviceD3D(w);
-    if (w->hwnd) { ::DestroyWindow(w->hwnd); w->hwnd = nullptr; }
+    HWND hwnd = w->hwnd.exchange(nullptr);
+    if (hwnd) ::DestroyWindow(hwnd);
     w->finished.store(true);
 }
 
@@ -382,7 +397,8 @@ void ReapFinishedLocked() {
 
 void DestroyWindowImplLocked(WindowImpl* w) {
     w->running.store(false);
-    if (w->hwnd) ::PostMessageW(w->hwnd, WM_CLOSE, 0, 0);  // nudge the loop out
+    HWND hwnd = w->hwnd.load();
+    if (hwnd) ::PostMessageW(hwnd, WM_CLOSE, 0, 0);  // nudge the loop out
     if (w->thread.joinable()) w->thread.join();
     delete w;
 }
@@ -404,9 +420,10 @@ void EditorHost::open(InstanceKey key, const ParamSnapshot& seed) {
     auto it = g_windows.find(key);
     if (it != g_windows.end()) {
         // Already open: bring it to the foreground (single instance per effect).
-        if (it->second->hwnd) {
-            ::ShowWindow(it->second->hwnd, SW_RESTORE);
-            ::SetForegroundWindow(it->second->hwnd);
+        HWND hwnd = it->second->hwnd.load();
+        if (hwnd) {
+            ::ShowWindow(hwnd, SW_RESTORE);
+            ::SetForegroundWindow(hwnd);
         }
         return;
     }
