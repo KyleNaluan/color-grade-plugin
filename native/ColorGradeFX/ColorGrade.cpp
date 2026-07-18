@@ -771,6 +771,7 @@ static PF_Err SequenceResetup(PF_InData* in_data, PF_OutData* out_data, PF_Param
         PackUid(sd, GenUid());
         PF_UNLOCK_HANDLE(in_data->sequence_data);
     }
+    out_data->sequence_data = in_data->sequence_data;
     return PF_Err_NONE;
 }
 
