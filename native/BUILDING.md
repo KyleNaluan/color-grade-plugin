@@ -5,8 +5,8 @@ the environment variables, and the folded-in Phase 0 checklist with its correcti
 It supersedes firstmate's `native-phase0-*.md` notes as the source of truth for the build.
 
 The Phase 1 deliverable is `ColorGradeFX.aex`: a SmartFX effect that applies a baked 3D
-LUT to a layer through the ported trilinear `sampleLut`, with a CPU path and a DirectX
-GPU path. See `../CLAUDE.md`/`AGENTS.md` for how the native tree fits the wider project.
+LUT to a layer through the ported trilinear `sampleLut`, with a CPU path and a GPU path
+(DirectX + CUDA). See `../CLAUDE.md`/`AGENTS.md` for how the native tree fits the wider project.
 
 ---
 
@@ -142,7 +142,7 @@ Additional pins beyond the checklist:
 
 ---
 
-## Verifying the GPU path (DirectX active vs CPU fallback)
+## Verifying the GPU path (CUDA/DirectX active vs CPU fallback)
 
 AE silently uses the CPU path when it will not / cannot run the effect's GPU path, so a
 correct-looking image does **not** prove DirectX ran. Two ways to tell them apart:
@@ -208,6 +208,7 @@ is ready, verify in AE 2025:
    `CG_LUT_PATH` to a `.cube` **or** drop a `ColorGrade_LUT.cube` next to the `.aex` in
    MediaCore; the layer takes on that LUT. A bad/missing path falls back to the embedded LUT.
 4. **GPU path active:** Project Settings -> Video Rendering and Effects -> Mercury GPU
-   Acceleration on; confirm the DirectX path renders (same result as CPU). If it falls back
-   to CPU on this NVIDIA box, adapter/framework selection is the suspect (this box has both
-   an RTX 3090 and an AMD adapter, and AE may prefer CUDA - the flagged Phase 0 unknown).
+   Acceleration on; confirm the GPU path renders (same result as CPU). On this NVIDIA box
+   (RTX 3090 + AMD) AE offers only CUDA, so expect the CUDA tracer lines; DirectX would
+   engage only on a host that offers it. If it falls back to CPU, adapter/framework
+   selection is the suspect - check the `GPUDeviceSetup` trace for which framework AE offered.
