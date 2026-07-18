@@ -13,7 +13,12 @@ SDK plugin.
   (`buildTransform` -> `bakeLut` natively), and a **cross-engine golden harness** proving the
   C++ core matches the TS oracle to ~1e-4 (achieved: grade/decode/recipe bit-exact, stats 2e-13).
 
-Later phases add the editor window, live preview, and in-effect analysis
+- **Phase 3** (in progress): the **editor window** - a native ImGui/Win32/D3D11 window
+  opened from an **Open Editor…** button, with Correct/Grade controls wired to the effect's
+  params through a pure effect<->window bridge. The **toolkit decision** (native ImGui vs an
+  embedded webview reusing Preact) and its rationale live in `docs/adr-editor-ui.md`.
+
+Later phases add the live preview and in-effect analysis
 (see `firstmate:native-scope-m2/report.md`).
 
 ## Layout
@@ -38,15 +43,23 @@ native/
       Recipe.h                        POD arb-data recipe + <-> Theme/stats + bakeFromRecipe
     lut/CubeLut.h                   ported parseCube + sampleLut (mirrors src/core/lut/cube.ts)
     embedded/EmbeddedLut.h          GENERATED default LUT (teal-orange grade, 17^3)
+    editor/                         Phase 3 editor window (see docs/adr-editor-ui.md)
+      EditorBridge.h                  pure effect<->window seam (edit queue + mapping); headless-tested
+      EditorWindow.h / .cpp           Win32/D3D11/ImGui host (no-op stubs off Windows)
     Win/ColorGradeFX.vcxproj/.sln   MSBuild project (CPU default; /p:CG_GPU=true builds DirectX + CUDA)
+  third_party/imgui/                vendored Dear ImGui v1.91.5 (MIT) + Win32/D3D11 backends
+  docs/adr-editor-ui.md             Phase 3 toolkit decision (ImGui vs webview) + bridge design
   tests/parity/
     parity_test.cpp                 Phase 1: sampleLut vs TS oracle
     core_parity.cpp                 Phase 2: computeStats / bakeGradeLut / bakeDecodeLut / recipe replay
+  tests/editor/
+    bridge_test.cpp                 Phase 3: editor<->effect bridge logic (headless, self-asserting)
   scripts/
     build.sh                        WSL -> NTFS mirror -> MSBuild interop build
     gen-embedded-lut.ts             bake the embedded LUT header from the TS engine
     parity-test.ts                  Phase 1 parity gate (local, not in CI)
     core-parity-test.ts             Phase 2 cross-engine golden harness (local, not in CI)
+    editor-bridge-test.ts           Phase 3 bridge-logic test (local, not in CI)
 ```
 
 ## Commands

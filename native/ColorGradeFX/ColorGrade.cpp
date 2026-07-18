@@ -31,6 +31,7 @@
 
 #include "ColorGrade.h"
 
+#include <atomic>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -282,6 +283,83 @@ static void ResolveRenderData(PF_InData* in_data, A_long source, A_long themePop
     }
 }
 
+/* ===================== Editor window <-> effect bridge =================== */
+//
+// Phase 3 editor spike. The "Open Editor" button opens a native ImGui/D3D11 window
+// (editor/EditorWindow.*); the window and this effect instance talk through the
+// pure EditorBridge.h seam. Direction of flow:
+//   - effect -> window: PublishEditorSnapshot() copies the current param values so
+//     the window's controls mirror Effect Controls (called from PreRender; a locked
+//     value copy, so it is safe from any render thread).
+//   - window -> effect: the window pushes ParamEdits; ApplyEditorEdits() drains them
+//     and writes them back onto the effect's params (with CHANGED_VALUE so AE
+//     re-renders and Effect Controls updates). See adr-editor-ui.md for the
+//     production driver (a companion-AEGP idle hook applying edits continuously via
+//     the AEGP StreamSuite inside one undo group) - this spike drains on the next
+//     param-change command and leaves the continuous driver + AEGP DOM writes to the
+//     post-decision full build (captain-verified in AE).
+//
+// The per-instance key is derived from in_data->effect_ref (stable for an applied
+// effect's lifetime within a session). Production hardening: store a generated uid
+// in sequence data so the key survives an effect_ref reuse across delete/re-add.
+
+static cg::editor::InstanceKey EffectKey(PF_InData* in_data) {
+    return static_cast<cg::editor::InstanceKey>(reinterpret_cast<uintptr_t>(in_data->effect_ref));
+}
+
+// Monotonic snapshot revision so the window can tell a genuinely newer publish from
+// a stale one and never stomp the control the user is mid-drag on.
+static std::atomic<uint64_t> g_snapshotRevision{1};
+
+static cg::editor::ParamSnapshot MakeSnapshot(A_long theme, double strength01, double skin01,
+                                              double chromaFrac, A_long source) {
+    cg::editor::ParamSnapshot s;
+    s.theme = static_cast<int>(theme);
+    s.strength = strength01;
+    s.skinProtection = skin01;
+    s.chromaGain = chromaFrac;
+    s.lutSource = static_cast<int>(source);
+    s.revision = g_snapshotRevision.fetch_add(1);
+    return s;
+}
+
+// Push the effect's current params to the editor window (if open).
+static void PublishEditorSnapshot(PF_InData* in_data, A_long theme, double strength01,
+                                  double skin01, double chromaFrac, A_long source) {
+    cg::editor::EditorHost::instance().publishSnapshot(
+        EffectKey(in_data), MakeSnapshot(theme, strength01, skin01, chromaFrac, source));
+}
+
+// Drain any edits the window produced and write them onto params[] (CHANGED_VALUE so
+// AE re-renders). Valid only where params[] is writable (USER_CHANGED_PARAM context).
+static void ApplyEditorEdits(PF_InData* in_data, PF_ParamDef* params[]) {
+    auto edits = cg::editor::EditorHost::instance().drainEdits(EffectKey(in_data));
+    for (const auto& e : edits) {
+        switch (e.field) {
+            case cg::editor::EditField::Theme:
+                params[CG_THEME]->u.pd.value = static_cast<A_long>(e.value + 0.5);
+                params[CG_THEME]->uu.change_flags |= PF_ChangeFlag_CHANGED_VALUE;
+                break;
+            case cg::editor::EditField::Strength:
+                params[CG_STRENGTH]->u.fs_d.value = cg::editor::clamp01(e.value) * 100.0;
+                params[CG_STRENGTH]->uu.change_flags |= PF_ChangeFlag_CHANGED_VALUE;
+                break;
+            case cg::editor::EditField::SkinProtection:
+                params[CG_SKIN_PROTECTION]->u.fs_d.value = cg::editor::clamp01(e.value) * 100.0;
+                params[CG_SKIN_PROTECTION]->uu.change_flags |= PF_ChangeFlag_CHANGED_VALUE;
+                break;
+            case cg::editor::EditField::ChromaGain:
+                params[CG_CHROMA_GAIN]->u.fs_d.value = cg::editor::clampChromaFraction(e.value) * 100.0;
+                params[CG_CHROMA_GAIN]->uu.change_flags |= PF_ChangeFlag_CHANGED_VALUE;
+                break;
+            case cg::editor::EditField::LutSource:
+                params[CG_LUT_SOURCE]->u.pd.value = static_cast<A_long>(e.value + 0.5);
+                params[CG_LUT_SOURCE]->uu.change_flags |= PF_ChangeFlag_CHANGED_VALUE;
+                break;
+        }
+    }
+}
+
 /* =============================== Setup =================================== */
 
 static PF_Err About(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef*[], PF_LayerDef*) {
@@ -309,6 +387,19 @@ static PF_Err GlobalSetup(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef*
 #endif
     }
 #endif
+    return PF_Err_NONE;
+}
+
+// AE process teardown: close every editor window so no orphan window survives a
+// project close / AE quit (Phase 3 lifecycle requirement).
+static PF_Err GlobalSetdown(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef*[], PF_LayerDef*) {
+    cg::editor::EditorHost::instance().shutdownAll();
+    return PF_Err_NONE;
+}
+
+// Effect instance removed (deleted from the layer, comp closed): close its window.
+static PF_Err SequenceSetdown(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef*[], PF_LayerDef*) {
+    cg::editor::EditorHost::instance().close(EffectKey(in_data));
     return PF_Err_NONE;
 }
 
@@ -358,6 +449,16 @@ static PF_Err ParamsSetup(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef*
                  CG_LUT_SOURCE_CHOICES,
                  CG_LUT_SOURCE);
 
+    // Momentary button opening the native editor window (Phase 3). SUPERVISE so AE
+    // sends PF_Cmd_USER_CHANGED_PARAM on click (buttons require it); the handler
+    // opens/focuses the single per-instance window.
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_BUTTON("Editor",
+                  "Open Editor\xE2\x80\xA6",  // "Open Editor…" (UTF-8 ellipsis)
+                  0,
+                  PF_ParamFlag_SUPERVISE,
+                  CG_OPEN_EDITOR);
+
     // Grade recipe: measured stats + full typed knob space, persisted as arb-data.
     // No custom UI (data only, seeded from the theme); AE stores it in the project.
     AEFX_CLR_STRUCT(def);
@@ -393,7 +494,22 @@ static PF_Err UserChangedParam(PF_InData* in_data, PF_OutData* out_data,
         params[CG_STRENGTH]->uu.change_flags |= PF_ChangeFlag_CHANGED_VALUE;
         params[CG_SKIN_PROTECTION]->u.fs_d.value = theme.knobs.skinProtectionDefault * 100.0;
         params[CG_SKIN_PROTECTION]->uu.change_flags |= PF_ChangeFlag_CHANGED_VALUE;
+    } else if (extra->param_index == CG_OPEN_EDITOR) {
+        // Open (or focus) the editor window, seeded with the current params so its
+        // controls start in sync with Effect Controls.
+        cg::editor::ParamSnapshot seed = MakeSnapshot(
+            params[CG_THEME]->u.pd.value,
+            params[CG_STRENGTH]->u.fs_d.value / 100.0,
+            params[CG_SKIN_PROTECTION]->u.fs_d.value / 100.0,
+            params[CG_CHROMA_GAIN]->u.fs_d.value / 100.0,
+            params[CG_LUT_SOURCE]->u.pd.value);
+        cg::editor::EditorHost::instance().open(EffectKey(in_data), seed);
     }
+
+    // Flush any edits the editor window produced back onto the params (spike driver:
+    // any param-change command drains the queue; the production continuous driver is
+    // the companion-AEGP idle hook - see adr-editor-ui.md).
+    ApplyEditorEdits(in_data, params);
     return PF_Err_NONE;
 }
 
@@ -520,6 +636,11 @@ static PF_Err PreRender(PF_InData* in_data, PF_OutData* out_data, PF_PreRenderEx
 
     ResolveRenderData(in_data, source, theme, strength01, skin01, chromaGain, recipe, *d);
 
+    // Mirror the current params into the editor window (if one is open for this
+    // instance), so its controls track Effect Controls. Safe from any render thread:
+    // it is a locked value copy. Also reaps a window the user has since closed.
+    PublishEditorSnapshot(in_data, theme, strength01, skin01, chromaGain, source);
+
     extra->output->pre_render_data = d;
     extra->output->delete_pre_render_data_func = DisposePreRenderData;
 
@@ -619,6 +740,12 @@ PF_Err EffectMain(PF_Cmd cmd, PF_InData* in_data, PF_OutData* out_data,
                 break;
             case PF_Cmd_GLOBAL_SETUP:
                 err = GlobalSetup(in_data, out_data, params, output);
+                break;
+            case PF_Cmd_GLOBAL_SETDOWN:
+                err = GlobalSetdown(in_data, out_data, params, output);
+                break;
+            case PF_Cmd_SEQUENCE_SETDOWN:
+                err = SequenceSetdown(in_data, out_data, params, output);
                 break;
             case PF_Cmd_PARAMS_SETUP:
                 err = ParamsSetup(in_data, out_data, params, output);

@@ -15,6 +15,8 @@ LUT to a layer through the ported trilinear `sampleLut`, with a CPU path and a G
 ```bash
 npm run native:gen-lut      # (re)generate the embedded default LUT header (committed)
 npm run native:parity       # C++ sampleLut vs TS oracle, ~1e-4 (needs g++/clang; not in CI)
+npm run native:core-parity  # full C++ core vs TS oracle end-to-end (needs g++/clang; not in CI)
+npm run native:editor-test  # headless editor<->effect bridge logic (needs g++/clang; not in CI)
 
 native/scripts/build.sh Debug            # CPU-only  .aex -> MediaCore
 native/scripts/build.sh Debug --gpu      # CPU + GPU (DirectX + CUDA) .aex + DirectX_Assets
@@ -122,6 +124,30 @@ file ...aex"**.
 - **Charset is MultiByte**, not Unicode: the SDK's `DirectXUtils.cpp` casts a
   `GetModuleHandleEx` string arg to `LPCSTR`; Unicode would break it. Our own code uses
   explicit `...W` Win32 APIs, so it is charset-agnostic.
+
+### Editor window (Phase 3)
+
+The editor is a Dear ImGui + Win32/D3D11 window opened from the **Open Editor…**
+button param. Toolkit rationale + the effect<->window bridge design live in
+`native/docs/adr-editor-ui.md` (the toolkit choice is a captain decision).
+
+- **Vendored** `native/third_party/imgui/` (v1.91.5, MIT; `VERSION.txt`) is compiled
+  straight into the `.aex` - zero external runtime dependency. `imgui_impl_dx11`/
+  `imgui_impl_win32` `#pragma comment(lib,...)` auto-link d3dcompiler/gdi32/dwmapi;
+  XInput loads dynamically. The vcxproj also links `d3d11.lib;dxgi.lib` and adds
+  `third_party/imgui[/backends]` to the include path (both configs).
+- **Editor sources** `native/ColorGradeFX/editor/`: `EditorBridge.h` (pure,
+  AE/Win32-free seam - the thread-safe edit queue + value mapping, headless-tested by
+  `npm run native:editor-test`), `EditorWindow.{h,cpp}` (Win32/D3D11/ImGui host,
+  single-instance-per-effect, own UI thread). The `.cpp` compiles to no-op stubs off
+  Windows so the interface still links for the eventual Mac backend.
+- **Effect wiring** (`ColorGrade.cpp`): `CG_OPEN_EDITOR` button (SUPERVISE) opens the
+  window in `UserChangedParam`; `PreRender` publishes a param snapshot to it;
+  `GLOBAL_SETDOWN`/`SEQUENCE_SETDOWN` tear windows down (no orphans). The window's
+  write-back to params is captain-verified in AE (the continuous driver is a companion
+  AEGP idle hook - see the ADR).
+- **Four-config rule now covers the editor too**: build Debug/Release x CPU/`--gpu`
+  after any editor/effect change (the editor sources compile in all four).
 
 ---
 
