@@ -200,9 +200,15 @@ After the captain approved ImGui, the full control set landed on it:
 Two directions over the pure `EditorBridge.h` seam:
 
 - **effect -> window** (`publishSnapshot`): a `ParamSnapshot` of the current param
-  values, published from `PreRender`. A locked value copy, so it is safe from any
-  render thread; a monotonic `revision` lets the window ignore a stale re-publish and
-  not stomp a control the user is mid-drag on.
+  values. Published two ways: opportunistically from `PreRender` (a locked value copy,
+  safe from any render thread), and - the reliable path - from the **idle hook**, which
+  reads the effect's current param streams via AEGP (`AEGP_GetNewStreamValue`) and
+  publishes on change so an Effect-Controls scrub/type tracks in the window sub-second.
+  The idle-hook poll is what makes EC->window work: `PreRender`'s publish can't be
+  relied on because `in_data->sequence_data` (and thus the window key) is unreliable on
+  render threads. A monotonic `revision` + the window's mid-drag guard
+  (`IsAnyItemActive`) keep a stale publish or a poll from stomping a control the user is
+  actively dragging.
 - **window -> effect** (`drainEdits`): the window pushes `ParamEdit`s on its UI
   thread; they are drained on AE's main thread and written back onto the effect's
   params (with `PF_ChangeFlag_CHANGED_VALUE`, so AE re-renders and Effect Controls

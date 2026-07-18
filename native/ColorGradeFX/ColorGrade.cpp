@@ -34,6 +34,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <fstream>
 #include <map>
 #include <mutex>
@@ -86,6 +87,11 @@ static bool             g_idleHookRegistered = false;
 // the idle hook to reach the effect's param streams. Disposed on close/setdown.
 static std::mutex                                         g_effMutex;
 static std::map<cg::editor::InstanceKey, AEGP_EffectRefH> g_effectRefs;
+
+// Last param values the idle hook published to each window (touched only from the
+// idle hook, which runs serially on the main thread - so no mutex). Lets the EC->window
+// poll publish only when something actually changed, avoiding revision churn.
+static std::map<cg::editor::InstanceKey, cg::editor::ParamSnapshot> g_lastPolled;
 
 // Flat POD sequence data: just a stable per-instance uid for the window registry.
 #define CG_SEQ_MAGIC   0x43475351u  // 'CGSQ'
@@ -549,9 +555,59 @@ static void DisposeEffectRefForKey(cg::editor::InstanceKey key) {
     }
 }
 
+// Read one param stream's scalar (one_d) value at t=0 (our value params don't
+// time-vary). Returns false on any AEGP failure so the poll degrades gracefully.
+static bool ReadStreamOneD(AEGP_SuiteHandler& sh, AEGP_EffectRefH effectH, PF_ParamIndex idx, double& out) {
+    AEGP_StreamRefH streamH = nullptr;
+    if (sh.StreamSuite5()->AEGP_GetNewEffectStreamByIndex(g_aegpId, effectH, idx, &streamH) || !streamH) {
+        return false;
+    }
+    AEGP_StreamValue2 val;
+    std::memset(&val, 0, sizeof(val));
+    A_Time t;
+    t.value = 0;
+    t.scale = 1;
+    A_Err e = sh.StreamSuite5()->AEGP_GetNewStreamValue(g_aegpId, streamH, AEGP_LTimeMode_LayerTime, &t,
+                                                        FALSE, &val);
+    bool ok = false;
+    if (!e) {
+        out = val.val.one_d;
+        ok = true;
+        sh.StreamSuite5()->AEGP_DisposeStreamValue(&val);
+    }
+    sh.StreamSuite5()->AEGP_DisposeStream(streamH);
+    return ok;
+}
+
+// Read the effect's current value params into a snapshot (the EC->window direction).
+static bool PollSnapshotViaAegp(AEGP_SuiteHandler& sh, AEGP_EffectRefH effectH, cg::editor::ParamSnapshot& s) {
+    double footage, theme, strength, skin, chroma, lut;
+    if (!ReadStreamOneD(sh, effectH, CG_FOOTAGE_PROFILE, footage)) return false;
+    if (!ReadStreamOneD(sh, effectH, CG_THEME, theme)) return false;
+    if (!ReadStreamOneD(sh, effectH, CG_STRENGTH, strength)) return false;
+    if (!ReadStreamOneD(sh, effectH, CG_SKIN_PROTECTION, skin)) return false;
+    if (!ReadStreamOneD(sh, effectH, CG_CHROMA_GAIN, chroma)) return false;
+    if (!ReadStreamOneD(sh, effectH, CG_LUT_SOURCE, lut)) return false;
+    s.footageProfile = static_cast<int>(footage + 0.5);
+    s.theme = static_cast<int>(theme + 0.5);
+    s.strength = strength / 100.0;
+    s.skinProtection = skin / 100.0;
+    s.chromaGain = chroma / 100.0;
+    s.lutSource = static_cast<int>(lut + 0.5);
+    return true;
+}
+
+static bool SnapshotChanged(const cg::editor::ParamSnapshot& a, const cg::editor::ParamSnapshot& b) {
+    return a.footageProfile != b.footageProfile || a.theme != b.theme || a.lutSource != b.lutSource ||
+           std::fabs(a.strength - b.strength) > 1e-6 ||
+           std::fabs(a.skinProtection - b.skinProtection) > 1e-6 ||
+           std::fabs(a.chromaGain - b.chromaGain) > 1e-6;
+}
+
 // The AEGP idle hook: main thread, fires while AE is idle. Cheap-noops unless a window
 // has pending edits, so it never burdens AE. Applies drained edits inside one undo
-// group per tick, and reaps effect refs whose window has been closed.
+// group per tick, polls Effect Controls -> window on change, and reaps effect refs
+// whose window has been closed.
 static A_Err CG_IdleHook(AEGP_GlobalRefcon, AEGP_IdleRefcon, A_long* max_sleepPL) {
     auto& host = cg::editor::EditorHost::instance();
     std::vector<cg::editor::InstanceKey> keys = host.openKeys();
@@ -565,12 +621,14 @@ static A_Err CG_IdleHook(AEGP_GlobalRefcon, AEGP_IdleRefcon, A_long* max_sleepPL
                 if (std::find(keys.begin(), keys.end(), kv.first) == keys.end()) orphans.push_back(kv.first);
             }
         }
-        for (auto k : orphans) DisposeEffectRefForKey(k);
+        for (auto k : orphans) {
+            DisposeEffectRefForKey(k);
+            g_lastPolled.erase(k);
+        }
     }
 
     if (g_spbasic && g_aegpId) {
         for (auto key : keys) {
-            if (!host.hasPendingEdits(key)) continue;  // fast path: nothing to do
             AEGP_EffectRefH effectH = nullptr;
             {
                 std::lock_guard<std::mutex> lk(g_effMutex);
@@ -578,32 +636,56 @@ static A_Err CG_IdleHook(AEGP_GlobalRefcon, AEGP_IdleRefcon, A_long* max_sleepPL
                 if (it != g_effectRefs.end()) effectH = it->second;
             }
             if (!effectH) continue;
-            std::vector<cg::editor::ParamEdit> edits = host.drainEdits(key);
-            if (edits.empty()) continue;
+
+            // window -> effect: apply any queued edits (writes param streams).
+            if (host.hasPendingEdits(key)) {
+                std::vector<cg::editor::ParamEdit> edits = host.drainEdits(key);
+                if (!edits.empty()) {
+                    try {
+                        AEGP_SuiteHandler sh(g_spbasic);
+                        sh.UtilitySuite6()->AEGP_StartUndoGroup("Color Grade editor edit");
+                        for (const auto& e : edits) {
+                            PF_ParamIndex idx = 0;
+                            double one_d = 0.0;
+                            if (!StreamForEdit(e, idx, one_d)) continue;
+                            AEGP_StreamRefH streamH = nullptr;
+                            A_Err er = sh.StreamSuite5()->AEGP_GetNewEffectStreamByIndex(g_aegpId, effectH, idx, &streamH);
+                            if (!er && streamH) {
+                                AEGP_StreamValue2 val;
+                                std::memset(&val, 0, sizeof(val));
+                                val.streamH = streamH;
+                                val.val.one_d = one_d;
+                                sh.StreamSuite5()->AEGP_SetStreamValue(g_aegpId, streamH, &val);
+                                sh.StreamSuite5()->AEGP_DisposeStream(streamH);
+                            }
+                        }
+                        sh.UtilitySuite6()->AEGP_EndUndoGroup();
+                    } catch (...) { /* swallow: a bridge hiccup must never destabilize AE */ }
+                }
+            }
+
+            // Effect Controls -> window: read the effect's current params and publish
+            // to the window if they changed (scrub/type in EC reflects live). This does
+            // not rely on the render-thread publish, whose sequence-data key is
+            // unreliable; the mid-drag guard in the window keeps a user drag from being
+            // stomped by a poll.
             try {
                 AEGP_SuiteHandler sh(g_spbasic);
-                sh.UtilitySuite6()->AEGP_StartUndoGroup("Color Grade editor edit");
-                for (const auto& e : edits) {
-                    PF_ParamIndex idx = 0;
-                    double one_d = 0.0;
-                    if (!StreamForEdit(e, idx, one_d)) continue;
-                    AEGP_StreamRefH streamH = nullptr;
-                    A_Err er = sh.StreamSuite5()->AEGP_GetNewEffectStreamByIndex(g_aegpId, effectH, idx, &streamH);
-                    if (!er && streamH) {
-                        AEGP_StreamValue2 val;
-                        std::memset(&val, 0, sizeof(val));
-                        val.streamH = streamH;
-                        val.val.one_d = one_d;
-                        sh.StreamSuite5()->AEGP_SetStreamValue(g_aegpId, streamH, &val);
-                        sh.StreamSuite5()->AEGP_DisposeStream(streamH);
+                cg::editor::ParamSnapshot polled;
+                if (PollSnapshotViaAegp(sh, effectH, polled)) {
+                    auto it = g_lastPolled.find(key);
+                    if (it == g_lastPolled.end() || SnapshotChanged(it->second, polled)) {
+                        polled.revision = g_snapshotRevision.fetch_add(1);
+                        g_lastPolled[key] = polled;
+                        host.publishSnapshot(key, polled);
                     }
                 }
-                sh.UtilitySuite6()->AEGP_EndUndoGroup();
-            } catch (...) { /* swallow: a bridge hiccup must never destabilize AE */ }
+            } catch (...) { /* swallow */ }
         }
     }
-    // Keep AE responsive but poll edits promptly (units of 1/60 s).
-    if (max_sleepPL && *max_sleepPL > 8) *max_sleepPL = 8;
+    // With a window open, poll promptly (sub-second) so EC edits track; otherwise let
+    // AE sleep normally. Units are 1/60 s.
+    if (!keys.empty() && max_sleepPL && *max_sleepPL > 8) *max_sleepPL = 8;
     return A_Err_NONE;
 }
 
