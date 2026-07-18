@@ -1,6 +1,15 @@
 import { describe, it, expect } from 'vitest';
-import { buildTransform } from '../../src/core/engine/engine.js';
-import { computeStats, skinWedgeWeight } from '../../src/core/analysis/stats.js';
+import { buildTransform, toneStretchChromaGuard } from '../../src/core/engine/engine.js';
+import {
+  computeStats,
+  skinWedgeWeight,
+  encodedRec709ToLab,
+  luma709,
+  SHADOW_MID_SPLIT,
+  MID_HIGHLIGHT_SPLIT,
+  type FootageStats,
+} from '../../src/core/analysis/stats.js';
+import type { Theme } from '../../src/core/engine/theme.js';
 import { THEMES } from '../../src/themes/index.js';
 import type { Vec3 } from '../../src/core/color/types.js';
 
@@ -171,6 +180,121 @@ describe('expanded overrides', () => {
             expect(out[c]).toBeLessThanOrEqual(1);
           }
         }
+  });
+});
+
+describe('chroma-overshoot guard', () => {
+  // Synthetic reproduction of the scout report's Experiment A failure shape
+  // (no dependency on the gitignored personal footage fixtures): a degraded,
+  // low-dynamic-range source whose luma sits in a narrow ~0.30-0.60 band with a
+  // green/blue cast, stat-matched toward a full-range target histogram. The
+  // large tone-curve stretch relocates mid pixels into the near-empty
+  // shadow/highlight bands, where the auto bandScale + kA/kB gains compound and
+  // used to explode chroma into a neon blowout.
+  function degradedFrame(n: number): Float32Array {
+    let seed = 7;
+    const rand = () => ((seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff);
+    const px = new Float32Array(n * 3);
+    for (let i = 0; i < px.length; i += 3) {
+      const base = 0.3 + rand() * 0.3; // luma ~0.30..0.60 (low dynamic range)
+      px[i] = Math.min(1, Math.max(0, base + (rand() - 0.5) * 0.12 - 0.03));
+      px[i + 1] = Math.min(1, Math.max(0, base + (rand() - 0.5) * 0.12 + 0.04));
+      px[i + 2] = Math.min(1, Math.max(0, base + (rand() - 0.5) * 0.12 + 0.03));
+    }
+    return px;
+  }
+  function maxBandChroma(px: Float32Array): number {
+    const sum = [0, 0, 0];
+    const cnt = [0, 0, 0];
+    for (let i = 0; i < px.length; i += 3) {
+      const y = luma709(px[i]!, px[i + 1]!, px[i + 2]!);
+      const lab = encodedRec709ToLab(px[i]!, px[i + 1]!, px[i + 2]!);
+      const chroma = Math.hypot(lab[1], lab[2]);
+      const band = y < SHADOW_MID_SPLIT ? 0 : y < MID_HIGHLIGHT_SPLIT ? 1 : 2;
+      sum[band]! += chroma;
+      cnt[band]! += 1;
+    }
+    return Math.max(...[0, 1, 2].map((b) => (cnt[b]! > 0 ? sum[b]! / cnt[b]! : 0)));
+  }
+  const applyToFrame = (t: (p: Vec3) => Vec3, frame: Float32Array): Float32Array => {
+    const out = new Float32Array(frame.length);
+    for (let i = 0; i < frame.length; i += 3) {
+      const o = t([frame[i]!, frame[i + 1]!, frame[i + 2]!]);
+      out[i] = o[0];
+      out[i + 1] = o[1];
+      out[i + 2] = o[2];
+    }
+    return out;
+  };
+
+  const frame = degradedFrame(20000);
+  const src = computeStats(frame);
+  // Wide-range target with modest per-band chroma (a genuinely full-range look).
+  const target: FootageStats = {
+    lumaPercentiles: { p1: 0.1, p5: 0.135, p25: 0.42, p50: 0.662, p75: 0.85, p95: 1.0, p99: 1.0 },
+    lab: { mean: [66.9, 0.13, 0.8], std: [24, 9, 10] },
+    bandChroma: { shadows: 2.1, mids: 5.4, highlights: 3.9 },
+    saturation: { mean: 0.15, std: 0.1 },
+    skinPresence: 0.047,
+    clipping: { low: 0, high: 0.143 },
+  };
+  const theme: Theme = {
+    name: 'synthetic-wide',
+    description: 'wide-range target for the overshoot repro',
+    targetStats: target,
+    knobs: { strength: { default: 1 }, skinProtection: { default: 0.5 } },
+  };
+  const targetMaxBand = Math.max(target.bandChroma.shadows, target.bandChroma.mids, target.bandChroma.highlights);
+
+  it('engages on a large tone-curve stretch and stays inert on ordinary sources', () => {
+    const g = toneStretchChromaGuard(src, target);
+    expect(g.stretch).toBeGreaterThan(2.5); // narrow source -> wide target
+    expect(g.gain).toBeLessThan(0.3); // auto amplification strongly damped
+    expect(g.autoSoftLimit).toBeGreaterThan(0);
+
+    // Ordinary sources (source range within ~1.5x of target) must stay exactly
+    // inert, guaranteeing byte-identical output to the pre-guard engine.
+    const normal = computeStats(syntheticFootage(20000));
+    for (const th of Object.values(THEMES)) {
+      const gi = toneStretchChromaGuard(normal, th.targetStats);
+      expect(gi.severity).toBe(0);
+      expect(gi.gain).toBe(1);
+      expect(gi.autoSoftLimit).toBeUndefined();
+    }
+  });
+
+  it('caps band chroma near the target where the un-guarded engine exploded past it', () => {
+    const guard = toneStretchChromaGuard(src, target);
+
+    // With the guard (default: no authored chromaGain/softLimit).
+    const guardedMax = maxBandChroma(applyToFrame(buildTransform(src, theme, { strength: 1 }), frame));
+
+    // Reconstruct the pre-guard behavior through the public API: an explicit
+    // chromaGain of 1/guard.gain cancels the auto damping and an explicit huge
+    // softLimit disables the auto ceiling (authored overrides win). This is the
+    // exact transform the engine produced before the guard existed.
+    const unguardedTheme: Theme = {
+      ...theme,
+      overrides: { chromaGain: 1 / guard.gain, chromaShape: { softLimit: 1e9 } },
+    };
+    const unguardedMax = maxBandChroma(applyToFrame(buildTransform(src, unguardedTheme, { strength: 1 }), frame));
+
+    // Before: the un-guarded transform explodes band chroma many times past target.
+    expect(unguardedMax).toBeGreaterThan(5 * targetMaxBand);
+    // After: the guard keeps it within a sane multiple of the target's chroma...
+    expect(guardedMax).toBeLessThan(2.5 * targetMaxBand);
+    // ...and dramatically below the un-guarded blowout.
+    expect(guardedMax).toBeLessThan(unguardedMax / 4);
+  });
+
+  it('respects an authored chroma ceiling instead of installing its own', () => {
+    const guard = toneStretchChromaGuard(src, target);
+    expect(guard.autoSoftLimit).toBeGreaterThan(0);
+    // An authored softLimit takes precedence over the auto ceiling.
+    const authored: Theme = { ...theme, overrides: { chromaShape: { softLimit: 8 } } };
+    const authoredMax = maxBandChroma(applyToFrame(buildTransform(src, authored, { strength: 1 }), frame));
+    // 8 is tighter than the auto ceiling (~16), so output chroma is bounded by it.
+    expect(authoredMax).toBeLessThanOrEqual(8);
   });
 });
 

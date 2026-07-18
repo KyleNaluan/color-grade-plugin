@@ -61,6 +61,63 @@ function buildToneCurve(src: FootageStats, tgt: FootageStats): MonotoneCurve {
   );
 }
 
+/** Result of the automatic chroma-overshoot guard (see {@link toneStretchChromaGuard}). */
+export interface ChromaGuard {
+  /** output/input luma-range ratio (p5..p95) that drives the guard; ~1 for ordinary sources. */
+  stretch: number;
+  /** 0 below the knee (guard inert) rising to 1; how hard the guard engages. */
+  severity: number;
+  /** Multiplier (<=1) folded into the automatic per-band chroma amplification. 1 = inert. */
+  gain: number;
+  /**
+   * LAB-chroma soft ceiling to install when the theme authored none, or `undefined`
+   * when the guard is inert (so ordinary sources keep their exact prior behavior).
+   */
+  autoSoftLimit: number | undefined;
+}
+
+// Guard tuning. The knee is set above any ordinary source's stretch (a normal
+// clip's luma range is within ~1.5x of the target's) so the guard is exactly
+// inert - and therefore output-identical - for ordinary footage; full strength
+// by ~3x, the regime the scout report's Experiment A blowout lives in.
+const STRETCH_KNEE = 1.5;
+const STRETCH_FULL = 3.0;
+const GUARD_GAIN_FLOOR = 0.2; // auto amplification is damped no further than this
+const AUTO_CEIL_LOOSE = 6; // multiple of target band chroma near the knee
+const AUTO_CEIL_TIGHT = 3; // multiple of target band chroma at full severity
+
+/**
+ * Automatic chroma-overshoot guard.
+ *
+ * A large tone-curve stretch - target luma range far wider than the source's,
+ * e.g. stat-matching a low-dynamic-range or degraded clip toward a full-range
+ * target - pushes originally mid-luma pixels out into the shadow/highlight
+ * output bands. There the automatic per-band chroma scale (`bandScale`, up to
+ * 2x) and the per-pixel LAB std-ratio gain (`kA`/`kB`, up to 1.8x) - both fit to
+ * the *source's* per-band stats, which are near-empty in those bands - compound
+ * and explode chroma far past the target (the "neon blowout", scout report
+ * Experiment A). The stretch ratio (output luma range / input luma range) is a
+ * principled proxy for how much relocation, and thus overshoot, will occur.
+ *
+ * The guard damps only this stat-derived *automatic* amplification and, when the
+ * theme authored no chroma ceiling, derives one from the target's own chroma.
+ * Authored chromaGain / chromaShape always still apply on top - the guard bounds
+ * the auto behavior, it never overrides hand-authored intent.
+ */
+export function toneStretchChromaGuard(src: FootageStats, tgt: FootageStats): ChromaGuard {
+  const srcRange = Math.max(src.lumaPercentiles.p95 - src.lumaPercentiles.p5, 1e-3);
+  const tgtRange = Math.max(tgt.lumaPercentiles.p95 - tgt.lumaPercentiles.p5, 1e-3);
+  const stretch = tgtRange / srcRange;
+  const severity = smoothstep(STRETCH_KNEE, STRETCH_FULL, stretch);
+  const gain = lerp(1, GUARD_GAIN_FLOOR, severity);
+  const tgtBandChromaMax = Math.max(tgt.bandChroma.shadows, tgt.bandChroma.mids, tgt.bandChroma.highlights);
+  const autoSoftLimit =
+    severity > 0 && tgtBandChromaMax > 0
+      ? tgtBandChromaMax * lerp(AUTO_CEIL_LOOSE, AUTO_CEIL_TIGHT, severity)
+      : undefined;
+  return { stretch, severity, gain, autoSoftLimit };
+}
+
 /**
  * Build the grade transform: measured footage stats -> transform toward the
  * theme's target stats, scaled by knobs, with skin-tone protection.
@@ -101,6 +158,13 @@ export function buildTransform(src: FootageStats, theme: Theme, opts: EngineOpti
   const ov = theme.overrides ?? {};
   const chromaGain = ov.chromaGain ?? 1;
 
+  // Automatic chroma-overshoot guard: when the tone curve stretches a low-range
+  // source toward a much wider target, damp the stat-derived auto chroma
+  // amplification (guard.gain, folded into `scale` below) so relocated pixels
+  // can't neon-blow-up, and adopt an auto soft ceiling if the theme authored
+  // none. Inert (gain 1, no ceiling) for ordinary sources.
+  const guard = toneStretchChromaGuard(src, tgt);
+
   // Authored curves: monotone per-channel tone shapes, evaluated on the
   // stat-matched signal, then clamped so authored points outside [0,1] cannot
   // push the encoded signal out of range.
@@ -128,7 +192,8 @@ export function buildTransform(src: FootageStats, theme: Theme, opts: EngineOpti
   // e-folding chroma for the vibrance falloff: low-chroma pixels get the full
   // effect, pixels beyond ~2-3x this are left mostly alone.
   const VIBRANCE_FALLOFF = 25; // LAB chroma units
-  const softLimit = shape.softLimit;
+  // Authored ceiling wins; otherwise the guard's auto ceiling (undefined = none).
+  const softLimit = shape.softLimit ?? guard.autoSoftLimit;
 
   return (rgb: Vec3): Vec3 => {
     const rIn = clamp01(rgb[0]);
@@ -150,7 +215,7 @@ export function buildTransform(src: FootageStats, theme: Theme, opts: EngineOpti
     // 3. Per-band chroma scaling + overrides.
     const y1 = luma709(r1, g1, b1);
     const [ws, wm, wh] = bandWeights(y1);
-    const scale = (ws * bandScale[0] + wm * bandScale[1] + wh * bandScale[2]) * chromaGain;
+    const scale = (ws * bandScale[0] + wm * bandScale[1] + wh * bandScale[2]) * chromaGain * guard.gain;
     a *= scale;
     bb *= scale;
     if (ov.shadowTint) {
