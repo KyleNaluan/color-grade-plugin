@@ -40,8 +40,11 @@ resource 'PiPL' (16000) {
 			PF_PLUG_IN_SUBVERS
 		},
 		/* [8] */
+		/* MUST equal PF_VERSION(MAJOR,MINOR,BUG,STAGE,BUILD) from ColorGrade.h, or AE
+		   warns "version mismatch (88001)". Packed = (vers<<19)+(subvers<<15)+(bug<<11)+(stage<<9)+build.
+		   1.1.0 develop(0) build 1 = (1<<19)+(1<<15)+1 = 557057. Bump in lockstep with the code version. */
 		AE_Effect_Version {
-			524289	/* 1.0.0 develop build 1 */
+			557057	/* 1.1.0 develop build 1 */
 		},
 		/* [9] */
 		AE_Effect_Info_Flags {

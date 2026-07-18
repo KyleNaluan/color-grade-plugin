@@ -30,6 +30,24 @@ linker drops the `.aex` (and, for `--gpu`, the `DirectX_Assets/` folder) into
 **After Effects must be closed before (re)building** - it holds the loaded `.aex` and the
 linker cannot overwrite it (LNK1104).
 
+**Pre-validation: build all four configs** - `Debug` and `Release`, each with and without
+`--gpu`. A config-gated break (e.g. an `ERR2`/`err2` use whose declaration only exists in one
+config) compiles in one and fails in another, so a single-config build is not proof. When
+running configs back-to-back, a lingering `mspdbsrv.exe` can hold the previous PDB and the
+next link fails with **LNK1201** (PDB write error) - not a code error; clear it with
+`rm -rf .../mirror/ColorGradeFX/Win/x64/<Config>` (+ `taskkill.exe /F /IM mspdbsrv.exe`) and
+rebuild.
+
+**PiPL version lockstep** - `ColorGradePiPL.r`'s `AE_Effect_Version` MUST equal
+`PF_VERSION(MAJOR,MINOR,BUG,STAGE,BUILD)` from `ColorGrade.h`, or AE warns "version mismatch
+(88001)" on load. Packed value = `(vers<<19)+(subvers<<15)+(bug<<11)+(stage<<9)+build`. Bump
+both together.
+
+**Data-only params** - the `Grade Recipe` arb param carries no UI: it MUST use `ui_width=0,
+ui_height=0` + `PF_PUI_NO_ECW_UI`. Any nonzero `ui_width`/`ui_height` (or a `PF_PUI_TOPIC`/
+`CONTROL` flag) without `PF_OutFlag_CUSTOM_UI` set makes AE warn "no custom ui outflag..."
+(25::37) and "Unsupported effect control!".
+
 ---
 
 ## Pinned toolchain (captain-verified, do not drift)
@@ -200,15 +218,28 @@ A build cannot prove the effect works in AE; that needs a human at the GUI. When
 is ready, verify in AE 2025:
 
 1. **Registers & drags:** AE launched, the effect appears under **Effects & Presets ->
-   Color Grade -> "CG Color Grade"**, and drags onto a layer with **Strength** and
-   **LUT Source** controls in Effect Controls.
-2. **CPU LUT applies:** with LUT Source = "Embedded (Teal-Orange)", the layer takes on a
-   teal-orange grade; **Strength** scrubs it from 0% (identity) to 100%.
-3. **External .cube:** set `LUT Source` = "External .cube file" and either set env
+   Color Grade -> "CG Color Grade"**, and drags onto a layer. Effect Controls now shows
+   (Phase 2): **Theme** (Teal-Orange / Warm-Film / Cool-Noir), **Strength**,
+   **Skin Protection**, **Chroma Gain**, and **LUT Source** (Auto / Embedded / External).
+   The **Grade Recipe** arb-data param is data-only (no visible control) but persists in the
+   project - save, reopen the `.aep`, and confirm the grade survives.
+2. **Auto grade (Phase 2 engine path):** with LUT Source = "Auto (Theme + Analysis)", the
+   layer takes on the selected **Theme**'s look, baked natively in-effect from the ported
+   engine. Switching Theme changes the look; **Strength** scrubs 0% (identity) -> full;
+   **Skin Protection** and **Chroma Gain** change the grade as their TS knobs do. (Real
+   footage-stats analysis lands in a later phase; the recipe currently seeds neutral
+   placeholder source stats, so Auto grades a placeholder-vs-theme transform.)
+3. **CPU LUT applies (Phase 1 path):** with LUT Source = "Embedded (Teal-Orange)", the layer
+   takes on a teal-orange grade; **Strength** scrubs it from 0% (identity) to 100%.
+4. **External .cube:** set `LUT Source` = "External .cube file" and either set env
    `CG_LUT_PATH` to a `.cube` **or** drop a `ColorGrade_LUT.cube` next to the `.aex` in
    MediaCore; the layer takes on that LUT. A bad/missing path falls back to the embedded LUT.
-4. **GPU path active:** Project Settings -> Video Rendering and Effects -> Mercury GPU
+5. **GPU path active:** Project Settings -> Video Rendering and Effects -> Mercury GPU
    Acceleration on; confirm the GPU path renders (same result as CPU). On this NVIDIA box
    (RTX 3090 + AMD) AE offers only CUDA, so expect the CUDA tracer lines; DirectX would
    engage only on a host that offers it. If it falls back to CPU, adapter/framework
    selection is the suspect - check the `GPUDeviceSetup` trace for which framework AE offered.
+
+The numerical correctness of the ported engine is proven unattended by the cross-engine
+golden harness (`npm run native:core-parity`), so AE verification here is about the SDK glue
+(param UI, arb-data persistence, render wiring), not the color math.
