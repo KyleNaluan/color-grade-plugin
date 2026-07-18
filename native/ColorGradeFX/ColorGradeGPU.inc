@@ -42,6 +42,17 @@ static size_t DivideRoundUp(size_t v, size_t d) { return v ? (v + d - 1) / d : 0
 static PF_Err GPUDeviceSetup(PF_InData* in_data, PF_OutData* out_data, PF_GPUDeviceSetupExtra* extra) {
     PF_Err err = PF_Err_NONE;
 
+    // Diagnostic: log which framework AE is offering. If this logs "CUDA"/"OpenCL" (and
+    // never "DirectX"), AE selected a non-DirectX framework for this box and our
+    // DirectX-only effect gets no GPU path -> CPU fallback (see BUILDING.md).
+    switch (extra->input->what_gpu) {
+        case PF_GPU_Framework_CUDA:    CG_DBG("GPUDeviceSetup: AE offered CUDA (unsupported here -> CPU fallback)"); break;
+        case PF_GPU_Framework_OPENCL:  CG_DBG("GPUDeviceSetup: AE offered OpenCL (unsupported here -> CPU fallback)"); break;
+        case PF_GPU_Framework_METAL:   CG_DBG("GPUDeviceSetup: AE offered Metal (unsupported here -> CPU fallback)"); break;
+        case PF_GPU_Framework_DIRECTX: CG_DBG("GPUDeviceSetup: AE offered DirectX (setting up)"); break;
+        default:                       CG_DBG("GPUDeviceSetup: AE offered an unknown framework"); break;
+    }
+
     PF_GPUDeviceInfo device_info;
     AEFX_CLR_STRUCT(device_info);
 
