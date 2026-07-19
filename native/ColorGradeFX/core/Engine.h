@@ -59,6 +59,10 @@ struct LiftGammaGain {
 // The neutral Lift/Gamma/Gain (mirrors NEUTRAL_LGG in engine.ts).
 inline LiftGammaGain neutralLgg() { return LiftGammaGain{}; }
 
+// Positive floor for per-channel gamma before inverting to 1/gamma (mirrors
+// LGG_GAMMA_FLOOR in engine.ts): the wheel UI can compose a non-positive gamma.
+constexpr double LGG_GAMMA_FLOOR = 1e-3;
+
 struct EngineOptions {
     std::optional<double> strength;
     std::optional<double> skinProtection;
@@ -529,7 +533,7 @@ inline GradeTransform buildTransform(const FootageStats& src, const Theme& theme
         for (int c = 0; c < 3; ++c) {
             t.lgLift[c] = lg.lift[c];
             t.lgGain[c] = lg.gain[c];
-            t.lgInvGamma[c] = 1.0 / lg.gamma[c];
+            t.lgInvGamma[c] = 1.0 / std::max(LGG_GAMMA_FLOOR, lg.gamma[c]);
         }
     }
 

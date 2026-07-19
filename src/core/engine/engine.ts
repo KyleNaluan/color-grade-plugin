@@ -59,6 +59,14 @@ export interface LiftGammaGain {
   gain: Vec3;
 }
 
+/**
+ * Positive floor for per-channel gamma before inverting to `1/gamma`. The
+ * wheel UI can compose a non-positive gamma (master min + full color disc),
+ * which would flip the exponent and blow a channel toward white; clamping here
+ * keeps `1/gamma` finite and positive.
+ */
+export const LGG_GAMMA_FLOOR = 1e-3;
+
 /** The neutral Lift/Gamma/Gain (exact identity). */
 export const NEUTRAL_LGG: LiftGammaGain = {
   lift: [0, 0, 0],
@@ -348,7 +356,11 @@ export function buildTransform(src: FootageStats, theme: Theme, opts: EngineOpti
   const lgLift: Vec3 = lgg ? lgg.lift : [0, 0, 0];
   const lgGain: Vec3 = lgg ? lgg.gain : [1, 1, 1];
   const lgInvGamma: Vec3 = lgg
-    ? [1 / lgg.gamma[0], 1 / lgg.gamma[1], 1 / lgg.gamma[2]]
+    ? [
+        1 / Math.max(LGG_GAMMA_FLOOR, lgg.gamma[0]),
+        1 / Math.max(LGG_GAMMA_FLOOR, lgg.gamma[1]),
+        1 / Math.max(LGG_GAMMA_FLOOR, lgg.gamma[2]),
+      ]
     : [1, 1, 1];
   const lggChannel = (x: number, lift: number, gain: number, invGamma: number): number => {
     const base = gain * x + lift * (1 - x);
