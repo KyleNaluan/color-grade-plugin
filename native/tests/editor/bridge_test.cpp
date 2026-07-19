@@ -20,6 +20,7 @@
  * Self-asserting: returns non-zero and prints the first failure on any mismatch.
  */
 #include "../../ColorGradeFX/editor/EditorBridge.h"
+#include "../../ColorGradeFX/core/FootageCatalog.h"
 
 #include <atomic>
 #include <cmath>
@@ -300,6 +301,57 @@ static void test_phase6b_curve_drag() {
     CHECK(e.count == 2 && approx(e.y[0], 0.0) && approx(e.y[1], 1.0), "remove interior -> endpoints");
 }
 
+// --- multi-camera footage catalog + editor Camera->Profile cascade ----------
+static void test_footage_cascade() {
+    using namespace cg::core;
+
+    // Catalog: contiguous 1-based, Standard first (no decode), 12 entries.
+    CHECK(footageProfileCount() == 12, "catalog has 12 profiles");
+    CHECK(footageStandardIndex() == 1, "Standard is index 1");
+    CHECK(std::string(footageEntry(1).key) == "rec709", "index 1 -> rec709");
+    CHECK(!footageIndexIsLog(1), "Standard is not log");
+    for (int i = 2; i <= footageProfileCount(); ++i) CHECK(footageIndexIsLog(i), "log index");
+    CHECK(std::string(footageEntry(11).key) == "vlog", "index 11 -> vlog (Lumix unchanged)");
+
+    // The flat choice string leads with Standard and is '|'-delimited/grouped.
+    const std::string flat = footageFlatChoicesString();
+    CHECK(flat.rfind("Standard (Rec.709)|", 0) == 0, "flat choices start with Standard");
+    CHECK(flat.find("|Sony - S-Log3") != std::string::npos, "flat choices carry grouped labels");
+
+    // Cameras are unique and alphabetical (Standard excluded).
+    std::vector<std::string> cams = footageCameras();
+    CHECK(cams.size() == 8, "8 cameras");
+    CHECK(cams.front() == "ARRI" && cams.back() == "Sony", "cameras alphabetical");
+    for (size_t i = 1; i < cams.size(); ++i) CHECK(cams[i - 1] < cams[i], "strictly ascending cameras");
+
+    // Every camera's Profile list is never empty and leads with Standard (-> index 1).
+    for (const auto& c : cams) {
+        FootageCameraProfiles p = footageProfilesForCamera(c);
+        CHECK(p.labels.size() >= 2, "camera has Standard + >=1 profile");
+        CHECK(p.labels.front() == "Standard (Rec.709)", "Standard leads every camera");
+        CHECK(p.flatIndices.front() == 1, "Standard maps to flat index 1");
+    }
+
+    // Canon exposes exactly Standard + C-Log2 + C-Log3.
+    FootageCameraProfiles canon = footageProfilesForCamera("Canon");
+    CHECK(canon.labels.size() == 3, "Canon has 3 options");
+    CHECK(canon.labels[1] == "C-Log2" && canon.labels[2] == "C-Log3", "Canon profiles");
+
+    // Cascade round-trip: a stored flat index resolves to (camera, option) that maps back.
+    for (int flat = 1; flat <= footageProfileCount(); ++flat) {
+        FootageCascadePos pos = footageCascadePosForFlat(flat);
+        const std::string cam = footageCameras()[static_cast<size_t>(pos.cameraIndex)];
+        FootageCameraProfiles p = footageProfilesForCamera(cam);
+        CHECK(p.flatIndices[static_cast<size_t>(pos.profileOptionIndex)] ==
+                  (footageIndexIsLog(flat) ? flat : 1),
+              "cascade position maps back to the stored flat index");
+    }
+
+    // Standard (flat 1) is ambiguous-camera -> first camera, Standard option.
+    FootageCascadePos std0 = footageCascadePosForFlat(1);
+    CHECK(std0.cameraIndex == 0 && std0.profileOptionIndex == 0, "Standard cascades to first camera/Standard");
+}
+
 int main() {
     test_queue_basic();
     test_queue_threaded();
@@ -308,6 +360,7 @@ int main() {
     test_phase6a_manual();
     test_phase6bc_curves_wheels();
     test_phase6b_curve_drag();
+    test_footage_cascade();
 
     if (g_failures == 0) {
         std::printf("editor-bridge-test: PASS (all bridge-logic checks)\n");

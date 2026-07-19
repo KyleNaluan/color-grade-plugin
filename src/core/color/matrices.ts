@@ -68,3 +68,19 @@ export const REC709_CHROMATICITIES: Chromaticities = {
 
 export const REC709_TO_XYZ = rgbToXyzMatrix(REC709_CHROMATICITIES);
 export const XYZ_TO_REC709 = mat3Inv(REC709_TO_XYZ);
+
+/**
+ * ITU-R BT.2020 primaries, D65 white. Fujifilm F-Gamut and Nikon N-Gamut are
+ * both defined as BT.2020, so their profile modules reuse these.
+ */
+export const BT2020_CHROMATICITIES: Chromaticities = {
+  r: [0.708, 0.292],
+  g: [0.17, 0.797],
+  b: [0.131, 0.046],
+  white: D65,
+};
+
+/** scene-linear camera-gamut RGB -> scene-linear Rec.709 RGB, from primaries. */
+export function gamutToRec709Matrix(c: Chromaticities): Mat3 {
+  return mat3Mul(mat3Inv(REC709_TO_XYZ), rgbToXyzMatrix(c));
+}

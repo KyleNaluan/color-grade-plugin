@@ -348,9 +348,18 @@ static cg::core::Theme ThemeFromPopup(A_long themePopup) {
     }
 }
 
-// Map the footage-profile popup (1-based) to a ported log profile.
+// Map the footage-profile popup (1-based) to a ported log profile via the catalog
+// (core/FootageCatalog.h). Any unknown index falls back to Rec.709 (no decode).
 static const cg::core::LogProfile& ProfileFromFootagePopup(A_long footagePopup) {
-    return footagePopup == CG_FOOT_VLOG ? cg::core::VLOG_PROFILE() : cg::core::REC709_PROFILE();
+    const cg::core::LogProfile* p = cg::core::getProfile(cg::core::footageKeyForIndex(footagePopup));
+    return p ? *p : cg::core::REC709_PROFILE();
+}
+
+// Whether the selected footage profile is a log format that needs decoding
+// (anything but Standard/Rec.709). Replaces the former V-Log-only equality checks
+// so every camera log profile decodes, not just V-Log.
+static bool FootageIsLog(A_long footagePopup) {
+    return cg::core::footageIndexIsLog(footagePopup);
 }
 
 // Bake the Auto-mode grade LUT natively: the popup theme supplies the look, the
@@ -391,14 +400,15 @@ static void BakeAutoLut(A_long themePopup, A_long footagePopup, double strength0
     opts.lgg = cg::core::lggFromRecipe(recipe);
     opts.lookMix = lookMix;
 
-    // Correct + Grade in one baked LUT. When the clip is a log profile (V-Log), the
+    // Correct + Grade in one baked LUT. When the clip is a log profile (V-Log,
+    // S-Log3, C-Log2/3, LogC3/4, D-Log, Film Gen5, F-Log/2, N-Log), the
     // Correct stage decodes each pixel to Rec.709 *before* the grade; baking the
     // composition into a single LUT keeps the CPU and GPU apply paths identical (no
     // per-pixel decode in the kernel). Rec.709 footage decodes to itself, so the
     // standard profile bakes the plain grade unchanged. (The decode stage applies to
     // the Auto path; the Embedded/External raw-LUT modes are unaffected by design.)
     auto grade = cg::core::buildTransform(src, theme, opts);
-    if (footagePopup == CG_FOOT_VLOG) {
+    if (FootageIsLog(footagePopup)) {
         const cg::core::LogProfile& profile = ProfileFromFootagePopup(footagePopup);
         dst = cg::core::bakeLut(
             [&grade, &profile](const cg::core::Vec3d& x) {
@@ -423,7 +433,7 @@ static void BakeAutoLut(A_long themePopup, A_long footagePopup, double strength0
 // (The Auto path composes the decode into the *continuous* grade in BakeAutoLut, which
 // avoids this resample's extra interpolation; here we only have a baked LUT to compose.)
 static cg::Lut3D ComposeDecodeIntoLut(const cg::Lut3D& lut, A_long footagePopup, double strength01) {
-    if (footagePopup != CG_FOOT_VLOG) return lut;
+    if (!FootageIsLog(footagePopup)) return lut;
     const cg::core::LogProfile& profile = ProfileFromFootagePopup(footagePopup);
     return cg::core::bakeLut(
         [&lut, &profile, strength01](const cg::core::Vec3d& x) -> cg::core::Vec3d {
@@ -604,13 +614,13 @@ static void ResolveRenderData(PF_InData* in_data, A_long source, A_long themePop
                     temperature, recipe, d.lut);
         d.applyStrength = 1.0f;
     } else {
-        // Embedded/External raw LUT. For V-Log the Footage/Correct decode is composed in
-        // and Strength is baked into the composed LUT (blend in decoded space, applied at
-        // 1.0) so V-Log is never left undecoded even at partial Strength (captain
-        // directive). Rec.709 decodes to itself: keep the raw LUT + slider-strength blend.
+        // Embedded/External raw LUT. For any log profile the Footage/Correct decode is
+        // composed in and Strength is baked into the composed LUT (blend in decoded space,
+        // applied at 1.0) so log footage is never left undecoded even at partial Strength
+        // (captain directive). Rec.709 decodes to itself: keep the raw LUT + slider strength.
         cg::Lut3D raw;
         ResolveLut(source, raw);
-        if (footagePopup == CG_FOOT_VLOG) {
+        if (FootageIsLog(footagePopup)) {
             d.lut = ComposeDecodeIntoLut(raw, footagePopup, strength01);
             d.applyStrength = 1.0f;
         } else {
@@ -1924,12 +1934,17 @@ static PF_Err ParamsSetup(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef*
 
     // Order must match the CG_* param enum (after CG_INPUT).
     // Correct: footage log-format selector (drives the decode stage baked into the
-    // Auto LUT). Rec.709 = no decode; V-Log decodes to Rec.709 before the grade.
+    // Auto LUT). Standard/Rec.709 = no decode (index 1, fresh-apply default); each
+    // camera log profile decodes to Rec.709 before the grade. The flat grouped
+    // choice string ("Sony - S-Log3") and its count come from the catalog
+    // (core/FootageCatalog.h), so adding a profile needs no edit here. The string
+    // is a function-local static so its pointer stays valid for AE's lifetime.
+    static const std::string kFootageChoices = cg::core::footageFlatChoicesString();
     AEFX_CLR_STRUCT(def);
     PF_ADD_POPUP("Footage",
-                 2 /* num choices */,
+                 cg::core::footageProfileCount() /* num choices */,
                  CG_FOOT_REC709,
-                 CG_FOOTAGE_CHOICES,
+                 kFootageChoices.c_str(),
                  CG_FOOTAGE_PROFILE);
 
     // SUPERVISE so AE sends PF_Cmd_USER_CHANGED_PARAM when the theme changes; that

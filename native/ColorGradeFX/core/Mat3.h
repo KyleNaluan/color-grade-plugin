@@ -113,6 +113,19 @@ inline const Mat3& XYZ_TO_REC709() {
     return m;
 }
 
+// ITU-R BT.2020 primaries, D65 white. Fujifilm F-Gamut and Nikon N-Gamut are
+// both defined as BT.2020, so their profile headers reuse these.
+inline const Chromaticities& BT2020_CHROMATICITIES() {
+    static const Chromaticities c = {{0.708, 0.292}, {0.17, 0.797}, {0.131, 0.046}, D65()};
+    return c;
+}
+
+// scene-linear camera-gamut RGB -> scene-linear Rec.709 RGB, from primaries.
+// Mirrors gamutToRec709Matrix in src/core/color/matrices.ts.
+inline Mat3 gamutToRec709Matrix(const Chromaticities& c) {
+    return mat3Mul(mat3Inv(REC709_TO_XYZ()), rgbToXyzMatrix(c));
+}
+
 }  // namespace core
 }  // namespace cg
 
