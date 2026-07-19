@@ -264,7 +264,7 @@ is ready, verify in AE 2025:
 1. **Registers & drags:** AE launched, the effect appears under **Effects & Presets ->
    Color Grade -> "CG Color Grade"**, and drags onto a layer. Effect Controls shows:
    **Footage** (Rec.709 / V-Log - Correct), **Theme** (Teal-Orange / Warm-Film /
-   Cool-Noir / None (Manual)), **Strength**, **Skin Protection**, **Chroma Gain**,
+   Cool-Noir / None (Manual) / Reference Match), **Strength**, **Skin Protection**, **Chroma Gain**,
    **LUT Source** (Auto / Embedded / External), **Open Editor…** (Phase 3 button), and
    the Phase 6a keyframeable manual params appended at the end: **Exposure**, **Look
    Mix**, **Temperature**. The **Grade Recipe** arb-data param is data-only (no visible
@@ -307,6 +307,13 @@ is ready, verify in AE 2025:
    and the Phase 6b/6c items 19-24: the **Curves** tab drags/adds/removes points and bakes,
    the **Wheels** tab's LGG mode is neutral-identity and pushes the right band, the 3-way
    mode feathers band tints, and a Phase-6a (v3) grade loads intact with neutral wheels).
+8. **Reference Match (Phase 7, "match this look"):** set **Theme** = "Reference Match" with
+   LUT Source = "Auto". With no sidecar it falls back to a clean identity (None (Manual)) -
+   never a crash. Then point env `CG_REF_STATS_PATH` at a `.stats` sidecar (or drop a
+   `ColorGrade_Reference.stats` next to the `.aex`) written by the TS side
+   (`writeReferenceStatsFile`); the clip takes on the reference still's look. (No image codec
+   lives in native/, so the reference image is decoded + measured on the TS side; the sidecar
+   is 21 pre-computed stats numbers.)
 
 The numerical correctness of the ported engine is proven unattended by the cross-engine
 golden harness (`npm run native:core-parity`), so AE verification here is about the SDK glue
