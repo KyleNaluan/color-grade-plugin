@@ -1,4 +1,4 @@
-# native/ - Color Grade native After Effects effect (Phase 5)
+# native/ - Color Grade native After Effects effect (Phase 6a)
 
 The Windows-first native re-platform of Color Grade from a CEP panel to a C++ AE Effect
 SDK plugin.
@@ -24,7 +24,7 @@ SDK plugin.
   per-instance LRU cache keeps scrubbing interactive, and the risky logic is isolated in the
   pure `editor/PreviewCache.h` (see `docs/adr-editor-ui.md`, "Phase 4" section).
 
-- **Phase 5** (this milestone): **in-effect analysis + live scopes + before/after**. The idle
+- **Phase 5** (landed): **in-effect analysis + live scopes + before/after**. The idle
   hook samples several frames upstream of the effect, decodes each to Rec.709 via the footage
   profile, and runs the ported `computeStats` over the union (incremental, one checkout per
   tick), injecting the measured stats over the recipe at render. The editor gains
@@ -32,6 +32,16 @@ SDK plugin.
   After/Before/Split toolbar. Risky logic is isolated in the pure `editor/Analysis.h`,
   `editor/Scopes.h`, and `splitViewGeometry` in `editor/PreviewCache.h`
   (see `docs/adr-editor-ui.md`, "Phase 5" section).
+
+- **Phase 6a** (this milestone): the **manual grade suite (Basics)** - a manual
+  primary-correction stage that runs *ahead* of the theme stages on decoded gamma-Rec.709
+  (Exposure, Contrast+pivot, Highlights/Shadows/Whites/Blacks, Temperature/Tint, Saturation,
+  Vibrance), every control neutral-gated to exact identity. A new **None (Manual)** theme
+  (`matchStats=false`) makes pure manual grading first-class, and **Look Mix** blends the
+  theme look over the manual pixel. Three keyframeable Effect Controls params
+  (Exposure / Look Mix / Temperature) are appended after the recipe; the editor gains a
+  **Basics** tab and the recipe grew a versioned migration (v2->v3) so old saved grades
+  survive (see `docs/adr-editor-ui.md`, "Phase 6a" section).
 
 ## Layout
 
@@ -49,10 +59,10 @@ native/
       LogProfile.h Decode.h           profiles (V-Log/Rec.709) + decode-to-Rec.709
       MonotoneCurve.h                 PCHIP tone/shape curves
       Stats.h                         FootageStats + computeStats
-      Theme.h Themes.h                Theme type + the 3 shipping themes (data, transcribed)
-      Engine.h                        buildTransform (the grade transform)
+      Theme.h Themes.h                Theme type + the shipping themes (3 stat-match + None/Manual, data, transcribed)
+      Engine.h                        buildTransform (manual stage + the grade transform + Look Mix)
       BakeLut.h                       bakeLut / bakeGradeLut / bakeDecodeLut -> cg::Lut3D
-      Recipe.h                        POD arb-data recipe + <-> Theme/stats + bakeFromRecipe
+      Recipe.h                        POD arb-data recipe (+ manual block) + <-> Theme/stats + bakeFromRecipe + v2->v3 migrateRecipeInto
     lut/CubeLut.h                   ported parseCube + sampleLut (mirrors src/core/lut/cube.ts)
     embedded/EmbeddedLut.h          GENERATED default LUT (teal-orange grade, 17^3)
     editor/                         Phase 3-5 editor window (see docs/adr-editor-ui.md)
@@ -63,10 +73,10 @@ native/
       EditorWindow.h / .cpp           Win32/D3D11/ImGui host + preview/scope textures (no-op stubs off Windows)
     Win/ColorGradeFX.vcxproj/.sln   MSBuild project (CPU default; /p:CG_GPU=true builds DirectX + CUDA)
   third_party/imgui/                vendored Dear ImGui v1.91.5 (MIT) + Win32/D3D11 backends
-  docs/adr-editor-ui.md             Phase 3 toolkit decision (ImGui vs webview) + bridge design + Phase 4 preview + Phase 5 analysis/scopes
+  docs/adr-editor-ui.md             Phase 3 toolkit decision (ImGui vs webview) + bridge design + Phase 4 preview + Phase 5 analysis/scopes + Phase 6a manual grade
   tests/parity/
     parity_test.cpp                 Phase 1: sampleLut vs TS oracle
-    core_parity.cpp                 Phase 2: computeStats / bakeGradeLut / bakeDecodeLut / recipe replay
+    core_parity.cpp                 Phase 2-6a: computeStats / bakeGradeLut / bakeDecodeLut / recipe / manual grade + Look Mix / v2->v3 migrate replay
   tests/editor/
     bridge_test.cpp                 Phase 3: editor<->effect bridge logic (headless, self-asserting)
     preview_test.cpp                Phase 4: live-preview core (cache/keying/fit/checkin; headless, self-asserting)
