@@ -1,4 +1,4 @@
-# native/ - Color Grade native After Effects effect (Phase 4)
+# native/ - Color Grade native After Effects effect (Phase 5)
 
 The Windows-first native re-platform of Color Grade from a CEP panel to a C++ AE Effect
 SDK plugin.
@@ -6,7 +6,7 @@ SDK plugin.
 - **Phase 1** (the spine): a registering, draggable **SmartFX** effect that applies a baked
   3D LUT to a layer via the ported trilinear `sampleLut`, on a CPU path and a GPU path
   (DirectX + CUDA).
-- **Phase 2** (this milestone): the full `src/core` color engine ported to C++
+- **Phase 2** (landed): the full `src/core` color engine ported to C++
   (`ColorGradeFX/core/`), an effect **parameter surface + arb-data** grade recipe that drives
   it (theme popup, strength / skin-protection / chroma-gain knobs, plus the persisted
   measured-stats + typed-knob-space recipe), an in-effect **Auto** bake
@@ -18,14 +18,20 @@ SDK plugin.
   params through a pure effect<->window bridge. The **toolkit decision** (native ImGui vs an
   embedded webview reusing Preact) and its rationale live in `docs/adr-editor-ui.md`.
 
-- **Phase 4** (this milestone): a **live clip preview** inside the editor window - the actual
+- **Phase 4** (landed): a **live clip preview** inside the editor window - the actual
   decode+graded clip frame, centered + letterboxed, refreshing on timeline scrub and any
   effect-param change. The idle hook checks the frame out downstream of the effect, a bounded
   per-instance LRU cache keeps scrubbing interactive, and the risky logic is isolated in the
   pure `editor/PreviewCache.h` (see `docs/adr-editor-ui.md`, "Phase 4" section).
 
-Later phases add scopes + before/after and in-effect analysis
-(see `firstmate:native-scope-m2/report.md`).
+- **Phase 5** (this milestone): **in-effect analysis + live scopes + before/after**. The idle
+  hook samples several frames upstream of the effect, decodes each to Rec.709 via the footage
+  profile, and runs the ported `computeStats` over the union (incremental, one checkout per
+  tick), injecting the measured stats over the recipe at render. The editor gains
+  waveform/histogram/vectorscope scopes drawn from the graded preview frame, plus an
+  After/Before/Split toolbar. Risky logic is isolated in the pure `editor/Analysis.h`,
+  `editor/Scopes.h`, and `splitViewGeometry` in `editor/PreviewCache.h`
+  (see `docs/adr-editor-ui.md`, "Phase 5" section).
 
 ## Layout
 
@@ -49,26 +55,32 @@ native/
       Recipe.h                        POD arb-data recipe + <-> Theme/stats + bakeFromRecipe
     lut/CubeLut.h                   ported parseCube + sampleLut (mirrors src/core/lut/cube.ts)
     embedded/EmbeddedLut.h          GENERATED default LUT (teal-orange grade, 17^3)
-    editor/                         Phase 3-4 editor window (see docs/adr-editor-ui.md)
+    editor/                         Phase 3-5 editor window (see docs/adr-editor-ui.md)
       EditorBridge.h                  pure effect<->window seam (edit queue + mapping); headless-tested
-      PreviewCache.h                  Phase 4 pure live-preview core (cache/keying/fit/checkin); headless-tested
-      EditorWindow.h / .cpp           Win32/D3D11/ImGui host + preview texture (no-op stubs off Windows)
+      PreviewCache.h                  Phase 4-5 pure preview core (cache/keying/fit/checkin + split geometry); headless-tested
+      Analysis.h                      Phase 5 pure analysis core (frame-sampling schedule + incremental job + fingerprint/debounce); headless-tested
+      Scopes.h                        Phase 5 pure scope synthesis (waveform/histogram/vectorscope binning -> RGBA8); headless-tested
+      EditorWindow.h / .cpp           Win32/D3D11/ImGui host + preview/scope textures (no-op stubs off Windows)
     Win/ColorGradeFX.vcxproj/.sln   MSBuild project (CPU default; /p:CG_GPU=true builds DirectX + CUDA)
   third_party/imgui/                vendored Dear ImGui v1.91.5 (MIT) + Win32/D3D11 backends
-  docs/adr-editor-ui.md             Phase 3 toolkit decision (ImGui vs webview) + bridge design + Phase 4 preview
+  docs/adr-editor-ui.md             Phase 3 toolkit decision (ImGui vs webview) + bridge design + Phase 4 preview + Phase 5 analysis/scopes
   tests/parity/
     parity_test.cpp                 Phase 1: sampleLut vs TS oracle
     core_parity.cpp                 Phase 2: computeStats / bakeGradeLut / bakeDecodeLut / recipe replay
   tests/editor/
     bridge_test.cpp                 Phase 3: editor<->effect bridge logic (headless, self-asserting)
     preview_test.cpp                Phase 4: live-preview core (cache/keying/fit/checkin; headless, self-asserting)
+    analysis_test.cpp               Phase 5: analysis schedule/job/debounce (headless, self-asserting)
+    scopes_test.cpp                 Phase 5: scope binning + image synthesis (headless, self-asserting)
   scripts/
-    build.sh                        WSL -> NTFS mirror -> MSBuild interop build
+    build.sh                        WSL -> NTFS mirror -> MSBuild interop build (CG_OUT_DIR override for link-verify)
     gen-embedded-lut.ts             bake the embedded LUT header from the TS engine
     parity-test.ts                  Phase 1 parity gate (local, not in CI)
     core-parity-test.ts             Phase 2 cross-engine golden harness (local, not in CI)
     editor-bridge-test.ts           Phase 3 bridge-logic test (local, not in CI)
     preview-test.ts                 Phase 4 live-preview core test (local, not in CI)
+    analysis-test.ts                Phase 5 analysis-core test (local, not in CI)
+    scopes-test.ts                  Phase 5 scope-synthesis test (local, not in CI)
 ```
 
 ## Commands
@@ -79,8 +91,11 @@ npm run native:parity        # Phase 1 LUT-apply parity gate (needs g++/clang; n
 npm run native:core-parity   # Phase 2 full-core cross-engine golden harness (g++/clang; not in CI)
 npm run native:editor-test   # Phase 3 headless editor<->effect bridge logic (g++/clang; not in CI)
 npm run native:preview-test  # Phase 4 headless live-preview core (g++/clang; not in CI)
+npm run native:analysis-test # Phase 5 headless analysis core (g++/clang; not in CI)
+npm run native:scopes-test   # Phase 5 headless scope synthesis (g++/clang; not in CI)
 native/scripts/build.sh Debug          # CPU-only build
 native/scripts/build.sh Release --gpu  # CPU + GPU (DirectX + CUDA) build
+CG_OUT_DIR='C:\dev\cg-verify-out' native/scripts/build.sh Debug  # link-verify without closing AE
 ```
 
 The two parity harnesses are the numerical-correctness evidence and run unattended from WSL;
