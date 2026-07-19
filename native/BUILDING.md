@@ -263,8 +263,9 @@ is ready, verify in AE 2025:
 
 1. **Registers & drags:** AE launched, the effect appears under **Effects & Presets ->
    Color Grade -> "CG Color Grade"**, and drags onto a layer. Effect Controls shows:
-   **Footage** (Rec.709 / V-Log - Correct), **Theme** (Teal-Orange / Warm-Film /
-   Cool-Noir / None (Manual) / Reference Match), **Strength**, **Skin Protection**, **Chroma Gain**,
+   **Footage** (Rec.709 / V-Log - Correct), **Theme** (25 entries: None (Manual) /
+   Teal-Orange / Warm-Film / Cool-Noir / Reference Match, then the 20-look PR #36
+   library), **Strength**, **Skin Protection**, **Chroma Gain**,
    **LUT Source** (Auto / Embedded / External), **Open Editor…** (Phase 3 button), and
    the Phase 6a keyframeable manual params appended at the end: **Exposure**, **Look
    Mix**, **Temperature**. The **Grade Recipe** arb-data param is data-only (no visible

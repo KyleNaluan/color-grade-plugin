@@ -1,5 +1,5 @@
 /*
- * Themes.h - C++ port of the three shipping themes (src/themes/*.ts).
+ * Themes.h - C++ port of all 24 registry looks (src/themes/*.ts).
  *
  * Data only, transcribed verbatim from the TS theme files. The theme data is
  * intentionally duplicated (not generated) so it is a second, independent
