@@ -11,6 +11,7 @@
     "test": "vitest run",
     "spike": "tsx scripts/spike.ts",
     "author": "tsx scripts/authorTheme.ts",
+    "auto-grade": "tsx scripts/autoGrade.ts",
     "dev": "vite",
     "build": "vite build && node scripts/assemble-cep.mjs",
     "lint": "tsx scripts/check-core-purity.ts",
