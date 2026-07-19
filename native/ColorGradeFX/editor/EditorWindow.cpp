@@ -1469,8 +1469,12 @@ void DrawTitleStrip(WindowImpl* w, ParamSnapshot& ui) {
     ImGui::SameLine();
     if (ui.theme == kThemeReferenceIndex)
         ImGui::TextColored(V4(COL_BRASS2), "Reference match");
-    else
-        ImGui::TextColored(V4(COL_INK2), "%s", kThemeNames[(ui.theme - 1 < 0 ? 0 : ui.theme - 1)]);
+    else {
+        int titleThemeIdx = ui.theme - 1;
+        if (titleThemeIdx < 0) titleThemeIdx = 0;
+        if (titleThemeIdx > kThemeCount - 1) titleThemeIdx = kThemeCount - 1;
+        ImGui::TextColored(V4(COL_INK2), "%s", kThemeNames[titleThemeIdx]);
+    }
 
     // right-aligned: analysis chip + Reset all
     ImGuiStyle& style = ImGui::GetStyle();
