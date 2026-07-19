@@ -88,16 +88,17 @@ enum {
 #define CG_FOOTAGE_CHOICES "Rec.709 (standard)|V-Log"
 
 // Theme popup order (1-based in AE); maps to cg::core::getTheme keys. None (Manual)
-// is appended (Phase 6a): adding a popup CHOICE keeps CG_THEME's param index, so
-// existing projects with value 1-3 still resolve.
+// is appended (Phase 6a), Reference Match (Phase 7) after that: adding a popup CHOICE
+// keeps CG_THEME's param index, so existing projects with value 1-4 still resolve.
 enum {
     CG_THEME_TEAL = 1,
     CG_THEME_WARM,
     CG_THEME_COOL,
-    CG_THEME_NONE
+    CG_THEME_NONE,
+    CG_THEME_REFERENCE
 };
-#define CG_THEME_CHOICES "Teal-Orange|Warm-Film|Cool-Noir|None (Manual)"
-#define CG_THEME_COUNT 4
+#define CG_THEME_CHOICES "Teal-Orange|Warm-Film|Cool-Noir|None (Manual)|Reference Match"
+#define CG_THEME_COUNT 5
 
 // LUT-source popup order (1-based). Auto bakes the grade from theme + recipe.
 enum {

@@ -72,7 +72,7 @@ native/
       Theme.h Themes.h                Theme type + the shipping themes (3 stat-match + None/Manual, data, transcribed)
       Engine.h                        buildTransform (manual stage + LGG wheels stage + the grade transform + Look Mix)
       BakeLut.h                       bakeLut / bakeGradeLut / bakeDecodeLut -> cg::Lut3D
-      Recipe.h                        POD arb-data recipe (+ manual block + editor user fields) + <-> Theme/stats + bakeFromRecipe + applyEditorOverrides + v2/v3->v4 migrateRecipeInto
+      Recipe.h                        POD arb-data recipe (+ manual block + editor user fields) + <-> Theme/stats + bakeFromRecipe + applyEditorOverrides + v2/v3->v4 migrateRecipeInto + reference-match theme + stats-sidecar parse
     lut/CubeLut.h                   ported parseCube + sampleLut (mirrors src/core/lut/cube.ts)
     embedded/EmbeddedLut.h          GENERATED default LUT (teal-orange grade, 17^3)
     editor/                         Phase 3-6c editor window (see docs/adr-editor-ui.md)
@@ -86,7 +86,7 @@ native/
   docs/adr-editor-ui.md             Phase 3 toolkit decision (ImGui vs webview) + bridge design + Phase 4 preview + Phase 5 analysis/scopes + Phase 6a manual grade + Phase 6b/6c curves + wheels
   tests/parity/
     parity_test.cpp                 Phase 1: sampleLut vs TS oracle
-    core_parity.cpp                 Phase 2-6c: computeStats / bakeGradeLut / bakeDecodeLut / recipe / manual grade + Look Mix / LGG + editor-override render path / v2/v3->v4 migrate replay
+    core_parity.cpp                 Phase 2-6c: computeStats / bakeGradeLut / bakeDecodeLut / recipe / manual grade + Look Mix / LGG + editor-override render path / v2/v3->v4 migrate replay / reference-match theme + stats-sidecar round-trip
   tests/editor/
     bridge_test.cpp                 Phase 3-6c: editor<->effect bridge logic + curve/wheel round-trip + far-drag monotone (headless, self-asserting)
     preview_test.cpp                Phase 4: live-preview core (cache/keying/fit/checkin; headless, self-asserting)

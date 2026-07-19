@@ -782,8 +782,13 @@ bool DrawTintDisc(const char* id, double ab[2], double scale, float radius) {
 // --- the per-window UI content (the editor's controls) ----------------------
 
 const char* const kFootageNames[] = {"Rec.709 (standard)", "V-Log"};
-const char* const kThemeNames[] = {"Teal-Orange", "Warm-Film", "Cool-Noir", "None (Manual)"};
-constexpr int kThemeCount = 4;
+// "Reference Match" (Phase 7) bakes a Theme from a reference-stats sidecar file (no
+// image codec in native/ - see ColorGrade.cpp's LoadReferenceStats / ThemeFromPopup and
+// data/cg-agents-study/report.md sec 1d); falls back to identity (None/Manual) with no
+// sidecar loaded. The polished drop-zone/picker ships later with the UI overhaul.
+const char* const kThemeNames[] = {"Teal-Orange", "Warm-Film", "Cool-Noir", "None (Manual)",
+                                   "Reference Match"};
+constexpr int kThemeCount = 5;
 const char* const kLutSourceNames[] = {"Auto (Theme + Analysis)", "Embedded (Teal-Orange)",
                                        "External .cube file"};
 

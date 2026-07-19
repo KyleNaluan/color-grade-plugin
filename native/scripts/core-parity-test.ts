@@ -34,6 +34,7 @@ import {
   type ManualGrade,
 } from '../../src/core/engine/engine.js';
 import { bakeGradeLut } from '../../src/core/lut/gradeLut.js';
+import { themeFromReferenceStats } from '../../src/core/engine/referenceTheme.js';
 import { bakeDecodeLut } from '../../src/core/lut/decodeLut.js';
 import { bakeLut, sampleLut, type Lut3D } from '../../src/core/lut/cube.js';
 import { decodePixelToRec709 } from '../../src/core/color/decode.js';
@@ -582,6 +583,43 @@ function main(): void {
   runCpp(ctx, ['migrate']);
   console.log('  migrate  self-test passed (arb-data v2/v3 forward migration)');
 
+  // --- Reference-match parity (Phase 7 "match this look", report sec 1d): a Theme built
+  //     from ONE frame's stats (themeFromReferenceStats / referenceMatchTheme), applied to
+  //     a DIFFERENT frame - proves the C++ port matches the TS oracle bit-exact, cross-
+  //     content, not just self-identity. Reuses the native editor's Theme-popup entry
+  //     point's underlying Theme construction, no image codec involved on either side. ---
+  const referenceMatchT = newTracker();
+  for (const refFrame of [frames[0]!, frames[2]!]) {
+    const refStats = computeStats(refFrame.pixels);
+    const theme = themeFromReferenceStats(refStats);
+    for (const srcFrame of frames) {
+      if (srcFrame === refFrame) continue;
+      const srcStats = computeStats(srcFrame.pixels);
+      for (const { label, opts } of recipeOpts) {
+        const ref: Lut3D = bakeGradeLut(srcStats, theme, opts, 33);
+        const outPath = join(tmp, `referencematch-${refFrame.name}-${srcFrame.name}-${label}.f32`);
+        const hasStr = opts.strength !== undefined ? '1' : '0';
+        const strVal = String(opts.strength ?? 0);
+        const hasSkin = opts.skinProtection !== undefined ? '1' : '0';
+        const skinVal = String(opts.skinProtection ?? 0);
+        runCpp(ctx, [
+          'referencematch',
+          framePaths.get(srcFrame.name)!, String(srcFrame.pixels.length),
+          framePaths.get(refFrame.name)!, String(refFrame.pixels.length),
+          hasStr, strVal, hasSkin, skinVal, '33', outPath,
+        ]);
+        const got = readF32(outPath, ref.data.length);
+        track(referenceMatchT, ref.data, got, `referencematch:${refFrame.name}->${srcFrame.name}/${label}`);
+      }
+    }
+  }
+
+  // --- Reference-stats sidecar text format self-test (the native editor's minimal entry
+  //     point): round-trip + malformed rejection. Self-checks in C++ (exits nonzero on
+  //     failure) - mirrors src/core/analysis/referenceStats.ts's own unit-tested round trip. ---
+  runCpp(ctx, ['referencestatsformat']);
+  console.log('  referencestatsformat  self-test passed (sidecar text round-trip)');
+
   // --- bakeDecodeLut parity: every profile, grade + fine grids ---
   for (const profileKey of Object.keys(PROFILES)) {
     for (const size of [33, 65]) {
@@ -604,8 +642,9 @@ function main(): void {
   report('grade', gradeT);
   report('recipe', recipeT);
   report('decode', decodeT);
+  report('refmatch', referenceMatchT);
 
-  const overall = Math.max(statsT.maxErr, gradeT.maxErr, recipeT.maxErr, decodeT.maxErr);
+  const overall = Math.max(statsT.maxErr, gradeT.maxErr, recipeT.maxErr, decodeT.maxErr, referenceMatchT.maxErr);
   console.log(`core-parity-test: overall maxAbsErr=${overall.toExponential(3)} (tol=${TOL})`);
   if (overall > TOL) {
     console.error(`core-parity-test: FAIL - max error ${overall} exceeds tolerance ${TOL}`);

@@ -22,11 +22,14 @@
  * `*decode` family (Phase 3 decode composition), `grademanual`/`recipemanual` (Phase 6a
  * manual stage + arb round-trip), `gradelgg`/`recipelgg` (Phase 6c DaVinci LGG stage),
  * `recipeeditor` (the Phase 6b/6c `applyEditorOverrides` render-path composition guard),
- * and `migrate` (v2/v3 -> v4 recipe migration).
+ * `migrate` (v2/v3 -> v4 recipe migration), `referencematch` (Phase 7 reference-image
+ * look matching, report sec 1d), and `referencestatsformat` (the reference-stats
+ * sidecar text format self-test).
  *
  * Buffers are raw little-endian arrays (matching JS Float32Array / Float64Array)
  * on the shared x86-64 host; not a portable serialization, just a test channel.
  */
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -564,6 +567,69 @@ int main(int argc, char** argv) {
         }
         std::printf(fail ? "  migrate  FAIL\n"
                          : "  migrate  PASS (v2->v4, v3->v4 forward, verbatim, reseed)\n");
+        return fail;
+    }
+
+    if (cmd == "referencematch" && argc == 12) {
+        // Phase 7 "match this look" (data/cg-agents-study/report.md sec 1d): a Theme
+        // built from ONE frame's stats (referenceMatchTheme), applied to a DIFFERENT
+        // frame - proves the C++ port matches the TS oracle (themeFromReferenceStats)
+        // bit-exact, cross-content, not just self-identity.
+        const size_t nSrc = static_cast<size_t>(std::strtoull(argv[3], nullptr, 10));
+        std::vector<float> srcPx = readF32(argv[2], nSrc);
+        const size_t nRef = static_cast<size_t>(std::strtoull(argv[5], nullptr, 10));
+        std::vector<float> refPx = readF32(argv[4], nRef);
+        EngineOptions opts;
+        if (std::atoi(argv[6])) opts.strength = std::atof(argv[7]);
+        if (std::atoi(argv[8])) opts.skinProtection = std::atof(argv[9]);
+        const int size = std::atoi(argv[10]);
+        FootageStats srcStats = computeStats(srcPx.data(), srcPx.size());
+        FootageStats refStats = computeStats(refPx.data(), refPx.size());
+        Theme theme = referenceMatchTheme(refStats);
+        cg::Lut3D lut = bakeGradeLut(srcStats, theme, opts, size);
+        writeF32(argv[11], lut.data);
+        return 0;
+    }
+
+    if (cmd == "referencestatsformat" && argc == 2) {
+        // Self-checking round-trip test for the reference-stats sidecar text format (the
+        // native editor's minimal entry point, ColorGrade.cpp's LoadReferenceStats): write
+        // -> parse recovers the same values; malformed input is rejected; comma-separated
+        // input (matching the TS tokenizer) parses too. Exit nonzero on any failure.
+        int fail = 0;
+        StatsData d{};
+        for (int i = 0; i < STATS_FIELDS; i++) d.v[i] = (i + 1) * 0.123456789 - 3.0;
+        const std::string text = formatReferenceStatsText(d);
+        StatsData parsed{};
+        if (!parseReferenceStatsText(text, parsed)) {
+            std::fprintf(stderr, "referencestatsformat: parse failed\n");
+            fail = 1;
+        }
+        for (int i = 0; i < STATS_FIELDS; i++) {
+            if (std::fabs(parsed.v[i] - d.v[i]) > 1e-9) {
+                std::fprintf(stderr, "referencestatsformat: mismatch at field %d\n", i);
+                fail = 1;
+            }
+        }
+        StatsData bogus{};
+        if (parseReferenceStatsText("1 2 3", bogus)) {
+            std::fprintf(stderr, "referencestatsformat: accepted malformed (too few tokens)\n");
+            fail = 1;
+        }
+        std::string tooMany = text + "1.0\n";
+        if (parseReferenceStatsText(tooMany, bogus)) {
+            std::fprintf(stderr, "referencestatsformat: accepted malformed (too many tokens)\n");
+            fail = 1;
+        }
+        std::string csv;
+        for (int i = 0; i < STATS_FIELDS; i++) csv += "0.5, ";
+        StatsData csvParsed{};
+        if (!parseReferenceStatsText(csv, csvParsed) || csvParsed.v[0] != 0.5) {
+            std::fprintf(stderr, "referencestatsformat: comma-separated parse failed\n");
+            fail = 1;
+        }
+        std::printf(fail ? "  referencestatsformat  FAIL\n"
+                         : "  referencestatsformat  PASS (round-trip, malformed rejected, csv)\n");
         return fail;
     }
 

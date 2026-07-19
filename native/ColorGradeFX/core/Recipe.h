@@ -19,9 +19,13 @@
 #define CG_CORE_RECIPE_H
 
 #include <array>
+#include <cctype>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <string>
 #include <vector>
 
 #include "../lut/CubeLut.h"
@@ -177,6 +181,65 @@ inline FootageStats statsFromData(const StatsData& d) {
     s.skinPresence = d.v[18];
     s.clipping = {d.v[19], d.v[20]};
     return s;
+}
+
+// --- reference-match (Phase 7, "match this look" - data/cg-agents-study/report.md sec
+//     1d): a reference still is just a Theme whose target stats are computed live. No
+//     image codec lives in native/, so the native editor's minimal entry point is the
+//     Theme popup's "Reference Match" choice (ColorGrade.cpp's ThemeFromPopup), which
+//     loads a small text sidecar of pre-computed stats - the actual image decode +
+//     computeStats happens on the TS side (src/panel/referenceMatch.ts), where the
+//     tested FrameSource/TIFF/PNG pipeline already lives. ---------------------------
+
+// Build the reference-matched Theme: NO authored overrides, matchStats left true, so
+// the engine's full automatic look (tone-curve stat match, LAB transfer, per-band
+// chroma scale, AND the chroma-overshoot guard) applies exactly as for any other
+// theme - zero new engine math. See src/core/engine/referenceTheme.ts's doc comment
+// (the TS oracle for this Theme shape) for the artifact-risk limitations this does
+// NOT solve (that guard only engages on large tone-curve stretch, not small-stretch
+// local chroma noise) - unchanged by the native port, since there is no new logic here.
+inline Theme referenceMatchTheme(const FootageStats& stats) {
+    Theme t;
+    t.name = "reference-match";
+    t.description = "Look matched from a reference image (stat transfer, no authored overrides).";
+    t.targetStats = stats;
+    t.matchStats = true;
+    t.knobs = {1.0, 0.5};
+    return t;
+}
+
+// Parse the reference-stats sidecar text format: STATS_FIELDS (21) whitespace/comma-
+// separated decimal numbers in the canonical StatsData order (see statsToData). Mirrors
+// (and round-trips against) the TS writer/parser (src/core/analysis/referenceStats.ts).
+// Hand-rolled (no JSON dependency), same spirit as CubeLut.h's hand-rolled .cube parser.
+// Returns false (leaving `out` untouched) on malformed input (wrong token count).
+inline bool parseReferenceStatsText(const std::string& text, StatsData& out) {
+    StatsData d{};
+    int count = 0;
+    size_t i = 0;
+    while (i < text.size() && count < STATS_FIELDS) {
+        while (i < text.size() && (std::isspace(static_cast<unsigned char>(text[i])) || text[i] == ',')) i++;
+        const size_t start = i;
+        while (i < text.size() && !std::isspace(static_cast<unsigned char>(text[i])) && text[i] != ',') i++;
+        if (i == start) break;
+        d.v[count++] = std::strtod(text.substr(start, i - start).c_str(), nullptr);
+    }
+    while (i < text.size() && (std::isspace(static_cast<unsigned char>(text[i])) || text[i] == ',')) i++;
+    if (count != STATS_FIELDS || i != text.size()) return false;  // wrong token count
+    out = d;
+    return true;
+}
+
+// Serialize a StatsData in the canonical order, one value per line - the counterpart to
+// parseReferenceStatsText, exercised by the parity harness's round-trip self-test.
+inline std::string formatReferenceStatsText(const StatsData& d) {
+    std::string out;
+    char buf[64];
+    for (int i = 0; i < STATS_FIELDS; i++) {
+        std::snprintf(buf, sizeof(buf), "%.17g\n", d.v[i]);
+        out += buf;
+    }
+    return out;
 }
 
 // --- curve <-> CurveData ---------------------------------------------------

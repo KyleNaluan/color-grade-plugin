@@ -273,8 +273,29 @@ static bool LoadExternalCube(cg::Lut3D& outLut) {
     }
     return false;
 }
+
+// Resolve the reference-match stats sidecar (Phase 7, "match this look" - data/cg-agents-
+// study/report.md sec 1d): env CG_REF_STATS_PATH first, then <pluginDir>/ColorGrade_Reference.stats.
+// Mirrors LoadExternalCube's resolution order exactly. No image codec lives in native/, so
+// the sidecar is pre-computed stats (written by src/core/analysis/referenceStats.ts's
+// writeReferenceStatsFile), not the reference image itself - this is the minimal native
+// entry point; a polished drop-zone/picker ships later with the UI overhaul.
+static bool LoadReferenceStats(cg::core::StatsData& out) {
+    std::string text;
+    wchar_t envBuf[MAX_PATH * 4];
+    DWORD envLen = ::GetEnvironmentVariableW(L"CG_REF_STATS_PATH", envBuf, sizeof(envBuf) / sizeof(envBuf[0]));
+    if (envLen > 0 && envLen < sizeof(envBuf) / sizeof(envBuf[0])) {
+        if (ReadFileTextW(std::wstring(envBuf, envLen), text) && cg::core::parseReferenceStatsText(text, out)) {
+            return true;
+        }
+    }
+    std::wstring sidecar = ModuleDirW() + L"ColorGrade_Reference.stats";
+    if (ReadFileTextW(sidecar, text) && cg::core::parseReferenceStatsText(text, out)) return true;
+    return false;
+}
 #else
 static bool LoadExternalCube(cg::Lut3D&) { return false; }
+static bool LoadReferenceStats(cg::core::StatsData&) { return false; }
 #endif
 
 // Fill dst with the LUT chosen by the source popup, always leaving a valid LUT.
@@ -291,6 +312,16 @@ static cg::core::Theme ThemeFromPopup(A_long themePopup) {
         case CG_THEME_WARM: return cg::core::warmFilmTheme();
         case CG_THEME_COOL: return cg::core::coolNoirTheme();
         case CG_THEME_NONE: return cg::core::noneManualTheme();
+        case CG_THEME_REFERENCE: {
+            // Phase 7 "match this look" (data/cg-agents-study/report.md sec 1d): the
+            // reference stats live in a sidecar file (LoadReferenceStats), computed on the
+            // TS side where the real image decode pipeline lives (no image codec here).
+            // No sidecar loaded yet -> safe identity fallback (None/Manual), never a crash
+            // or a silent bogus grade.
+            cg::core::StatsData d;
+            if (LoadReferenceStats(d)) return cg::core::referenceMatchTheme(cg::core::statsFromData(d));
+            return cg::core::noneManualTheme();
+        }
         case CG_THEME_TEAL:
         default: return cg::core::tealOrangeTheme();
     }
