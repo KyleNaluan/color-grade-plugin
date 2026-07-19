@@ -1,12 +1,12 @@
 /**
- * Tuning-evidence helper for the spike CLI: measures what a built transform
- * actually does to a frame's pixels, beyond the raw stats printout.
- *
- * Not part of the shipped engine - lives outside src/core so it can pull in
- * Node/analysis utilities freely; the engine itself stays pure.
+ * Grade-impact measurement: what a built transform actually does to a
+ * frame's pixels, beyond the raw stats printout. This is the numeric
+ * evidence source for theme-tuning decisions (see `npm run spike`'s
+ * grade-impact report) and the input signal for the round-over-round
+ * regression guard in `gradeGuard.ts`.
  */
-import { computeStats, encodedRec709ToLab, labHueDeg, skinWedgeWeight, type FootageStats } from '../../src/core/analysis/stats.js';
-import type { Transform } from '../../src/core/engine/engine.js';
+import { computeStats, encodedRec709ToLab, labHueDeg, skinWedgeWeight, type FootageStats } from './stats.js';
+import type { Transform } from '../engine/engine.js';
 
 export interface GradeImpact {
   /** Stats of the graded output, directly comparable to the input stats printout. */
