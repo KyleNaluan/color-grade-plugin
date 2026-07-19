@@ -315,6 +315,13 @@ static void BakeAutoLut(A_long themePopup, A_long footagePopup, double strength0
     cg::core::ThemeOverrides ov = theme.overrides.value_or(cg::core::ThemeOverrides{});
     const double authored = ov.chromaGain.value_or(1.0);
     ov.chromaGain = authored * chromaGain;  // slider scales the theme's authored gain
+
+    // Phase 6b/6c: COMPOSE the editor-owned layers (curves / 3-way tints) onto the popup
+    // theme's authored look via the SAME core helper the pure themeFromRecipe path uses. The
+    // theme LOOK stays popup-driven; only these user edits come from the recipe, so switching
+    // themes never applies a stale editor override and an old grade with no edits bakes exactly
+    // the theme. User curves REPLACE the theme's authored curve per slot; user 3-way tints ADD.
+    cg::core::applyEditorOverrides(ov, recipe);
     theme.overrides = ov;
 
     cg::core::FootageStats src = cg::core::statsFromData(recipe.sourceStats);
@@ -328,6 +335,8 @@ static void BakeAutoLut(A_long themePopup, A_long footagePopup, double strength0
     manual.exposure = exposure;
     manual.temperature = temperature;
     opts.manual = manual;
+    // Phase 6c: the Lift/Gamma/Gain wheels are editor state carried in the recipe.
+    opts.lgg = cg::core::lggFromRecipe(recipe);
     opts.lookMix = lookMix;
 
     // Correct + Grade in one baked LUT. When the clip is a log profile (V-Log), the
@@ -639,6 +648,84 @@ static void ApplyManualStateToRecipe(const cg::editor::ManualState& m, RecipeDat
     r.manualVibrance = m.vibrance;
 }
 
+// --- Curves (Phase 6b): recipe CurveData <-> bridge CurveState ---------------
+static cg::editor::CurveState CurveStateFromData(const cg::core::CurveData& c) {
+    cg::editor::CurveState s;
+    int n = c.count < 0 ? 0 : c.count;
+    if (n > cg::editor::CG_EDIT_MAX_CURVE_POINTS) n = cg::editor::CG_EDIT_MAX_CURVE_POINTS;
+    s.count = n;
+    for (int i = 0; i < n; ++i) { s.x[i] = c.pts[i][0]; s.y[i] = c.pts[i][1]; }
+    return s;
+}
+static void CurveStateToData(const cg::editor::CurveState& s, cg::core::CurveData& c) {
+    int n = s.count < 0 ? 0 : s.count;
+    if (n > cg::core::RECIPE_MAX_POINTS) n = cg::core::RECIPE_MAX_POINTS;
+    c = cg::core::CurveData{};
+    c.count = n;
+    for (int i = 0; i < n; ++i) { c.pts[i][0] = s.x[i]; c.pts[i][1] = s.y[i]; }
+}
+// The Curves tab is EDITOR-OWNED (writes the recipe's userToneCurve/userChannelR/G/B),
+// distinct from the theme-seeded toneCurve/channelR/G/B. For DISPLAY the tab shows the
+// EFFECTIVE curve per slot: the user's curve if present, else the picked theme's authored
+// curve (so the user edits from the theme's curve as a starting point). The bake mirrors
+// this per-slot replace (BakeAutoLut). `themePopup` supplies the theme fallback.
+static cg::editor::CurvesState CurvesStateForDisplay(const RecipeData& r, A_long themePopup) {
+    cg::core::Theme theme = ThemeFromPopup(themePopup);
+    cg::core::ThemeOverrides ov = theme.overrides.value_or(cg::core::ThemeOverrides{});
+    cg::core::ChannelCurves cc = ov.channelCurves.value_or(cg::core::ChannelCurves{});
+    auto pick = [](const cg::core::CurveData& user,
+                   const std::optional<std::vector<cg::core::CurvePoint>>& authored) {
+        if (user.count > 0) return CurveStateFromData(user);
+        return CurveStateFromData(cg::core::curveToData(authored));
+    };
+    cg::editor::CurvesState s;
+    s.master = pick(r.userToneCurve, ov.toneCurve);
+    s.r = pick(r.userChannelR, cc.r);
+    s.g = pick(r.userChannelG, cc.g);
+    s.b = pick(r.userChannelB, cc.b);
+    return s;
+}
+static void ApplyCurvesStateToRecipe(const cg::editor::CurvesState& s, RecipeData& r) {
+    CurveStateToData(s.master, r.userToneCurve);
+    CurveStateToData(s.r, r.userChannelR);
+    CurveStateToData(s.g, r.userChannelG);
+    CurveStateToData(s.b, r.userChannelB);
+}
+
+// --- Wheels (Phase 6c): recipe LGG triples + additive 3-way user tints <-> WheelsState.
+// The LGG triples are the primary face; the Adobe 3-way secondary mode's color discs are
+// the editor's ADDITIVE user band tints (userShadowTint/...), distinct from the theme's
+// authored band tints, and its per-band luminance reuses the LGG masters. No new engine math.
+static cg::editor::WheelsState WheelsStateFromRecipe(const RecipeData& r) {
+    cg::editor::WheelsState s;
+    for (int c = 0; c < 3; ++c) { s.lift[c] = r.lift[c]; s.gamma[c] = r.gamma[c]; s.gain[c] = r.gain[c]; }
+    s.shadowTint[0] = r.userShadowTint[0]; s.shadowTint[1] = r.userShadowTint[1];
+    s.hasShadowTint = r.userShadowTint[0] != 0.0 || r.userShadowTint[1] != 0.0;
+    s.midTint[0] = r.userMidTint[0]; s.midTint[1] = r.userMidTint[1];
+    s.hasMidTint = r.userMidTint[0] != 0.0 || r.userMidTint[1] != 0.0;
+    s.highTint[0] = r.userHighTint[0]; s.highTint[1] = r.userHighTint[1];
+    s.hasHighTint = r.userHighTint[0] != 0.0 || r.userHighTint[1] != 0.0;
+    s.mode = static_cast<int>(r.wheelsMode);
+    return s;
+}
+static void ApplyWheelsStateToRecipe(const cg::editor::WheelsState& s, RecipeData& r) {
+    for (int c = 0; c < 3; ++c) { r.lift[c] = s.lift[c]; r.gamma[c] = s.gamma[c]; r.gain[c] = s.gain[c]; }
+    r.userShadowTint[0] = s.shadowTint[0]; r.userShadowTint[1] = s.shadowTint[1];
+    r.userMidTint[0] = s.midTint[0]; r.userMidTint[1] = s.midTint[1];
+    r.userHighTint[0] = s.highTint[0]; r.userHighTint[1] = s.highTint[1];
+    r.wheelsMode = static_cast<uint32_t>(s.mode);
+}
+
+// Dispatch one recipe-backed edit (Manual/Curves/Wheels) into the recipe blob.
+static void ApplyRecipeEditToRecipe(const cg::editor::ParamEdit& e, RecipeData& r) {
+    switch (e.field) {
+        case cg::editor::EditField::Manual: ApplyManualStateToRecipe(e.manual, r); break;
+        case cg::editor::EditField::Curves: ApplyCurvesStateToRecipe(e.curves, r); break;
+        case cg::editor::EditField::Wheels: ApplyWheelsStateToRecipe(e.wheels, r); break;
+        default: break;
+    }
+}
+
 static cg::editor::ParamSnapshot MakeSnapshot(A_long footage, A_long theme, double strength01,
                                               double skin01, double chromaFrac, A_long source,
                                               double exposure, double lookMix, double temperature,
@@ -654,6 +741,8 @@ static cg::editor::ParamSnapshot MakeSnapshot(A_long footage, A_long theme, doub
     s.lookMix = lookMix;
     s.temperature = temperature;
     s.manual = ManualStateFromRecipe(recipe);
+    s.curves = CurvesStateForDisplay(recipe, theme);
+    s.wheels = WheelsStateFromRecipe(recipe);
     s.recipeHash = RecipeHash(recipe);
     s.revision = g_snapshotRevision.fetch_add(1);
     return s;
@@ -712,14 +801,16 @@ static void ApplyEditorEdits(PF_InData* in_data, PF_ParamDef* params[]) {
                     cg::editor::clampRange(e.value, CG_TEMPERATURE_MIN, CG_TEMPERATURE_MAX);
                 params[CG_TEMPERATURE]->uu.change_flags |= PF_ChangeFlag_CHANGED_VALUE;
                 break;
-            case cg::editor::EditField::Manual: {
-                // Recipe-backed manual controls: mutate the CG_RECIPE arb handle in
-                // place (the SDK-sanctioned ColorGrid pattern) and flag CHANGED_VALUE.
+            case cg::editor::EditField::Manual:
+            case cg::editor::EditField::Curves:
+            case cg::editor::EditField::Wheels: {
+                // Recipe-backed controls (manual / curves / wheels): mutate the CG_RECIPE
+                // arb handle in place (the SDK-sanctioned ColorGrid pattern) + CHANGED_VALUE.
                 PF_ArbitraryH arbH = params[CG_RECIPE]->u.arb_d.value;
                 if (arbH) {
                     RecipeData* rp = reinterpret_cast<RecipeData*>(PF_LOCK_HANDLE(arbH));
                     if (rp) {
-                        ApplyManualStateToRecipe(e.manual, *rp);
+                        ApplyRecipeEditToRecipe(e, *rp);
                         PF_UNLOCK_HANDLE(arbH);
                         params[CG_RECIPE]->uu.change_flags |= PF_ChangeFlag_CHANGED_VALUE;
                     }
@@ -752,7 +843,9 @@ static bool StreamForEdit(const cg::editor::ParamEdit& e, PF_ParamIndex& idx, do
         case F::Exposure:       idx = CG_EXPOSURE;        one_d = cg::editor::clampRange(e.value, CG_EXPOSURE_MIN, CG_EXPOSURE_MAX); return true;
         case F::LookMix:        idx = CG_LOOK_MIX;        one_d = cg::editor::clamp01(e.value) * 100.0; return true;
         case F::Temperature:    idx = CG_TEMPERATURE;     one_d = cg::editor::clampRange(e.value, CG_TEMPERATURE_MIN, CG_TEMPERATURE_MAX); return true;
-        case F::Manual:         return false;  // recipe arb write, handled out-of-band (idle hook)
+        case F::Manual:                        // recipe arb writes, handled out-of-band (idle hook)
+        case F::Curves:
+        case F::Wheels:         return false;
     }
     return false;
 }
@@ -1023,10 +1116,12 @@ static bool PollSnapshotViaAegp(AEGP_SuiteHandler& sh, AEGP_EffectRefH effectH, 
     s.exposure = exposure;
     s.lookMix = lookMix / 100.0;
     s.temperature = temperature;
-    // Recipe-backed manual state (best-effort; keeps the last value if the arb read fails).
+    // Recipe-backed state (best-effort; keeps the last value if the arb read fails).
     RecipeData recipe;
     if (ReadRecipeViaAegp(sh, effectH, recipe)) {
         s.manual = ManualStateFromRecipe(recipe);
+        s.curves = CurvesStateForDisplay(recipe, static_cast<A_long>(theme + 0.5));
+        s.wheels = WheelsStateFromRecipe(recipe);
         s.recipeHash = RecipeHash(recipe);
     }
     return true;
@@ -1559,11 +1654,11 @@ static A_Err CG_IdleHook(AEGP_GlobalRefcon, AEGP_IdleRefcon, A_long* max_sleepPL
                         AEGP_SuiteHandler sh(g_spbasic);
                         sh.UtilitySuite6()->AEGP_StartUndoGroup("Color Grade editor edit");
                         for (const auto& e : edits) {
-                            // Recipe-backed manual controls (Phase 6a): read-modify-write the
-                            // CG_RECIPE arb stream (its arbH is an A_Handle to the RecipeData
-                            // bytes; lock via the PF HandleSuite, mutate the 9 manual fields,
-                            // set it back). Kept out of the scalar StreamForEdit path.
-                            if (e.field == cg::editor::EditField::Manual) {
+                            // Recipe-backed controls (manual / curves / wheels): read-modify-write
+                            // the CG_RECIPE arb stream (its arbH is an A_Handle to the RecipeData
+                            // bytes; lock via the PF HandleSuite, mutate the relevant fields, set
+                            // it back). Kept out of the scalar StreamForEdit path.
+                            if (cg::editor::isRecipeBackedField(e.field)) {
                                 AEGP_StreamRefH rstreamH = nullptr;
                                 if (sh.StreamSuite5()->AEGP_GetNewEffectStreamByIndex(
                                         g_aegpId, effectH, CG_RECIPE, &rstreamH) ||
@@ -1582,7 +1677,7 @@ static A_Err CG_IdleHook(AEGP_GlobalRefcon, AEGP_IdleRefcon, A_long* max_sleepPL
                                             sh.HandleSuite1()->host_lock_handle(
                                                 reinterpret_cast<PF_Handle>(rval.val.arbH)));
                                         if (rp) {
-                                            ApplyManualStateToRecipe(e.manual, *rp);
+                                            ApplyRecipeEditToRecipe(e, *rp);
                                             sh.HandleSuite1()->host_unlock_handle(
                                                 reinterpret_cast<PF_Handle>(rval.val.arbH));
                                             sh.StreamSuite5()->AEGP_SetStreamValue(g_aegpId, rstreamH, &rval);

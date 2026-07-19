@@ -1,12 +1,16 @@
 /*
- * core-parity-test.ts - Phase 2 cross-engine golden harness.
+ * core-parity-test.ts - Phase 2-6c cross-engine golden harness.
  *
  * Proves the C++ core port (native/ColorGradeFX/core/*.h) matches the TS oracle
  * (src/core/*) within TOL (~1e-4) end to end:
  *   - computeStats over representative synthetic frames,
  *   - bakeGradeLut(computeStats(frame), theme, opts) across all shipping themes
- *     and the typed knob space (strength / skinProtection overrides), and
- *   - bakeDecodeLut for every profile in PROFILES.
+ *     and the typed knob space (strength / skinProtection overrides),
+ *   - bakeDecodeLut for every profile in PROFILES,
+ *   - the arb-data recipe round-trip and later-phase stages: the Phase 6a manual
+ *     grade + Look Mix, the Phase 6c DaVinci LGG wheel stage, the Phase 6b/6c
+ *     `applyEditorOverrides` render-path composition (curves + wheel tints), and
+ *     the v2/v3 -> v4 recipe migration.
  *
  * The TS side generates the golden vectors; the C++ side (tests/parity/core_parity.cpp)
  * replays the SAME chain natively and writes its results as raw f32/f64 buffers,
@@ -493,10 +497,90 @@ function main(): void {
     }
   }
 
-  // --- Versioned arb-data migration self-test (Phase 6a landmine): old grades must
+  // --- Lift/Gamma/Gain wheels parity (Phase 6c): the new LGG stage baked in both
+  //     engines, direct (gradelgg) and carried through the arb-data recipe (recipelgg).
+  //     Presets cover lift (blacks), gamma (mids), gain (whites), and a combined push,
+  //     with a per-channel color balance so each of R/G/B exercises its own operator. ---
+  const lggCsv = (lg: { lift: number[]; gamma: number[]; gain: number[] }): string =>
+    [...lg.lift, ...lg.gamma, ...lg.gain].join(',');
+  const lggPresets: { label: string; lgg: { lift: number[]; gamma: number[]; gain: number[] } }[] = [
+    { label: 'lift', lgg: { lift: [0.06, 0.02, -0.04], gamma: [1, 1, 1], gain: [1, 1, 1] } },
+    { label: 'gamma', lgg: { lift: [0, 0, 0], gamma: [1.25, 1.0, 0.82], gain: [1, 1, 1] } },
+    { label: 'gain', lgg: { lift: [0, 0, 0], gamma: [1, 1, 1], gain: [1.18, 1.0, 0.88] } },
+    {
+      label: 'combined',
+      lgg: { lift: [0.04, 0.0, -0.03], gamma: [0.9, 1.05, 1.12], gain: [1.12, 1.0, 0.93] },
+    },
+  ];
+  for (const [themeName, theme] of Object.entries(THEMES)) {
+    for (const f of [frames[0]!, frames[2]!]) {
+      const stats = computeStats(f.pixels);
+      for (const preset of lggPresets) {
+        for (const { label: optLabel, opts } of manualOpts) {
+          const fullOpts: EngineOptions = { ...opts, lgg: preset.lgg as EngineOptions['lgg'] };
+          const ref: Lut3D = bakeGradeLut(stats, theme, fullOpts, 33);
+          const hasStr = opts.strength !== undefined ? '1' : '0';
+          const strVal = String(opts.strength ?? 0);
+          const hasSkin = opts.skinProtection !== undefined ? '1' : '0';
+          const skinVal = String(opts.skinProtection ?? 0);
+          const csv = lggCsv(preset.lgg);
+          const outDirect = join(tmp, `gradelgg-${themeName}-${f.name}-${preset.label}-${optLabel}.f32`);
+          runCpp(ctx, [
+            'gradelgg', framePaths.get(f.name)!, String(f.pixels.length),
+            themeName, hasStr, strVal, hasSkin, skinVal, '33', csv, outDirect,
+          ]);
+          track(gradeT, ref.data, readF32(outDirect, ref.data.length),
+            `gradelgg:${themeName}/${f.name}/${preset.label}/${optLabel}`);
+          const outRecipe = join(tmp, `recipelgg-${themeName}-${f.name}-${preset.label}-${optLabel}.f32`);
+          runCpp(ctx, [
+            'recipelgg', framePaths.get(f.name)!, String(f.pixels.length),
+            themeName, hasStr, strVal, hasSkin, skinVal, '33', csv, outRecipe,
+          ]);
+          track(recipeT, ref.data, readF32(outRecipe, ref.data.length),
+            `recipelgg:${themeName}/${f.name}/${preset.label}/${optLabel}`);
+        }
+      }
+    }
+  }
+
+  // --- Editor-layer composition parity (Phase 6b/6c render-path guard): the effect's Auto
+  //     bake COMPOSES the editor-owned layers (user curves REPLACE the theme's authored curve
+  //     per slot; 3-way user tints ADD to the authored band tints) via `applyEditorOverrides`,
+  //     the SAME core helper themeFromRecipe/bakeFromRecipe use. Seed a recipe from the theme,
+  //     stamp the user curve + user shadow tint into the USER fields, and bake via the recipe
+  //     path; it must match a TS oracle theme built with the composed overrides. This is the
+  //     regression that would have caught "editor curve/tint edits never reach the baked LUT". ---
+  const userMasterCurve: [number, number][] = [[0, 0], [0.3, 0.18], [0.7, 0.82], [1, 1]];
+  const userShadowTint: [number, number] = [10, -6];
+  for (const [themeName, theme] of Object.entries(THEMES)) {
+    for (const f of [frames[0]!, frames[2]!]) {
+      const stats = computeStats(f.pixels);
+      const authored = theme.overrides ?? {};
+      const composed = {
+        ...authored,
+        toneCurve: userMasterCurve, // user curve REPLACES the authored master curve
+        shadowTint: [
+          (authored.shadowTint?.[0] ?? 0) + userShadowTint[0],
+          (authored.shadowTint?.[1] ?? 0) + userShadowTint[1],
+        ] as [number, number],
+      };
+      const oracleTheme = { ...theme, overrides: composed };
+      const ref: Lut3D = bakeGradeLut(stats, oracleTheme, {}, 33);
+      const curveCsv = userMasterCurve.flat().join(',');
+      const outPath = join(tmp, `recipeeditor-${themeName}-${f.name}.f32`);
+      runCpp(ctx, [
+        'recipeeditor', framePaths.get(f.name)!, String(f.pixels.length),
+        themeName, curveCsv, String(userShadowTint[0]), String(userShadowTint[1]), outPath,
+      ]);
+      track(recipeT, ref.data, readF32(outPath, ref.data.length),
+        `recipeeditor:${themeName}/${f.name}`);
+    }
+  }
+
+  // --- Versioned arb-data migration self-test (the recipe landmine): old grades must
   //     survive the RECIPE_VERSION bump. Self-checks in C++ (exits nonzero on failure). ---
   runCpp(ctx, ['migrate']);
-  console.log('  migrate  self-test passed (arb-data v2->v3 forward migration)');
+  console.log('  migrate  self-test passed (arb-data v2/v3 forward migration)');
 
   // --- bakeDecodeLut parity: every profile, grade + fine grids ---
   for (const profileKey of Object.keys(PROFILES)) {

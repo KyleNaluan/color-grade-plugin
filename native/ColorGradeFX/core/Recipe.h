@@ -35,10 +35,11 @@ namespace core {
 
 constexpr uint32_t RECIPE_MAGIC = 0x43475244;  // 'CGRD'
 // v2 added midtoneTint (PR #24). v3 (Phase 6a) added the matchStats flag + the
-// manual primary-correction block + lookMix. The unflatten handler MIGRATES older
-// versions forward (copy the shared prefix, default the new fields) rather than
-// reseeding, so grades saved by an earlier build survive - see ColorGrade.cpp.
-constexpr uint32_t RECIPE_VERSION = 3;
+// manual primary-correction block + lookMix. v4 (Phase 6c) added the DaVinci
+// Lift/Gamma/Gain wheels + the editor wheels-mode flag. The unflatten handler
+// MIGRATES older versions forward (copy the shared prefix, default the new fields)
+// rather than reseeding, so grades saved by an earlier build survive - see ColorGrade.cpp.
+constexpr uint32_t RECIPE_VERSION = 4;
 constexpr int RECIPE_MAX_POINTS = 16;
 constexpr int STATS_FIELDS = 21;
 
@@ -102,7 +103,51 @@ struct RecipeData {
     double manualSaturation = 1.0;
     double manualVibrance = 0.0;
     double lookMix = 1.0;
+
+    // --- v4 (Phase 6b/6c) additions. Kept AFTER all v3 fields so a v3 blob's bytes
+    //     land identically and the migration only defaults these. `lift` MUST stay the
+    //     FIRST v4 field (RECIPE_V3_SIZE == offsetof(RecipeData, lift)). ---
+    //
+    // These are EDITOR-OWNED fields, distinct from the theme-seeded overrides above
+    // (toneCurve/shadowTint/... which recipeFromTheme seeds from the picked theme).
+    // The effect's Auto bake takes the theme LOOK from the Theme popup, then COMPOSES
+    // these editor layers on top: user curves REPLACE the theme's authored curve per
+    // slot; user 3-way tints ADD to the theme's authored band tints; LGG is its own
+    // engine stage. All default to neutral/empty, so an old grade (v2/v3) or a
+    // theme with no edits bakes exactly the theme look - and switching themes never
+    // applies a stale editor override.
+    //
+    // DaVinci Lift/Gamma/Gain wheels. Neutral (lift 0, gamma 1, gain 1) = exact identity.
+    double lift[3] = {0.0, 0.0, 0.0};
+    double gamma[3] = {1.0, 1.0, 1.0};
+    double gain[3] = {1.0, 1.0, 1.0};
+    // Curves tab (6b): user master + per-channel curves. count 0 = absent (the theme's
+    // authored curve is used for that slot); present = replaces it.
+    CurveData userToneCurve{};
+    CurveData userChannelR{};
+    CurveData userChannelG{};
+    CurveData userChannelB{};
+    // Adobe 3-way (6c) per-band color discs -> LAB [a,b] tints, ADDED to the theme's
+    // authored band tints. {0,0} = no user tint. Distinct from the theme-seeded
+    // shadowTint/midtoneTint/highlightTint above so a theme switch stays clean.
+    double userShadowTint[2] = {0.0, 0.0};
+    double userMidTint[2] = {0.0, 0.0};
+    double userHighTint[2] = {0.0, 0.0};
+    // Which wheels face the editor last showed (0 = Lift/Gamma/Gain, 1 = Adobe
+    // 3-way). Pure UI state; the engine ignores it.
+    uint32_t wheelsMode = 0;
 };
+
+// Combine a theme-authored band tint (optional) with the editor's additive user tint.
+inline std::optional<std::array<double, 2>> combineBandTint(
+    const std::optional<std::array<double, 2>>& authored, const double user[2]) {
+    const bool hasUser = user[0] != 0.0 || user[1] != 0.0;
+    if (!authored && !hasUser) return std::nullopt;
+    const double a0 = authored ? (*authored)[0] : 0.0;
+    const double a1 = authored ? (*authored)[1] : 0.0;
+    return std::array<double, 2>{a0 + user[0], a1 + user[1]};
+}
+
 
 // --- canonical FootageStats <-> flat 21-double vector ---------------------
 
@@ -151,6 +196,24 @@ inline std::optional<std::vector<CurvePoint>> curveFromData(const CurveData& c) 
     std::vector<CurvePoint> pts(n);
     for (int i = 0; i < n; i++) pts[i] = c.pts[i];
     return pts;
+}
+
+// Compose the editor-owned look layers onto a set of theme overrides: the 6b user curves
+// REPLACE the authored curve per slot; the 6c 3-way user tints ADD to the authored band
+// tints. Shared by the pure themeFromRecipe path AND the effect's Auto bake (BakeAutoLut),
+// so the render path and the golden harness exercise IDENTICAL composition - the regression
+// guard for "editor curve/wheel edits actually reach the baked LUT". (LGG is a separate
+// EngineOptions stage, folded in by the caller via lggFromRecipe.)
+inline void applyEditorOverrides(ThemeOverrides& ov, const RecipeData& r) {
+    ov.shadowTint = combineBandTint(ov.shadowTint, r.userShadowTint);
+    ov.highlightTint = combineBandTint(ov.highlightTint, r.userHighTint);
+    ov.midtoneTint = combineBandTint(ov.midtoneTint, r.userMidTint);
+    if (r.userToneCurve.count > 0) ov.toneCurve = curveFromData(r.userToneCurve);
+    ChannelCurves cc = ov.channelCurves.value_or(ChannelCurves{});
+    if (r.userChannelR.count > 0) cc.r = curveFromData(r.userChannelR);
+    if (r.userChannelG.count > 0) cc.g = curveFromData(r.userChannelG);
+    if (r.userChannelB.count > 0) cc.b = curveFromData(r.userChannelB);
+    if (cc.r || cc.g || cc.b) ov.channelCurves = cc;
 }
 
 // --- Theme <-> RecipeData --------------------------------------------------
@@ -202,8 +265,9 @@ inline RecipeData recipeFromTheme(const Theme& theme, const FootageStats& source
     r.strengthDefault = theme.knobs.strengthDefault;
     r.skinProtectionDefault = theme.knobs.skinProtectionDefault;
     r.matchStats = theme.matchStats ? 1u : 0u;
-    // Manual block + lookMix keep their neutral defaults: manual grading is editor
-    // state, not theme data, so a freshly-seeded recipe carries a neutral manual grade.
+    // Manual block + lookMix + LGG wheels keep their neutral defaults: manual grading
+    // and the wheels are editor state, not theme data, so a freshly-seeded recipe
+    // carries a neutral manual grade and neutral wheels.
     return r;
 }
 
@@ -214,6 +278,7 @@ inline Theme themeFromRecipe(const RecipeData& r) {
     t.name = "recipe";
     t.targetStats = statsFromData(r.targetStats);
     ThemeOverrides ov;
+    // Start from the theme-authored overrides (as seeded by recipeFromTheme)...
     if (r.hasShadowTint) ov.shadowTint = std::array<double, 2>{r.shadowTint[0], r.shadowTint[1]};
     if (r.hasHighlightTint)
         ov.highlightTint = std::array<double, 2>{r.highlightTint[0], r.highlightTint[1]};
@@ -221,11 +286,16 @@ inline Theme themeFromRecipe(const RecipeData& r) {
         ov.midtoneTint = std::array<double, 2>{r.midtoneTint[0], r.midtoneTint[1]};
     if (r.hasChromaGain) ov.chromaGain = r.chromaGain;
     ov.toneCurve = curveFromData(r.toneCurve);
-    ChannelCurves cc;
-    cc.r = curveFromData(r.channelR);
-    cc.g = curveFromData(r.channelG);
-    cc.b = curveFromData(r.channelB);
-    if (cc.r || cc.g || cc.b) ov.channelCurves = cc;
+    {
+        ChannelCurves cc;
+        cc.r = curveFromData(r.channelR);
+        cc.g = curveFromData(r.channelG);
+        cc.b = curveFromData(r.channelB);
+        if (cc.r || cc.g || cc.b) ov.channelCurves = cc;
+    }
+    // ...then compose the editor-owned layers on top (the SAME helper the effect's Auto
+    // bake uses, so both agree on how curve/wheel edits reach the LUT).
+    applyEditorOverrides(ov, r);
     ChromaShape cs;
     cs.byLuma = curveFromData(r.chromaByLuma);
     if (r.hasVibrance) cs.vibrance = r.vibrance;
@@ -254,31 +324,46 @@ inline ManualGrade manualFromRecipe(const RecipeData& r) {
     return m;
 }
 
+// Reconstruct the Lift/Gamma/Gain wheels (EngineOptions.lgg) from a recipe (Phase 6c).
+inline LiftGammaGain lggFromRecipe(const RecipeData& r) {
+    LiftGammaGain lg;
+    for (int c = 0; c < 3; ++c) {
+        lg.lift[c] = r.lift[c];
+        lg.gamma[c] = r.gamma[c];
+        lg.gain[c] = r.gain[c];
+    }
+    return lg;
+}
+
 // In-effect bake: build the grade LUT the effect applies, straight from arb-data.
 // opts overrides (strength / skinProtection sliders, and the live PF manual/lookMix)
-// win over the recipe. When the caller leaves manual / lookMix unset, they are taken
-// from the recipe, so the bake carries the persisted manual grade (Phase 6a).
+// win over the recipe. When the caller leaves manual / lgg / lookMix unset, they are
+// taken from the recipe, so the bake carries the persisted manual grade + wheels.
 inline cg::Lut3D bakeFromRecipe(const RecipeData& r, const EngineOptions& opts = {}, int size = 33) {
     EngineOptions merged = opts;
     if (!merged.manual) merged.manual = manualFromRecipe(r);
+    if (!merged.lgg) merged.lgg = lggFromRecipe(r);
     if (!merged.lookMix) merged.lookMix = r.lookMix;
     return bakeGradeLut(statsFromData(r.sourceStats), themeFromRecipe(r), merged, size);
 }
 
 // --- versioned arb-data migration (the Phase 6a landmine) ------------------
 //
-// Byte size of the v2 RecipeData layout: every v3 (Phase 6a) field was appended
-// AFTER the v2 fields, so the first v3 field's offset is exactly the v2 struct
-// size and a v2 blob's bytes are a clean prefix of the v3 struct.
+// Byte size of the v2 / v3 RecipeData layouts: every later field was appended AFTER
+// the earlier fields, so an older field's offset is exactly the older struct size and
+// an older blob's bytes are a clean prefix of the current struct. v2 ended before
+// matchStats (first v3 field); v3 ended before lift (first v4 field).
 constexpr std::size_t RECIPE_V2_SIZE = offsetof(RecipeData, matchStats);
+constexpr std::size_t RECIPE_V3_SIZE = offsetof(RecipeData, lift);
 
 // Migrate a persisted (flattened) recipe blob into a current RecipeData. Old grades
-// must survive a version bump: a same-version blob copies verbatim; a v2 blob copies
-// its shared prefix over v3 defaults (new fields default to neutral: matchStats 1,
-// manual neutral, lookMix 1) and is re-stamped to the current version; anything
-// foreign/corrupt/unknown falls back to `fallback` (the caller supplies the default
-// recipe, keeping this header free of a Themes.h dependency). Single source of truth
-// for the AE arb-data UNFLATTEN handler and the parity harness.
+// must survive a version bump: a same-version blob copies verbatim; an older (v2/v3)
+// blob copies its shared prefix over current defaults (new fields default to neutral:
+// matchStats 1, manual neutral, lookMix 1, LGG lift 0 / gamma 1 / gain 1, wheelsMode 0)
+// and is re-stamped to the current version; anything foreign/corrupt/unknown falls back
+// to `fallback` (the caller supplies the default recipe, keeping this header free of a
+// Themes.h dependency). Single source of truth for the AE arb-data UNFLATTEN handler and
+// the parity harness.
 inline void migrateRecipeInto(RecipeData* dst, const void* flat, std::size_t flatSize,
                               const RecipeData& fallback) {
     RecipeData result = fallback;  // used verbatim only on the foreign/corrupt path
@@ -289,6 +374,10 @@ inline void migrateRecipeInto(RecipeData* dst, const void* flat, std::size_t fla
     }
     if (magic == RECIPE_MAGIC && ver == RECIPE_VERSION && flatSize == sizeof(RecipeData)) {
         std::memcpy(&result, flat, sizeof(RecipeData));  // current version: verbatim
+    } else if (magic == RECIPE_MAGIC && ver == 3 && flatSize == RECIPE_V3_SIZE) {
+        result = RecipeData{};                       // start from current-version defaults
+        std::memcpy(&result, flat, RECIPE_V3_SIZE);  // v3 prefix over those defaults
+        result.version = RECIPE_VERSION;             // stamp forward; new fields defaulted
     } else if (magic == RECIPE_MAGIC && ver == 2 && flatSize == RECIPE_V2_SIZE) {
         result = RecipeData{};                       // start from current-version defaults
         std::memcpy(&result, flat, RECIPE_V2_SIZE);  // v2 prefix over those defaults

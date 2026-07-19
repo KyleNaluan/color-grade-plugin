@@ -2,7 +2,9 @@ import { describe, it, expect } from 'vitest';
 import {
   buildTransform,
   NEUTRAL_MANUAL,
+  NEUTRAL_LGG,
   type ManualGrade,
+  type LiftGammaGain,
 } from '../../src/core/engine/engine.js';
 import { computeStats, encodedRec709ToLab } from '../../src/core/analysis/stats.js';
 import { THEMES } from '../../src/themes/index.js';
@@ -238,5 +240,67 @@ describe('Look Mix', () => {
     const hi = Math.max(full(p)[0], none(p)[0]);
     expect(pv).toBeGreaterThanOrEqual(lo - 1e-9);
     expect(pv).toBeLessThanOrEqual(hi + 1e-9);
+  });
+});
+
+describe('Lift/Gamma/Gain wheels (Phase 6c)', () => {
+  const lgg = (over: Partial<LiftGammaGain>): LiftGammaGain => ({ ...NEUTRAL_LGG, ...over });
+
+  it('a neutral LGG is exact identity at full strength (None/Manual)', () => {
+    const t = buildTransform(stats, noneManual, { strength: 1, lgg: NEUTRAL_LGG });
+    for (const p of SAMPLES) {
+      const out = t(p);
+      for (let c = 0; c < 3; c++) expect(out[c]).toBe(p[c]); // identity fast path
+    }
+  });
+
+  it('lift raises the black point (dark pixels move up, white pinned)', () => {
+    const t = buildTransform(stats, noneManual, {
+      strength: 1,
+      skinProtection: 0,
+      lgg: lgg({ lift: [0.15, 0.15, 0.15] }),
+    });
+    const dark: Vec3 = [0.05, 0.05, 0.05];
+    const white: Vec3 = [1, 1, 1];
+    expect(t(dark)[0]).toBeGreaterThan(dark[0]!);
+    // gain 1 => x=1 maps to 1 exactly (lift pivots at white).
+    for (let c = 0; c < 3; c++) expect(t(white)[c]).toBeCloseTo(1, 6);
+  });
+
+  it('gain scales the white point (black pinned, highlights move)', () => {
+    const t = buildTransform(stats, noneManual, {
+      strength: 1,
+      skinProtection: 0,
+      lgg: lgg({ gain: [0.8, 0.8, 0.8] }),
+    });
+    const black: Vec3 = [0, 0, 0];
+    const bright: Vec3 = [0.9, 0.9, 0.9];
+    for (let c = 0; c < 3; c++) expect(t(black)[c]).toBeCloseTo(0, 6); // lift 0 pivots at black
+    expect(t(bright)[0]).toBeLessThan(bright[0]!);
+  });
+
+  it('gamma bends the midtones with both endpoints pinned', () => {
+    const t = buildTransform(stats, noneManual, {
+      strength: 1,
+      skinProtection: 0,
+      lgg: lgg({ gamma: [1.6, 1.6, 1.6] }),
+    });
+    const mid: Vec3 = [0.5, 0.5, 0.5];
+    expect(t(mid)[0]).toBeGreaterThan(mid[0]!); // gamma>1 lifts mids
+    for (let c = 0; c < 3; c++) {
+      expect(t([0, 0, 0])[c]).toBeCloseTo(0, 6);
+      expect(t([1, 1, 1])[c]).toBeCloseTo(1, 6);
+    }
+  });
+
+  it('a per-channel gain pushes color into the highlights', () => {
+    const t = buildTransform(stats, noneManual, {
+      strength: 1,
+      skinProtection: 0,
+      lgg: lgg({ gain: [1.1, 1.0, 0.9] }), // warm highlights
+    });
+    const gray: Vec3 = [0.8, 0.8, 0.8];
+    const out = t(gray);
+    expect(out[0]).toBeGreaterThan(out[2]!); // red raised above blue
   });
 });

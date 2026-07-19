@@ -29,6 +29,12 @@ export interface EngineOptions {
    */
   manual?: ManualGrade;
   /**
+   * DaVinci-style Lift/Gamma/Gain wheels (Phase 6c), applied in the manual-primaries
+   * slot right after {@link ManualGrade} on the decoded gamma-Rec.709 signal. Omit
+   * (or pass {@link NEUTRAL_LGG}) for no wheels - a neutral LGG is exact identity.
+   */
+  lgg?: LiftGammaGain;
+  /**
    * Look Mix (Phase 6a, keyframeable PF param): 0-1, default 1. Blends the
    * theme "look" contribution in and out while keeping the manual correction:
    * 1 = full theme look, 0 = manual-corrected only (theme look removed). Distinct
@@ -36,6 +42,37 @@ export interface EngineOptions {
    */
   lookMix?: number;
 }
+
+/**
+ * DaVinci-style Lift/Gamma/Gain color wheels (Phase 6c). Each is a per-channel RGB
+ * triple (the wheel's disc color folded with its master ring). The printer-lights
+ * model - `out_c = clamp01((gain_c*x + lift_c*(1-x))^(1/gamma_c))` - moves the black
+ * point (lift), white point (gain), and bends the midtones (gamma) with the opposite
+ * endpoint pinned. Neutral (`lift 0, gamma 1, gain 1`) is exact identity.
+ */
+export interface LiftGammaGain {
+  /** Per-channel lift (black-point offset), 0 = neutral. */
+  lift: Vec3;
+  /** Per-channel gamma (midtone bend), 1 = neutral. Must be > 0. */
+  gamma: Vec3;
+  /** Per-channel gain (white-point multiply), 1 = neutral. */
+  gain: Vec3;
+}
+
+/**
+ * Positive floor for per-channel gamma before inverting to `1/gamma`. The
+ * wheel UI can compose a non-positive gamma (master min + full color disc),
+ * which would flip the exponent and blow a channel toward white; clamping here
+ * keeps `1/gamma` finite and positive.
+ */
+export const LGG_GAMMA_FLOOR = 1e-3;
+
+/** The neutral Lift/Gamma/Gain (exact identity). */
+export const NEUTRAL_LGG: LiftGammaGain = {
+  lift: [0, 0, 0],
+  gamma: [1, 1, 1],
+  gain: [1, 1, 1],
+};
 
 /**
  * Manual primary correction (Phase 6a). All controls are neutral at
@@ -306,6 +343,38 @@ export function buildTransform(src: FootageStats, theme: Theme, opts: EngineOpti
   const mTintA = ((m?.tint ?? 0) / 100) * MANUAL_TINT_MAX;
   const manualActive = mExpActive || mContrastActive || mRegionActive || mColorActive;
 
+  // --- Lift/Gamma/Gain wheels (Phase 6c) ----------------------------------
+  // Per-channel printer-lights operator, applied right after the manual stage on
+  // the decoded signal. Neutral (lift 0, gamma 1, gain 1) is exact identity, so
+  // the whole stage is gated off when neutral (no lossy pow round-trip).
+  const lgg = opts.lgg;
+  const lggActive =
+    !!lgg &&
+    (lgg.lift[0] !== 0 || lgg.lift[1] !== 0 || lgg.lift[2] !== 0 ||
+      lgg.gamma[0] !== 1 || lgg.gamma[1] !== 1 || lgg.gamma[2] !== 1 ||
+      lgg.gain[0] !== 1 || lgg.gain[1] !== 1 || lgg.gain[2] !== 1);
+  const lgLift: Vec3 = lgg ? lgg.lift : [0, 0, 0];
+  const lgGain: Vec3 = lgg ? lgg.gain : [1, 1, 1];
+  const lgInvGamma: Vec3 = lgg
+    ? [
+        1 / Math.max(LGG_GAMMA_FLOOR, lgg.gamma[0]),
+        1 / Math.max(LGG_GAMMA_FLOOR, lgg.gamma[1]),
+        1 / Math.max(LGG_GAMMA_FLOOR, lgg.gamma[2]),
+      ]
+    : [1, 1, 1];
+  const lggChannel = (x: number, lift: number, gain: number, invGamma: number): number => {
+    const base = gain * x + lift * (1 - x);
+    return clamp01(Math.pow(Math.max(0, base), invGamma));
+  };
+  const applyLgg = (r: number, g: number, b: number): Vec3 => [
+    lggChannel(r, lgLift[0], lgGain[0], lgInvGamma[0]),
+    lggChannel(g, lgLift[1], lgGain[1], lgInvGamma[1]),
+    lggChannel(b, lgLift[2], lgGain[2], lgInvGamma[2]),
+  ];
+
+  // The manual-primaries slot as a whole (manual basics + LGG wheels).
+  const correctionActive = manualActive || lggActive;
+
   // Apply the manual stage on one decoded gamma-Rec.709 pixel. Order: exposure
   // (linear) -> contrast (about pivot) -> region lifts (bandWeights) -> color
   // (LAB temp/tint/saturation/vibrance).
@@ -378,7 +447,7 @@ export function buildTransform(src: FootageStats, theme: Theme, opts: EngineOpti
     !ov.toneCurve &&
     !ov.channelCurves &&
     !ov.chromaShape;
-  if (themeLookIsIdentity && !manualActive) {
+  if (themeLookIsIdentity && !correctionActive) {
     return (rgb: Vec3): Vec3 => [clamp01(rgb[0]), clamp01(rgb[1]), clamp01(rgb[2])];
   }
 
@@ -387,11 +456,15 @@ export function buildTransform(src: FootageStats, theme: Theme, opts: EngineOpti
     const gIn = clamp01(rgb[1]);
     const bIn = clamp01(rgb[2]);
 
-    // 0. Manual primary correction on the decoded footage, ahead of the theme
-    //    stages. The identity target for Strength/Skin below stays the ORIGINAL
-    //    footage (rIn/gIn/bIn), so Strength dilutes the whole grade - manual
-    //    included (decision D3) - and skin is keyed on the real footage.
-    const [rm, gm, bm] = manualActive ? applyManual(rIn, gIn, bIn) : [rIn, gIn, bIn];
+    // 0. Manual primary correction + LGG wheels on the decoded footage, ahead of
+    //    the theme stages. The identity target for Strength/Skin below stays the
+    //    ORIGINAL footage (rIn/gIn/bIn), so Strength dilutes the whole grade -
+    //    manual + wheels included (decision D3) - and skin is keyed on real footage.
+    let rm = rIn;
+    let gm = gIn;
+    let bm = bIn;
+    if (manualActive) [rm, gm, bm] = applyManual(rm, gm, bm);
+    if (lggActive) [rm, gm, bm] = applyLgg(rm, gm, bm);
 
     // 1. Tone: stat-matching curve per channel (matches luma percentiles,
     //    keeps color ratios), then the authored master + per-channel curves.

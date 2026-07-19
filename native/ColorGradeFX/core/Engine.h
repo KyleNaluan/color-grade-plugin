@@ -48,10 +48,26 @@ struct ManualGrade {
 // The neutral manual grade (mirrors NEUTRAL_MANUAL in engine.ts).
 inline ManualGrade neutralManual() { return ManualGrade{}; }
 
+// DaVinci Lift/Gamma/Gain wheels (Phase 6c). Ported from LiftGammaGain in engine.ts.
+// Per-channel printer-lights operator; neutral (lift 0, gamma 1, gain 1) = identity.
+struct LiftGammaGain {
+    double lift[3] = {0.0, 0.0, 0.0};   // per-channel black-point offset (0 = neutral)
+    double gamma[3] = {1.0, 1.0, 1.0};  // per-channel midtone bend (1 = neutral, > 0)
+    double gain[3] = {1.0, 1.0, 1.0};   // per-channel white-point multiply (1 = neutral)
+};
+
+// The neutral Lift/Gamma/Gain (mirrors NEUTRAL_LGG in engine.ts).
+inline LiftGammaGain neutralLgg() { return LiftGammaGain{}; }
+
+// Positive floor for per-channel gamma before inverting to 1/gamma (mirrors
+// LGG_GAMMA_FLOOR in engine.ts): the wheel UI can compose a non-positive gamma.
+constexpr double LGG_GAMMA_FLOOR = 1e-3;
+
 struct EngineOptions {
     std::optional<double> strength;
     std::optional<double> skinProtection;
     std::optional<ManualGrade> manual;  // Phase 6a manual primary correction
+    std::optional<LiftGammaGain> lgg;   // Phase 6c Lift/Gamma/Gain wheels
     std::optional<double> lookMix;      // Phase 6a Look Mix (0..1, default 1)
 };
 
@@ -198,6 +214,11 @@ struct GradeTransform {
     double mAmtHi = 0.0, mAmtSh = 0.0, mAmtWh = 0.0, mAmtBl = 0.0;
     bool mColorActive = false;
     double mSat = 1.0, mVib = 0.0, mTempB = 0.0, mTintA = 0.0;
+    // --- Lift/Gamma/Gain wheels (Phase 6c) ---
+    bool lggActive = false;
+    double lgLift[3] = {0.0, 0.0, 0.0};
+    double lgGain[3] = {1.0, 1.0, 1.0};
+    double lgInvGamma[3] = {1.0, 1.0, 1.0};  // 1/gamma, precomputed
     // Look Mix (0..1); blends the theme look over the manual-corrected pixel.
     double lookMix = 1.0;
     bool lookMixActive = false;
@@ -259,6 +280,18 @@ struct GradeTransform {
         return {r, g, b};
     }
 
+    // Apply the LGG wheels on one pixel (mirrors applyLgg in engine.ts):
+    // out_c = clamp01((gain_c*x + lift_c*(1-x))^(1/gamma_c)) per channel.
+    Vec3d applyLgg(double r, double g, double b) const {
+        auto ch = [](double x, double lift, double gain, double invGamma) {
+            const double base = gain * x + lift * (1.0 - x);
+            return clamp01(std::pow(std::max(0.0, base), invGamma));
+        };
+        return {ch(r, lgLift[0], lgGain[0], lgInvGamma[0]),
+                ch(g, lgLift[1], lgGain[1], lgInvGamma[1]),
+                ch(b, lgLift[2], lgGain[2], lgInvGamma[2])};
+    }
+
     Vec3d operator()(const Vec3d& rgb) const {
         using engine_detail::lerp;
         const double VIBRANCE_FALLOFF = engine_detail::VIBRANCE_FALLOFF;
@@ -269,14 +302,20 @@ struct GradeTransform {
         // Fast identity path (None/Manual theme with no edits): clamp only.
         if (identity) return {rIn, gIn, bIn};
 
-        // 0. Manual primary correction on the decoded footage, ahead of the theme
-        //    stages. The Strength/Skin identity target stays the ORIGINAL footage.
+        // 0. Manual primary correction + LGG wheels on the decoded footage, ahead of
+        //    the theme stages. The Strength/Skin identity target stays the ORIGINAL footage.
         double rm = rIn, gm = gIn, bm = bIn;
         if (manualActive) {
-            const Vec3d pm = applyManual(rIn, gIn, bIn);
+            const Vec3d pm = applyManual(rm, gm, bm);
             rm = pm[0];
             gm = pm[1];
             bm = pm[2];
+        }
+        if (lggActive) {
+            const Vec3d pl = applyLgg(rm, gm, bm);
+            rm = pl[0];
+            gm = pl[1];
+            bm = pl[2];
         }
 
         // 1. Tone: stat-matching curve per channel, then authored curves.
@@ -485,16 +524,29 @@ inline GradeTransform buildTransform(const FootageStats& src, const Theme& theme
     }
     t.manualActive = t.mExpActive || t.mContrastActive || t.mRegionActive || t.mColorActive;
 
+    // --- Lift/Gamma/Gain wheels (Phase 6c) ---
+    if (opts.lgg) {
+        const LiftGammaGain& lg = *opts.lgg;
+        t.lggActive = lg.lift[0] != 0.0 || lg.lift[1] != 0.0 || lg.lift[2] != 0.0 ||
+                      lg.gamma[0] != 1.0 || lg.gamma[1] != 1.0 || lg.gamma[2] != 1.0 ||
+                      lg.gain[0] != 1.0 || lg.gain[1] != 1.0 || lg.gain[2] != 1.0;
+        for (int c = 0; c < 3; ++c) {
+            t.lgLift[c] = lg.lift[c];
+            t.lgGain[c] = lg.gain[c];
+            t.lgInvGamma[c] = 1.0 / std::max(LGG_GAMMA_FLOOR, lg.gamma[c]);
+        }
+    }
+
     // Look Mix (0..1); blends the theme look over the manual-corrected pixel.
     t.lookMix = clamp01(opts.lookMix.value_or(1.0));
     t.lookMixActive = t.lookMix != 1.0;
 
     // Fast identity path: theme contributes no look (stat-match off + no authored
-    // overrides) and the manual stage is neutral -> the transform is a clamp.
+    // overrides) and the manual + wheels stages are neutral -> the transform is a clamp.
     const bool themeLookIsIdentity =
         !matchStats && !ov.shadowTint && !ov.highlightTint && !ov.midtoneTint &&
         t.chromaGain == 1.0 && !ov.toneCurve && !ov.channelCurves && !ov.chromaShape;
-    t.identity = themeLookIsIdentity && !t.manualActive;
+    t.identity = themeLookIsIdentity && !t.manualActive && !t.lggActive;
 
     return t;
 }
