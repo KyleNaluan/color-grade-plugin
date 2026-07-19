@@ -42,6 +42,7 @@
 #include <sstream>
 #include <string>
 #include <cstring>
+#include <cstddef>
 #include <new>
 #include <vector>
 
@@ -289,6 +290,7 @@ static cg::core::Theme ThemeFromPopup(A_long themePopup) {
     switch (themePopup) {
         case CG_THEME_WARM: return cg::core::warmFilmTheme();
         case CG_THEME_COOL: return cg::core::coolNoirTheme();
+        case CG_THEME_NONE: return cg::core::noneManualTheme();
         case CG_THEME_TEAL:
         default: return cg::core::tealOrangeTheme();
     }
@@ -307,7 +309,8 @@ static const cg::core::LogProfile& ProfileFromFootagePopup(A_long footagePopup) 
 // two agree. The chromaGain arg is the slider fraction (slider/100), so 100% (=1.0)
 // preserves each theme's authored chromaGain exactly and the slider scales from there.
 static void BakeAutoLut(A_long themePopup, A_long footagePopup, double strength01, double skin01,
-                        double chromaGain, const cg::core::RecipeData& recipe, cg::Lut3D& dst) {
+                        double chromaGain, double exposure, double lookMix, double temperature,
+                        const cg::core::RecipeData& recipe, cg::Lut3D& dst) {
     cg::core::Theme theme = ThemeFromPopup(themePopup);
     cg::core::ThemeOverrides ov = theme.overrides.value_or(cg::core::ThemeOverrides{});
     const double authored = ov.chromaGain.value_or(1.0);
@@ -318,6 +321,14 @@ static void BakeAutoLut(A_long themePopup, A_long footagePopup, double strength0
     cg::core::EngineOptions opts;
     opts.strength = strength01;
     opts.skinProtection = skin01;
+    // Phase 6a: fold the recipe's manual primary correction into the bake, with the
+    // live keyframeable PF params (Exposure/Temperature/Look Mix) overriding the
+    // recipe's stored values (decision D1). Neutral values contribute exact identity.
+    cg::core::ManualGrade manual = cg::core::manualFromRecipe(recipe);
+    manual.exposure = exposure;
+    manual.temperature = temperature;
+    opts.manual = manual;
+    opts.lookMix = lookMix;
 
     // Correct + Grade in one baked LUT. When the clip is a log profile (V-Log), the
     // Correct stage decodes each pixel to Rec.709 *before* the grade; baking the
@@ -397,6 +408,13 @@ static PF_Err CreateDefaultRecipe(PF_InData* in_data, PF_ArbitraryH* arbPH) {
     return err;
 }
 
+// The default recipe used as the migration fallback (foreign/corrupt blob): the
+// teal-orange theme over neutral placeholder stats, matching CreateDefaultRecipe.
+static RecipeData DefaultRecipe() {
+    cg::core::Theme th = cg::core::tealOrangeTheme();
+    return cg::core::recipeFromTheme(th, th.targetStats);
+}
+
 static PF_Err HandleArbitrary(PF_InData* in_data, PF_OutData* out_data, PF_ArbParamsExtra* extra) {
     PF_Err err = PF_Err_NONE;
     switch (extra->which_function) {
@@ -435,19 +453,13 @@ static PF_Err HandleArbitrary(PF_InData* in_data, PF_OutData* out_data, PF_ArbPa
             if (!handle) return PF_Err_OUT_OF_MEMORY;
             RecipeData* dstP = reinterpret_cast<RecipeData*>(PF_LOCK_HANDLE(handle));
             if (dstP) {
-                // Only trust a blob whose size matches; otherwise (foreign/older/grown
-                // struct) it is unusable, so reseed to the default recipe. Never leave
-                // *arbPH unset - AE must always receive a valid handle.
-                bool usable = extra->u.unflatten_func_params.buf_sizeLu == sizeof(RecipeData);
-                if (usable) {
-                    std::memcpy(dstP, extra->u.unflatten_func_params.flat_dataPV, sizeof(RecipeData));
-                    usable = dstP->magic == cg::core::RECIPE_MAGIC && dstP->version == cg::core::RECIPE_VERSION;
-                }
-                if (!usable) {
-                    cg::core::Theme th = cg::core::tealOrangeTheme();
-                    RecipeData def = cg::core::recipeFromTheme(th, th.targetStats);
-                    std::memcpy(dstP, &def, sizeof(RecipeData));
-                }
+                // Migrate the persisted blob forward instead of reseeding on any
+                // mismatch: a v2 grade (or the current version) survives; only a
+                // foreign/corrupt blob falls back to the default. Never leave *arbPH
+                // unset - AE must always receive a valid handle.
+                cg::core::migrateRecipeInto(dstP, extra->u.unflatten_func_params.flat_dataPV,
+                                            extra->u.unflatten_func_params.buf_sizeLu,
+                                            DefaultRecipe());
             }
             *(extra->u.unflatten_func_params.arbPH) = handle;
             PF_UNLOCK_HANDLE(handle);
@@ -520,10 +532,15 @@ static void InjectAnalyzedStats(cg::editor::InstanceKey key, A_long footage, Rec
 // Resolve the LUT + post-blend for a frame from the resolved param values. Auto
 // bakes natively (strength baked in); embedded/external keep the Phase 1 blend.
 static void ResolveRenderData(PF_InData* in_data, A_long source, A_long themePopup, A_long footagePopup,
-                              double strength01, double skin01, double chromaGain,
-                              const RecipeData& recipe, CG_RenderData& d) {
+                              double strength01, double skin01, double chromaGain, double exposure,
+                              double lookMix, double temperature, const RecipeData& recipe,
+                              CG_RenderData& d) {
     if (source == CG_SRC_AUTO) {
-        BakeAutoLut(themePopup, footagePopup, strength01, skin01, chromaGain, recipe, d.lut);
+        // Manual primary correction (Phase 6a) folds into the Auto grade bake. The
+        // Embedded/External raw-LUT modes carry no buildTransform to fold it into, so
+        // manual grading applies in Auto mode (the theme / None-Manual path).
+        BakeAutoLut(themePopup, footagePopup, strength01, skin01, chromaGain, exposure, lookMix,
+                    temperature, recipe, d.lut);
         d.applyStrength = 1.0f;
     } else {
         // Embedded/External raw LUT. For V-Log the Footage/Correct decode is composed in
@@ -582,8 +599,50 @@ static cg::editor::InstanceKey SeqKey(PF_InData* in_data) {
 // a stale one and never stomp the control the user is mid-drag on.
 static std::atomic<uint64_t> g_snapshotRevision{1};
 
+// Cheap FNV-1a hash over the whole recipe blob (flat POD), folded into the preview
+// fingerprint so any manual/recipe change busts the preview cache (Phase 6a).
+static uint64_t RecipeHash(const RecipeData& r) {
+    const auto* bytes = reinterpret_cast<const unsigned char*>(&r);
+    uint64_t h = 1469598103934665603ull;
+    for (size_t i = 0; i < sizeof(RecipeData); ++i) {
+        h ^= bytes[i];
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+
+// The recipe-backed 9 manual controls -> the bridge ManualState (editor display).
+static cg::editor::ManualState ManualStateFromRecipe(const RecipeData& r) {
+    cg::editor::ManualState m;
+    m.contrast = r.manualContrast;
+    m.pivot = r.manualPivot;
+    m.highlights = r.manualHighlights;
+    m.shadows = r.manualShadows;
+    m.whites = r.manualWhites;
+    m.blacks = r.manualBlacks;
+    m.tint = r.manualTint;
+    m.saturation = r.manualSaturation;
+    m.vibrance = r.manualVibrance;
+    return m;
+}
+
+// Write a bridge ManualState back into a recipe's 9 manual controls (window -> effect).
+static void ApplyManualStateToRecipe(const cg::editor::ManualState& m, RecipeData& r) {
+    r.manualContrast = m.contrast;
+    r.manualPivot = m.pivot;
+    r.manualHighlights = m.highlights;
+    r.manualShadows = m.shadows;
+    r.manualWhites = m.whites;
+    r.manualBlacks = m.blacks;
+    r.manualTint = m.tint;
+    r.manualSaturation = m.saturation;
+    r.manualVibrance = m.vibrance;
+}
+
 static cg::editor::ParamSnapshot MakeSnapshot(A_long footage, A_long theme, double strength01,
-                                              double skin01, double chromaFrac, A_long source) {
+                                              double skin01, double chromaFrac, A_long source,
+                                              double exposure, double lookMix, double temperature,
+                                              const RecipeData& recipe) {
     cg::editor::ParamSnapshot s;
     s.footageProfile = static_cast<int>(footage);
     s.theme = static_cast<int>(theme);
@@ -591,15 +650,22 @@ static cg::editor::ParamSnapshot MakeSnapshot(A_long footage, A_long theme, doub
     s.skinProtection = skin01;
     s.chromaGain = chromaFrac;
     s.lutSource = static_cast<int>(source);
+    s.exposure = exposure;
+    s.lookMix = lookMix;
+    s.temperature = temperature;
+    s.manual = ManualStateFromRecipe(recipe);
+    s.recipeHash = RecipeHash(recipe);
     s.revision = g_snapshotRevision.fetch_add(1);
     return s;
 }
 
 // Push the effect's current params to the editor window (if open).
 static void PublishEditorSnapshot(PF_InData* in_data, A_long footage, A_long theme, double strength01,
-                                  double skin01, double chromaFrac, A_long source) {
+                                  double skin01, double chromaFrac, A_long source, double exposure,
+                                  double lookMix, double temperature, const RecipeData& recipe) {
     cg::editor::EditorHost::instance().publishSnapshot(
-        SeqKey(in_data), MakeSnapshot(footage, theme, strength01, skin01, chromaFrac, source));
+        SeqKey(in_data), MakeSnapshot(footage, theme, strength01, skin01, chromaFrac, source,
+                                      exposure, lookMix, temperature, recipe));
 }
 
 // Drain any edits the window produced and write them onto params[] (CHANGED_VALUE so
@@ -632,6 +698,34 @@ static void ApplyEditorEdits(PF_InData* in_data, PF_ParamDef* params[]) {
                 params[CG_LUT_SOURCE]->u.pd.value = static_cast<A_long>(e.value + 0.5);
                 params[CG_LUT_SOURCE]->uu.change_flags |= PF_ChangeFlag_CHANGED_VALUE;
                 break;
+            case cg::editor::EditField::Exposure:
+                params[CG_EXPOSURE]->u.fs_d.value =
+                    cg::editor::clampRange(e.value, CG_EXPOSURE_MIN, CG_EXPOSURE_MAX);
+                params[CG_EXPOSURE]->uu.change_flags |= PF_ChangeFlag_CHANGED_VALUE;
+                break;
+            case cg::editor::EditField::LookMix:
+                params[CG_LOOK_MIX]->u.fs_d.value = cg::editor::clamp01(e.value) * 100.0;
+                params[CG_LOOK_MIX]->uu.change_flags |= PF_ChangeFlag_CHANGED_VALUE;
+                break;
+            case cg::editor::EditField::Temperature:
+                params[CG_TEMPERATURE]->u.fs_d.value =
+                    cg::editor::clampRange(e.value, CG_TEMPERATURE_MIN, CG_TEMPERATURE_MAX);
+                params[CG_TEMPERATURE]->uu.change_flags |= PF_ChangeFlag_CHANGED_VALUE;
+                break;
+            case cg::editor::EditField::Manual: {
+                // Recipe-backed manual controls: mutate the CG_RECIPE arb handle in
+                // place (the SDK-sanctioned ColorGrid pattern) and flag CHANGED_VALUE.
+                PF_ArbitraryH arbH = params[CG_RECIPE]->u.arb_d.value;
+                if (arbH) {
+                    RecipeData* rp = reinterpret_cast<RecipeData*>(PF_LOCK_HANDLE(arbH));
+                    if (rp) {
+                        ApplyManualStateToRecipe(e.manual, *rp);
+                        PF_UNLOCK_HANDLE(arbH);
+                        params[CG_RECIPE]->uu.change_flags |= PF_ChangeFlag_CHANGED_VALUE;
+                    }
+                }
+                break;
+            }
         }
     }
 }
@@ -655,6 +749,10 @@ static bool StreamForEdit(const cg::editor::ParamEdit& e, PF_ParamIndex& idx, do
         case F::SkinProtection: idx = CG_SKIN_PROTECTION; one_d = cg::editor::clamp01(e.value) * 100.0; return true;
         case F::ChromaGain:     idx = CG_CHROMA_GAIN;     one_d = cg::editor::clampChromaFraction(e.value) * 100.0; return true;
         case F::LutSource:      idx = CG_LUT_SOURCE;      one_d = static_cast<int>(e.value + 0.5); return true;
+        case F::Exposure:       idx = CG_EXPOSURE;        one_d = cg::editor::clampRange(e.value, CG_EXPOSURE_MIN, CG_EXPOSURE_MAX); return true;
+        case F::LookMix:        idx = CG_LOOK_MIX;        one_d = cg::editor::clamp01(e.value) * 100.0; return true;
+        case F::Temperature:    idx = CG_TEMPERATURE;     one_d = cg::editor::clampRange(e.value, CG_TEMPERATURE_MIN, CG_TEMPERATURE_MAX); return true;
+        case F::Manual:         return false;  // recipe arb write, handled out-of-band (idle hook)
     }
     return false;
 }
@@ -867,21 +965,70 @@ static bool ReadStreamOneD(AEGP_SuiteHandler& sh, AEGP_EffectRefH effectH, PF_Pa
     return ok;
 }
 
+// Read the CG_RECIPE arb stream (its arbH is an A_Handle to the RecipeData bytes) via
+// AEGP, into `out`. Returns false on any AEGP failure. Best-effort: the poll degrades
+// to "recipe unchanged" rather than failing if the arb read is unavailable.
+static bool ReadRecipeViaAegp(AEGP_SuiteHandler& sh, AEGP_EffectRefH effectH, RecipeData& out) {
+    AEGP_StreamRefH streamH = nullptr;
+    if (sh.StreamSuite5()->AEGP_GetNewEffectStreamByIndex(g_aegpId, effectH, CG_RECIPE, &streamH) ||
+        !streamH) {
+        return false;
+    }
+    AEGP_StreamType stype = AEGP_StreamType_NO_DATA;
+    if (sh.StreamSuite5()->AEGP_GetStreamType(streamH, &stype) || stype == AEGP_StreamType_NO_DATA) {
+        sh.StreamSuite5()->AEGP_DisposeStream(streamH);
+        return false;
+    }
+    AEGP_StreamValue2 val;
+    std::memset(&val, 0, sizeof(val));
+    A_Time t;
+    t.value = 0;
+    t.scale = 1;
+    bool ok = false;
+    if (!sh.StreamSuite5()->AEGP_GetNewStreamValue(g_aegpId, streamH, AEGP_LTimeMode_LayerTime, &t,
+                                                   FALSE, &val)) {
+        if (val.val.arbH) {
+            RecipeData* rp = reinterpret_cast<RecipeData*>(
+                sh.HandleSuite1()->host_lock_handle(reinterpret_cast<PF_Handle>(val.val.arbH)));
+            if (rp) {
+                out = *rp;
+                ok = true;
+                sh.HandleSuite1()->host_unlock_handle(reinterpret_cast<PF_Handle>(val.val.arbH));
+            }
+        }
+        sh.StreamSuite5()->AEGP_DisposeStreamValue(&val);
+    }
+    sh.StreamSuite5()->AEGP_DisposeStream(streamH);
+    return ok;
+}
+
 // Read the effect's current value params into a snapshot (the EC->window direction).
 static bool PollSnapshotViaAegp(AEGP_SuiteHandler& sh, AEGP_EffectRefH effectH, cg::editor::ParamSnapshot& s) {
-    double footage, theme, strength, skin, chroma, lut;
+    double footage, theme, strength, skin, chroma, lut, exposure, lookMix, temperature;
     if (!ReadStreamOneD(sh, effectH, CG_FOOTAGE_PROFILE, footage)) return false;
     if (!ReadStreamOneD(sh, effectH, CG_THEME, theme)) return false;
     if (!ReadStreamOneD(sh, effectH, CG_STRENGTH, strength)) return false;
     if (!ReadStreamOneD(sh, effectH, CG_SKIN_PROTECTION, skin)) return false;
     if (!ReadStreamOneD(sh, effectH, CG_CHROMA_GAIN, chroma)) return false;
     if (!ReadStreamOneD(sh, effectH, CG_LUT_SOURCE, lut)) return false;
+    if (!ReadStreamOneD(sh, effectH, CG_EXPOSURE, exposure)) return false;
+    if (!ReadStreamOneD(sh, effectH, CG_LOOK_MIX, lookMix)) return false;
+    if (!ReadStreamOneD(sh, effectH, CG_TEMPERATURE, temperature)) return false;
     s.footageProfile = static_cast<int>(footage + 0.5);
     s.theme = static_cast<int>(theme + 0.5);
     s.strength = strength / 100.0;
     s.skinProtection = skin / 100.0;
     s.chromaGain = chroma / 100.0;
     s.lutSource = static_cast<int>(lut + 0.5);
+    s.exposure = exposure;
+    s.lookMix = lookMix / 100.0;
+    s.temperature = temperature;
+    // Recipe-backed manual state (best-effort; keeps the last value if the arb read fails).
+    RecipeData recipe;
+    if (ReadRecipeViaAegp(sh, effectH, recipe)) {
+        s.manual = ManualStateFromRecipe(recipe);
+        s.recipeHash = RecipeHash(recipe);
+    }
     return true;
 }
 
@@ -889,7 +1036,11 @@ static bool SnapshotChanged(const cg::editor::ParamSnapshot& a, const cg::editor
     return a.footageProfile != b.footageProfile || a.theme != b.theme || a.lutSource != b.lutSource ||
            std::fabs(a.strength - b.strength) > 1e-6 ||
            std::fabs(a.skinProtection - b.skinProtection) > 1e-6 ||
-           std::fabs(a.chromaGain - b.chromaGain) > 1e-6;
+           std::fabs(a.chromaGain - b.chromaGain) > 1e-6 ||
+           std::fabs(a.exposure - b.exposure) > 1e-6 ||
+           std::fabs(a.lookMix - b.lookMix) > 1e-6 ||
+           std::fabs(a.temperature - b.temperature) > 1e-6 ||
+           a.recipeHash != b.recipeHash || a.manual != b.manual;
 }
 
 /* ============= Live preview: layer-frame checkout via AEGP (Phase 4) ======= */
@@ -991,7 +1142,8 @@ static void DrivePreviewForKey(AEGP_SuiteHandler& sh, cg::editor::InstanceKey ke
     pk.timeValue = static_cast<int64_t>(t.value);
     pk.timeScale = t.scale ? static_cast<uint32_t>(t.scale) : 1u;
     pk.paramFingerprint = cg::editor::previewParamFingerprint(
-        ps.footageProfile, ps.theme, ps.lutSource, ps.strength, ps.skinProtection, ps.chromaGain);
+        ps.footageProfile, ps.theme, ps.lutSource, ps.strength, ps.skinProtection, ps.chromaGain,
+        ps.exposure, ps.lookMix, ps.temperature, ps.recipeHash);
 
     PreviewDriver& drv = g_previewDrivers[key];
     cg::editor::PreviewAction action =
@@ -1407,6 +1559,40 @@ static A_Err CG_IdleHook(AEGP_GlobalRefcon, AEGP_IdleRefcon, A_long* max_sleepPL
                         AEGP_SuiteHandler sh(g_spbasic);
                         sh.UtilitySuite6()->AEGP_StartUndoGroup("Color Grade editor edit");
                         for (const auto& e : edits) {
+                            // Recipe-backed manual controls (Phase 6a): read-modify-write the
+                            // CG_RECIPE arb stream (its arbH is an A_Handle to the RecipeData
+                            // bytes; lock via the PF HandleSuite, mutate the 9 manual fields,
+                            // set it back). Kept out of the scalar StreamForEdit path.
+                            if (e.field == cg::editor::EditField::Manual) {
+                                AEGP_StreamRefH rstreamH = nullptr;
+                                if (sh.StreamSuite5()->AEGP_GetNewEffectStreamByIndex(
+                                        g_aegpId, effectH, CG_RECIPE, &rstreamH) ||
+                                    !rstreamH) {
+                                    continue;
+                                }
+                                AEGP_StreamValue2 rval;
+                                std::memset(&rval, 0, sizeof(rval));
+                                A_Time zt;
+                                zt.value = 0;
+                                zt.scale = 1;
+                                if (!sh.StreamSuite5()->AEGP_GetNewStreamValue(
+                                        g_aegpId, rstreamH, AEGP_LTimeMode_LayerTime, &zt, FALSE, &rval)) {
+                                    if (rval.val.arbH) {
+                                        RecipeData* rp = reinterpret_cast<RecipeData*>(
+                                            sh.HandleSuite1()->host_lock_handle(
+                                                reinterpret_cast<PF_Handle>(rval.val.arbH)));
+                                        if (rp) {
+                                            ApplyManualStateToRecipe(e.manual, *rp);
+                                            sh.HandleSuite1()->host_unlock_handle(
+                                                reinterpret_cast<PF_Handle>(rval.val.arbH));
+                                            sh.StreamSuite5()->AEGP_SetStreamValue(g_aegpId, rstreamH, &rval);
+                                        }
+                                    }
+                                    sh.StreamSuite5()->AEGP_DisposeStreamValue(&rval);
+                                }
+                                sh.StreamSuite5()->AEGP_DisposeStream(rstreamH);
+                                continue;
+                            }
                             PF_ParamIndex idx = 0;
                             double one_d = 0.0;
                             if (!StreamForEdit(e, idx, one_d)) continue;
@@ -1434,6 +1620,8 @@ static A_Err CG_IdleHook(AEGP_GlobalRefcon, AEGP_IdleRefcon, A_long* max_sleepPL
             try {
                 AEGP_SuiteHandler sh(g_spbasic);
                 cg::editor::ParamSnapshot polled;
+                auto seed = g_lastPolled.find(key);
+                if (seed != g_lastPolled.end()) polled = seed->second;
                 if (PollSnapshotViaAegp(sh, effectH, polled)) {
                     auto it = g_lastPolled.find(key);
                     if (it == g_lastPolled.end() || SnapshotChanged(it->second, polled)) {
@@ -1601,7 +1789,7 @@ static PF_Err ParamsSetup(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef*
     // handler resets the Strength/Skin sliders to the new theme's authored knobs.
     AEFX_CLR_STRUCT(def);
     PF_ADD_POPUPX("Theme",
-                  3 /* num choices */,
+                  CG_THEME_COUNT /* num choices */,
                   CG_THEME_TEAL,
                   CG_THEME_CHOICES,
                   PF_ParamFlag_SUPERVISE,
@@ -1668,6 +1856,33 @@ static PF_Err ParamsSetup(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef*
                           CG_ARB_REFCON);
     }
 
+    // Phase 6a keyframeable params, APPENDED after CG_RECIPE (never inserted): the
+    // live value overrides the recipe's manual exposure/temperature and drives Look
+    // Mix at bake time (decision D1). Neutral defaults keep a fresh effect identity.
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_FLOAT_SLIDERX("Exposure",
+                         CG_EXPOSURE_MIN, CG_EXPOSURE_MAX,
+                         CG_EXPOSURE_MIN, CG_EXPOSURE_MAX,
+                         CG_EXPOSURE_DFLT,
+                         2, PF_ValueDisplayFlag_NONE, 0,
+                         CG_EXPOSURE);
+
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_FLOAT_SLIDERX("Look Mix",
+                         CG_LOOK_MIX_MIN, CG_LOOK_MIX_MAX,
+                         CG_LOOK_MIX_MIN, CG_LOOK_MIX_MAX,
+                         CG_LOOK_MIX_DFLT,
+                         1, PF_ValueDisplayFlag_PERCENT, 0,
+                         CG_LOOK_MIX);
+
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_FLOAT_SLIDERX("Temperature",
+                         CG_TEMPERATURE_MIN, CG_TEMPERATURE_MAX,
+                         CG_TEMPERATURE_MIN, CG_TEMPERATURE_MAX,
+                         CG_TEMPERATURE_DFLT,
+                         1, PF_ValueDisplayFlag_NONE, 0,
+                         CG_TEMPERATURE);
+
     out_data->num_params = CG_NUM_PARAMS;
     return err;
 }
@@ -1687,14 +1902,20 @@ static PF_Err UserChangedParam(PF_InData* in_data, PF_OutData* out_data,
         params[CG_SKIN_PROTECTION]->uu.change_flags |= PF_ChangeFlag_CHANGED_VALUE;
     } else if (extra->param_index == CG_OPEN_EDITOR) {
         // Open (or focus) the editor window, seeded with the current params so its
-        // controls start in sync with Effect Controls.
+        // controls start in sync with Effect Controls. The recipe (manual state) is
+        // read straight off the PF arb handle here - reliable at button-open.
+        RecipeData seedRecipe = RecipeFromHandle(in_data, params[CG_RECIPE]->u.arb_d.value);
         cg::editor::ParamSnapshot seed = MakeSnapshot(
             params[CG_FOOTAGE_PROFILE]->u.pd.value,
             params[CG_THEME]->u.pd.value,
             params[CG_STRENGTH]->u.fs_d.value / 100.0,
             params[CG_SKIN_PROTECTION]->u.fs_d.value / 100.0,
             params[CG_CHROMA_GAIN]->u.fs_d.value / 100.0,
-            params[CG_LUT_SOURCE]->u.pd.value);
+            params[CG_LUT_SOURCE]->u.pd.value,
+            params[CG_EXPOSURE]->u.fs_d.value,
+            params[CG_LOOK_MIX]->u.fs_d.value / 100.0,
+            params[CG_TEMPERATURE]->u.fs_d.value,
+            seedRecipe);
         const cg::editor::InstanceKey key = SeqKey(in_data);
         // Exactly one window per effect: close any orphan window bound to this same effect
         // under a stale key (e.g. from a delete+undo that reseeded the uid) before opening.
@@ -1782,9 +2003,13 @@ static PF_Err LegacyRender(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef
     const A_long theme = params[CG_THEME]->u.pd.value;
     const A_long footage = params[CG_FOOTAGE_PROFILE]->u.pd.value;
     const A_long source = params[CG_LUT_SOURCE]->u.pd.value;
+    const double exposure = params[CG_EXPOSURE]->u.fs_d.value;
+    const double lookMix = params[CG_LOOK_MIX]->u.fs_d.value / 100.0;
+    const double temperature = params[CG_TEMPERATURE]->u.fs_d.value;
     RecipeData recipe = RecipeFromHandle(in_data, params[CG_RECIPE]->u.arb_d.value);
     InjectAnalyzedStats(SeqKey(in_data), footage, recipe);  // Phase 5: adapt to the analysed clip
-    ResolveRenderData(in_data, source, theme, footage, strength01, skin01, chromaGain, recipe, data);
+    ResolveRenderData(in_data, source, theme, footage, strength01, skin01, chromaGain, exposure,
+                      lookMix, temperature, recipe, data);
 
     PF_EffectWorld* input = &params[CG_INPUT]->u.ld;
     AEFX_SuiteScoper<PF_Iterate8Suite2> iterate8(in_data, kPFIterate8Suite, kPFIterate8SuiteVersion2, out_data);
@@ -1839,6 +2064,22 @@ static PF_Err PreRender(PF_InData* in_data, PF_OutData* out_data, PF_PreRenderEx
     const A_long source = p.u.pd.value;
     ERR2(PF_CHECKIN_PARAM(in_data, &p));
 
+    // Phase 6a keyframeable params (live values fold into the bake).
+    AEFX_CLR_STRUCT(p);
+    ERR(PF_CHECKOUT_PARAM(in_data, CG_EXPOSURE, in_data->current_time, in_data->time_step, in_data->time_scale, &p));
+    const double exposure = p.u.fs_d.value;
+    ERR2(PF_CHECKIN_PARAM(in_data, &p));
+
+    AEFX_CLR_STRUCT(p);
+    ERR(PF_CHECKOUT_PARAM(in_data, CG_LOOK_MIX, in_data->current_time, in_data->time_step, in_data->time_scale, &p));
+    const double lookMix = p.u.fs_d.value / 100.0;
+    ERR2(PF_CHECKIN_PARAM(in_data, &p));
+
+    AEFX_CLR_STRUCT(p);
+    ERR(PF_CHECKOUT_PARAM(in_data, CG_TEMPERATURE, in_data->current_time, in_data->time_step, in_data->time_scale, &p));
+    const double temperature = p.u.fs_d.value;
+    ERR2(PF_CHECKIN_PARAM(in_data, &p));
+
     // Copy the grade recipe out of its arb handle before checkin (the handle is
     // only valid while checked out).
     AEFX_CLR_STRUCT(p);
@@ -1847,12 +2088,14 @@ static PF_Err PreRender(PF_InData* in_data, PF_OutData* out_data, PF_PreRenderEx
     ERR2(PF_CHECKIN_PARAM(in_data, &p));
 
     InjectAnalyzedStats(SeqKey(in_data), footage, recipe);  // Phase 5: adapt to the analysed clip
-    ResolveRenderData(in_data, source, theme, footage, strength01, skin01, chromaGain, recipe, *d);
+    ResolveRenderData(in_data, source, theme, footage, strength01, skin01, chromaGain, exposure,
+                      lookMix, temperature, recipe, *d);
 
     // Mirror the current params into the editor window (if one is open for this
     // instance), so its controls track Effect Controls. Safe from any render thread:
     // it is a locked value copy. Also reaps a window the user has since closed.
-    PublishEditorSnapshot(in_data, footage, theme, strength01, skin01, chromaGain, source);
+    PublishEditorSnapshot(in_data, footage, theme, strength01, skin01, chromaGain, source, exposure,
+                          lookMix, temperature, recipe);
 
     extra->output->pre_render_data = d;
     extra->output->delete_pre_render_data_func = DisposePreRenderData;

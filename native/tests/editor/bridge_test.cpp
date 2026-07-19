@@ -140,11 +140,59 @@ static void test_apply_roundtrip() {
     CHECK(s3.theme == 3, "popup index rounds to nearest");
 }
 
+// --- Phase 6a: the manual grade + keyframeable scalars round-trip ------------
+static void test_phase6a_manual() {
+    ParamSnapshot s;  // defaults: exposure 0, lookMix 1, temperature 0, manual neutral
+
+    // The three keyframeable scalar edits.
+    applyEdit(s, {EditField::Exposure, 1.75});
+    applyEdit(s, {EditField::Temperature, -40.0});
+    applyEdit(s, {EditField::LookMix, 0.5});
+    CHECK(approx(s.exposure, 1.75), "exposure applied");
+    CHECK(approx(s.temperature, -40.0), "temperature applied");
+    CHECK(approx(s.lookMix, 0.5), "look mix applied");
+    applyEdit(s, {EditField::LookMix, 1.9});  // over-range fraction clamps to 1
+    CHECK(approx(s.lookMix, 1.0), "look mix clamped to 1");
+
+    // A Manual edit carries the whole recipe-backed ManualState.
+    ParamEdit me;
+    me.field = EditField::Manual;
+    me.manual.contrast = 60;
+    me.manual.shadows = 30;
+    me.manual.saturation = 1.4;
+    me.manual.vibrance = 25;
+    applyEdit(s, me);
+    CHECK(approx(s.manual.contrast, 60) && approx(s.manual.shadows, 30) &&
+              approx(s.manual.saturation, 1.4) && approx(s.manual.vibrance, 25),
+          "manual state applied");
+
+    // Manual edits coalesce to one queue entry (latest ManualState wins).
+    EditQueue q;
+    ParamEdit a;
+    a.field = EditField::Manual;
+    a.manual.tint = 10;
+    q.push(a);
+    ParamEdit b;
+    b.field = EditField::Manual;
+    b.manual.tint = 55;
+    q.push(b);
+    CHECK(q.size() == 1, "manual edits coalesce to one field");
+    auto drained = q.drain();
+    CHECK(drained.size() == 1 && approx(drained[0].manual.tint, 55), "latest manual wins");
+
+    // ManualState equality (used by SnapshotChanged on the effect side).
+    ManualState m1, m2;
+    CHECK(m1 == m2, "default ManualState equal");
+    m2.blacks = -20;
+    CHECK(m1 != m2, "differing ManualState unequal");
+}
+
 int main() {
     test_queue_basic();
     test_queue_threaded();
     test_mapping();
     test_apply_roundtrip();
+    test_phase6a_manual();
 
     if (g_failures == 0) {
         std::printf("editor-bridge-test: PASS (all bridge-logic checks)\n");

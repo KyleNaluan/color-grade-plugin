@@ -59,6 +59,11 @@ struct Theme {
     FootageStats targetStats;
     std::optional<ThemeOverrides> overrides;
     ThemeKnobs knobs;
+    // Whether the engine runs its automatic stat-matching look. True for every
+    // shipping theme; the "None / Manual" theme sets it false so the stat-match
+    // stages contribute exact identity and manual grading is the whole look
+    // (Phase 6a). Ported from Theme.matchStats in theme.ts.
+    bool matchStats = true;
 };
 
 }  // namespace core

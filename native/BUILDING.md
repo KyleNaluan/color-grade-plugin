@@ -135,7 +135,7 @@ file ...aex"**.
   `GetModuleHandleEx` string arg to `LPCSTR`; Unicode would break it. Our own code uses
   explicit `...W` Win32 APIs, so it is charset-agnostic.
 
-### Editor window (Phase 3-4)
+### Editor window (Phase 3-6a)
 
 The editor is a Dear ImGui + Win32/D3D11 window opened from the **Open Editor…**
 button param. Toolkit rationale + the effect<->window bridge design live in
@@ -262,10 +262,12 @@ is ready, verify in AE 2025:
 1. **Registers & drags:** AE launched, the effect appears under **Effects & Presets ->
    Color Grade -> "CG Color Grade"**, and drags onto a layer. Effect Controls shows:
    **Footage** (Rec.709 / V-Log - Correct), **Theme** (Teal-Orange / Warm-Film /
-   Cool-Noir), **Strength**, **Skin Protection**, **Chroma Gain**, **LUT Source**
-   (Auto / Embedded / External), and **Open Editor…** (Phase 3 button). The **Grade
-   Recipe** arb-data param is data-only (no visible control) but persists in the
-   project - save, reopen the `.aep`, and confirm the grade survives.
+   Cool-Noir / None (Manual)), **Strength**, **Skin Protection**, **Chroma Gain**,
+   **LUT Source** (Auto / Embedded / External), **Open Editor…** (Phase 3 button), and
+   the Phase 6a keyframeable manual params appended at the end: **Exposure**, **Look
+   Mix**, **Temperature**. The **Grade Recipe** arb-data param is data-only (no visible
+   control) but persists in the project - save, reopen the `.aep`, and confirm the grade
+   survives (a pre-6a v2 recipe migrates forward, not reseeds).
 2. **Auto grade (Phase 2 engine path):** with LUT Source = "Auto (Theme + Analysis)", the
    layer takes on the selected **Theme**'s look, baked natively in-effect from the ported
    engine. Switching Theme changes the look; **Strength** scrubs 0% (identity) -> full;
@@ -287,15 +289,17 @@ is ready, verify in AE 2025:
    log). "Rec.709 (standard)" leaves the decode out. (The decode applies in every LUT
    Source mode - Embedded/External resample their raw LUT through it - so V-Log is never
    left undecoded; repeat with LUT Source = "Embedded"/"External" to confirm.)
-7. **Editor window (Phase 3-5):** click **Open Editor…**; the native editor window opens and
+7. **Editor window (Phase 3-6a):** click **Open Editor…**; the native editor window opens and
    AE stays responsive. Run the full editor checklist in
    `native/docs/adr-editor-ui.md` (button opens, single instance, controls round-trip
    both ways, no dialogs/hangs, sane close/reopen/project-close lifecycle, undo, plus the
    Phase 4 live-preview and deletion-lifecycle items - the window shows the letterboxed
    clip frame, updates on scrub/param change, and closes cleanly on effect/layer/comp
-   delete without a stale-ref modal - and the Phase 5 items 9-12: in-effect analysis
+   delete without a stale-ref modal - the Phase 5 items 9-12: in-effect analysis
    adapts the grade, analysis is post-decode on V-Log, live scopes render, and the
-   After/Before/Split toggle works).
+   After/Before/Split toggle works - and the Phase 6a items 13-18: the **Basics** tab
+   sliders round-trip live, neutral is identity, Exposure keyframes ramp, Strength
+   dilutes manual, a pre-6a grade survives load, and manual acts post-decode on V-Log).
 
 The numerical correctness of the ported engine is proven unattended by the cross-engine
 golden harness (`npm run native:core-parity`), so AE verification here is about the SDK glue

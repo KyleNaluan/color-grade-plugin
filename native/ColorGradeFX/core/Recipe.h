@@ -19,7 +19,9 @@
 #define CG_CORE_RECIPE_H
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <vector>
 
 #include "../lut/CubeLut.h"
@@ -32,7 +34,11 @@ namespace cg {
 namespace core {
 
 constexpr uint32_t RECIPE_MAGIC = 0x43475244;  // 'CGRD'
-constexpr uint32_t RECIPE_VERSION = 2;  // v2 added midtoneTint (PR #24)
+// v2 added midtoneTint (PR #24). v3 (Phase 6a) added the matchStats flag + the
+// manual primary-correction block + lookMix. The unflatten handler MIGRATES older
+// versions forward (copy the shared prefix, default the new fields) rather than
+// reseeding, so grades saved by an earlier build survive - see ColorGrade.cpp.
+constexpr uint32_t RECIPE_VERSION = 3;
 constexpr int RECIPE_MAX_POINTS = 16;
 constexpr int STATS_FIELDS = 21;
 
@@ -76,6 +82,26 @@ struct RecipeData {
 
     double strengthDefault = 0.8;
     double skinProtectionDefault = 0.75;
+
+    // --- v3 (Phase 6a) additions. Kept AFTER all v2 fields so a v2 blob's bytes
+    //     land identically and the migration only defaults these. ---
+    // Whether the theme runs the automatic stat-match look (0 = None/Manual theme).
+    uint32_t matchStats = 1;
+    // Manual primary correction (editor state). All neutral = identity. Exposure,
+    // temperature, and lookMix are ALSO exposed as keyframeable PF params; the
+    // effect overrides these three with the live PF value at bake time (decision D1).
+    double manualExposure = 0.0;
+    double manualContrast = 0.0;
+    double manualPivot = 0.435;
+    double manualHighlights = 0.0;
+    double manualShadows = 0.0;
+    double manualWhites = 0.0;
+    double manualBlacks = 0.0;
+    double manualTemperature = 0.0;
+    double manualTint = 0.0;
+    double manualSaturation = 1.0;
+    double manualVibrance = 0.0;
+    double lookMix = 1.0;
 };
 
 // --- canonical FootageStats <-> flat 21-double vector ---------------------
@@ -175,6 +201,9 @@ inline RecipeData recipeFromTheme(const Theme& theme, const FootageStats& source
     }
     r.strengthDefault = theme.knobs.strengthDefault;
     r.skinProtectionDefault = theme.knobs.skinProtectionDefault;
+    r.matchStats = theme.matchStats ? 1u : 0u;
+    // Manual block + lookMix keep their neutral defaults: manual grading is editor
+    // state, not theme data, so a freshly-seeded recipe carries a neutral manual grade.
     return r;
 }
 
@@ -204,13 +233,68 @@ inline Theme themeFromRecipe(const RecipeData& r) {
     if (cs.byLuma || cs.vibrance || cs.softLimit) ov.chromaShape = cs;
     t.overrides = ov;
     t.knobs = {r.strengthDefault, r.skinProtectionDefault};
+    t.matchStats = r.matchStats != 0;
     return t;
 }
 
+// Reconstruct the manual primary correction (EngineOptions.manual) from a recipe.
+inline ManualGrade manualFromRecipe(const RecipeData& r) {
+    ManualGrade m;
+    m.exposure = r.manualExposure;
+    m.contrast = r.manualContrast;
+    m.pivot = r.manualPivot;
+    m.highlights = r.manualHighlights;
+    m.shadows = r.manualShadows;
+    m.whites = r.manualWhites;
+    m.blacks = r.manualBlacks;
+    m.temperature = r.manualTemperature;
+    m.tint = r.manualTint;
+    m.saturation = r.manualSaturation;
+    m.vibrance = r.manualVibrance;
+    return m;
+}
+
 // In-effect bake: build the grade LUT the effect applies, straight from arb-data.
-// opts overrides (strength / skinProtection sliders) win over the recipe knobs.
+// opts overrides (strength / skinProtection sliders, and the live PF manual/lookMix)
+// win over the recipe. When the caller leaves manual / lookMix unset, they are taken
+// from the recipe, so the bake carries the persisted manual grade (Phase 6a).
 inline cg::Lut3D bakeFromRecipe(const RecipeData& r, const EngineOptions& opts = {}, int size = 33) {
-    return bakeGradeLut(statsFromData(r.sourceStats), themeFromRecipe(r), opts, size);
+    EngineOptions merged = opts;
+    if (!merged.manual) merged.manual = manualFromRecipe(r);
+    if (!merged.lookMix) merged.lookMix = r.lookMix;
+    return bakeGradeLut(statsFromData(r.sourceStats), themeFromRecipe(r), merged, size);
+}
+
+// --- versioned arb-data migration (the Phase 6a landmine) ------------------
+//
+// Byte size of the v2 RecipeData layout: every v3 (Phase 6a) field was appended
+// AFTER the v2 fields, so the first v3 field's offset is exactly the v2 struct
+// size and a v2 blob's bytes are a clean prefix of the v3 struct.
+constexpr std::size_t RECIPE_V2_SIZE = offsetof(RecipeData, matchStats);
+
+// Migrate a persisted (flattened) recipe blob into a current RecipeData. Old grades
+// must survive a version bump: a same-version blob copies verbatim; a v2 blob copies
+// its shared prefix over v3 defaults (new fields default to neutral: matchStats 1,
+// manual neutral, lookMix 1) and is re-stamped to the current version; anything
+// foreign/corrupt/unknown falls back to `fallback` (the caller supplies the default
+// recipe, keeping this header free of a Themes.h dependency). Single source of truth
+// for the AE arb-data UNFLATTEN handler and the parity harness.
+inline void migrateRecipeInto(RecipeData* dst, const void* flat, std::size_t flatSize,
+                              const RecipeData& fallback) {
+    RecipeData result = fallback;  // used verbatim only on the foreign/corrupt path
+    uint32_t magic = 0, ver = 0;
+    if (flatSize >= 2 * sizeof(uint32_t)) {
+        std::memcpy(&magic, flat, sizeof(uint32_t));
+        std::memcpy(&ver, static_cast<const char*>(flat) + sizeof(uint32_t), sizeof(uint32_t));
+    }
+    if (magic == RECIPE_MAGIC && ver == RECIPE_VERSION && flatSize == sizeof(RecipeData)) {
+        std::memcpy(&result, flat, sizeof(RecipeData));  // current version: verbatim
+    } else if (magic == RECIPE_MAGIC && ver == 2 && flatSize == RECIPE_V2_SIZE) {
+        result = RecipeData{};                       // start from current-version defaults
+        std::memcpy(&result, flat, RECIPE_V2_SIZE);  // v2 prefix over those defaults
+        result.version = RECIPE_VERSION;             // stamp forward; new fields defaulted
+    }
+    std::memcpy(dst, &result, sizeof(RecipeData));
 }
 
 }  // namespace core

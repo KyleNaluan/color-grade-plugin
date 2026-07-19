@@ -108,11 +108,36 @@ inline Theme coolNoirTheme() {
     return t;
 }
 
+// "None / Manual" theme (Phase 6a): matchStats == false, no authored overrides.
+// The stat-match stages contribute exact identity so manual grading is the whole
+// look. targetStats are unused while matchStats is false (carried only in the
+// recipe); they hold plausible neutral placeholders. Transcribed from
+// src/themes/none-manual.ts.
+inline Theme noneManualTheme() {
+    Theme t;
+    t.name = "none-manual";
+    t.description = "No automatic look - manual grading only.";
+    t.matchStats = false;
+    t.targetStats = FootageStats{
+        {0.02, 0.05, 0.25, 0.5, 0.75, 0.95, 0.98},  // lumaPercentiles
+        {50, 0, 0},                                  // labMean
+        {22, 10, 10},                                // labStd
+        {10, 12, 10},                                // bandChroma
+        {0.3, 0.15},                                 // saturation
+        0,                                           // skinPresence
+        {0.002, 0.002},                              // clipping
+    };
+    // No overrides.
+    t.knobs = {1.0, 0.75};
+    return t;
+}
+
 // Look a theme up by the same key strings src/themes/index.ts uses.
 inline bool getTheme(const std::string& key, Theme& out) {
     if (key == "teal-orange") { out = tealOrangeTheme(); return true; }
     if (key == "warm-film") { out = warmFilmTheme(); return true; }
     if (key == "cool-noir") { out = coolNoirTheme(); return true; }
+    if (key == "none-manual") { out = noneManualTheme(); return true; }
     return false;
 }
 

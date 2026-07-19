@@ -29,9 +29,30 @@
 namespace cg {
 namespace core {
 
+// Manual primary correction (Phase 6a). Ported from ManualGrade in engine.ts.
+// Neutral at NEUTRAL_MANUAL; each control contributes exact identity when neutral.
+struct ManualGrade {
+    double exposure = 0.0;     // stops; scene-linear multiply 2^EV
+    double contrast = 0.0;     // -100..100; S-slope about pivot
+    double pivot = 0.435;      // gamma-709 contrast pivot
+    double highlights = 0.0;   // -100..100 region lift (upper band)
+    double shadows = 0.0;      // -100..100 region lift (lower band)
+    double whites = 0.0;       // -100..100 region lift (shoulder)
+    double blacks = 0.0;       // -100..100 region lift (toe)
+    double temperature = 0.0;  // -100..100; LAB b bias (blue<->amber)
+    double tint = 0.0;         // -100..100; LAB a bias (green<->magenta)
+    double saturation = 1.0;   // 0..2; LAB chroma multiply (1 = neutral)
+    double vibrance = 0.0;     // -100..100; nonlinear chroma
+};
+
+// The neutral manual grade (mirrors NEUTRAL_MANUAL in engine.ts).
+inline ManualGrade neutralManual() { return ManualGrade{}; }
+
 struct EngineOptions {
     std::optional<double> strength;
     std::optional<double> skinProtection;
+    std::optional<ManualGrade> manual;  // Phase 6a manual primary correction
+    std::optional<double> lookMix;      // Phase 6a Look Mix (0..1, default 1)
 };
 
 namespace engine_detail {
@@ -39,6 +60,12 @@ inline double clampv(double x, double lo, double hi) {
     return x < lo ? lo : (x > hi ? hi : x);
 }
 inline double lerp(double a, double b, double t) { return a + (b - a) * t; }
+
+// Manual-stage tuning (ported verbatim from engine.ts).
+constexpr double MANUAL_REGION_LIFT = 0.5;  // gamma-709 lift at +-100 for hi/sh/wh/bl
+constexpr double MANUAL_TEMP_MAX = 30.0;    // LAB b units at +-100 (temperature)
+constexpr double MANUAL_TINT_MAX = 30.0;    // LAB a units at +-100 (tint)
+constexpr double VIBRANCE_FALLOFF = 25.0;   // LAB chroma e-folding (shared)
 
 // Smooth 0->1 ramp between edges.
 inline double smoothstep(double e0, double e1, double x) {
@@ -160,17 +187,102 @@ struct GradeTransform {
     bool hasMidtoneTint = false;
     std::array<double, 2> midtoneTint{0.0, 0.0};
 
+    // --- Manual primary correction (Phase 6a) ---
+    bool manualActive = false;
+    bool mExpActive = false;
+    double mExpGain = 1.0;
+    bool mContrastActive = false;
+    double mContrastSlope = 1.0;
+    double mPivot = 0.435;
+    bool mRegionActive = false;
+    double mAmtHi = 0.0, mAmtSh = 0.0, mAmtWh = 0.0, mAmtBl = 0.0;
+    bool mColorActive = false;
+    double mSat = 1.0, mVib = 0.0, mTempB = 0.0, mTintA = 0.0;
+    // Look Mix (0..1); blends the theme look over the manual-corrected pixel.
+    double lookMix = 1.0;
+    bool lookMixActive = false;
+    // Fast identity path: theme contributes no look and the manual stage is
+    // neutral, so the whole transform is a clamp (a clean identity LUT).
+    bool identity = false;
+
+    // Apply the manual stage on one decoded gamma-Rec.709 pixel (mirrors
+    // applyManual in engine.ts): exposure (linear) -> contrast (about pivot) ->
+    // region lifts (bandWeights) -> color (LAB temp/tint/saturation/vibrance).
+    Vec3d applyManual(double r0, double g0, double b0) const {
+        using engine_detail::smoothstep;
+        double r = r0, g = g0, b = b0;
+        if (mExpActive) {
+            r = rec709Encode(rec709Decode(r) * mExpGain);
+            g = rec709Encode(rec709Decode(g) * mExpGain);
+            b = rec709Encode(rec709Decode(b) * mExpGain);
+        }
+        if (mContrastActive) {
+            r = mPivot + (r - mPivot) * mContrastSlope;
+            g = mPivot + (g - mPivot) * mContrastSlope;
+            b = mPivot + (b - mPivot) * mContrastSlope;
+        }
+        if (mExpActive || mContrastActive) {
+            r = clamp01(r);
+            g = clamp01(g);
+            b = clamp01(b);
+        }
+        if (mRegionActive) {
+            const double y = luma709(r, g, b);
+            const Vec3d bw = bandWeights(y);
+            const double wBlack = 1.0 - smoothstep(0.0, 0.2, y);
+            const double wWhite = smoothstep(0.8, 1.0, y);
+            const double dY = mAmtSh * bw[0] + mAmtHi * bw[2] + mAmtBl * wBlack + mAmtWh * wWhite;
+            r = clamp01(r + dY);
+            g = clamp01(g + dY);
+            b = clamp01(b + dY);
+        }
+        if (mColorActive) {
+            const Vec3d labm = linearRec709ToLab({rec709Decode(r), rec709Decode(g), rec709Decode(b)});
+            double am = labm[1] * mSat;
+            double bm = labm[2] * mSat;
+            if (mVib != 0.0) {
+                const double chromam = std::hypot(am, bm);
+                if (chromam > 1e-6) {
+                    const double mult =
+                        std::max(0.0, 1.0 + mVib * std::exp(-chromam / engine_detail::VIBRANCE_FALLOFF));
+                    am *= mult;
+                    bm *= mult;
+                }
+            }
+            am += mTintA;
+            bm += mTempB;
+            const Vec3d linm = labToLinearRec709({labm[0], am, bm});
+            r = clamp01(rec709Encode(std::max(0.0, linm[0])));
+            g = clamp01(rec709Encode(std::max(0.0, linm[1])));
+            b = clamp01(rec709Encode(std::max(0.0, linm[2])));
+        }
+        return {r, g, b};
+    }
+
     Vec3d operator()(const Vec3d& rgb) const {
         using engine_detail::lerp;
-        const double VIBRANCE_FALLOFF = 25.0;
+        const double VIBRANCE_FALLOFF = engine_detail::VIBRANCE_FALLOFF;
         const double rIn = clamp01(rgb[0]);
         const double gIn = clamp01(rgb[1]);
         const double bIn = clamp01(rgb[2]);
 
+        // Fast identity path (None/Manual theme with no edits): clamp only.
+        if (identity) return {rIn, gIn, bIn};
+
+        // 0. Manual primary correction on the decoded footage, ahead of the theme
+        //    stages. The Strength/Skin identity target stays the ORIGINAL footage.
+        double rm = rIn, gm = gIn, bm = bIn;
+        if (manualActive) {
+            const Vec3d pm = applyManual(rIn, gIn, bIn);
+            rm = pm[0];
+            gm = pm[1];
+            bm = pm[2];
+        }
+
         // 1. Tone: stat-matching curve per channel, then authored curves.
-        const double r1 = rCurve(masterCurve(toneCurve(rIn)));
-        const double g1 = gCurve(masterCurve(toneCurve(gIn)));
-        const double b1 = bCurve(masterCurve(toneCurve(bIn)));
+        const double r1 = rCurve(masterCurve(toneCurve(rm)));
+        const double g1 = gCurve(masterCurve(toneCurve(gm)));
+        const double b1 = bCurve(masterCurve(toneCurve(bm)));
 
         // 2. Color in LAB.
         const Vec3d labIn = linearRec709ToLab({rec709Decode(rIn), rec709Decode(gIn), rec709Decode(bIn)});
@@ -223,6 +335,11 @@ struct GradeTransform {
             clamp01(rec709Encode(std::max(0.0, linOut[2]))),
         };
 
+        // 3c. Look Mix: fade the theme look toward the manual-corrected pixel.
+        if (lookMixActive) {
+            out = {lerp(rm, out[0], lookMix), lerp(gm, out[1], lookMix), lerp(bm, out[2], lookMix)};
+        }
+
         // 4/5. Strength + skin-tone protection: interpolate toward identity.
         double identityMix = 1.0 - strength;
         if (skinActive && protection > 0.0) {
@@ -249,13 +366,21 @@ inline GradeTransform buildTransform(const FootageStats& src, const Theme& theme
     t.srcMeanA = src.labMean[1];
     t.srcMeanB = src.labMean[2];
 
-    // Stat-matching tone curve from luma percentiles.
-    {
+    // Automatic stat-matching look: on for every shipping theme, off for the
+    // "None / Manual" theme (matchStats == false), where the tone curve, LAB
+    // mean/std transfer, per-band chroma scale, and chroma-overshoot guard all
+    // collapse to identity so manual grading is the whole look.
+    const bool matchStats = theme.matchStats;
+
+    // Stat-matching tone curve from luma percentiles (identity when off).
+    if (matchStats) {
         const auto& sp = src.lumaPercentiles;
         const auto& tp = tgt.lumaPercentiles;
         std::vector<double> xs = {0, sp.p5, sp.p25, sp.p50, sp.p75, sp.p95, 1};
         std::vector<double> ys = {0, tp.p5, tp.p25, tp.p50, tp.p75, tp.p95, 1};
         t.toneCurve = MonotoneCurve::make(xs, ys, /*forceMonotoneY=*/true);
+    } else {
+        t.toneCurve = MonotoneCurve::make({0.0, 1.0}, {0.0, 1.0}, /*forceMonotoneY=*/true);
     }
 
     // Damped LAB mean transfer (tanh soft-clamp on the mean-shift magnitude).
@@ -265,21 +390,31 @@ inline GradeTransform buildTransform(const FootageStats& src, const Theme& theme
     const double dist = std::hypot(dA, dB);
     const double damp =
         dist > 1e-6 ? (MAX_MEAN_SHIFT * std::tanh(dist / MAX_MEAN_SHIFT)) / dist : 1.0;
-    t.shiftA = dA * damp;
-    t.shiftB = dB * damp;
-    t.kA = clampv(tgt.labStd[1] / std::max({tgt.labStd[1] * 0.1, src.labStd[1], 1e-3}), 0.6, 1.8);
-    t.kB = clampv(tgt.labStd[2] / std::max({tgt.labStd[2] * 0.1, src.labStd[2], 1e-3}), 0.6, 1.8);
-
-    t.bandScale = {
-        clampv(tgt.bandChroma.shadows / std::max(src.bandChroma.shadows, 1.0), 0.5, 2.0),
-        clampv(tgt.bandChroma.mids / std::max(src.bandChroma.mids, 1.0), 0.5, 2.0),
-        clampv(tgt.bandChroma.highlights / std::max(src.bandChroma.highlights, 1.0), 0.5, 2.0),
-    };
-
-    // Automatic chroma-overshoot guard: damp the stat-derived auto chroma
-    // amplification for a large low->wide tone stretch, and adopt an auto soft
-    // ceiling if the theme authored none. Inert for ordinary sources.
-    const ChromaGuard guard = toneStretchChromaGuard(src, tgt);
+    ChromaGuard guard;
+    guard.stretch = 1.0;
+    guard.severity = 0.0;
+    guard.gain = 1.0;
+    guard.autoSoftLimit = std::nullopt;
+    if (matchStats) {
+        t.shiftA = dA * damp;
+        t.shiftB = dB * damp;
+        t.kA = clampv(tgt.labStd[1] / std::max({tgt.labStd[1] * 0.1, src.labStd[1], 1e-3}), 0.6, 1.8);
+        t.kB = clampv(tgt.labStd[2] / std::max({tgt.labStd[2] * 0.1, src.labStd[2], 1e-3}), 0.6, 1.8);
+        t.bandScale = {
+            clampv(tgt.bandChroma.shadows / std::max(src.bandChroma.shadows, 1.0), 0.5, 2.0),
+            clampv(tgt.bandChroma.mids / std::max(src.bandChroma.mids, 1.0), 0.5, 2.0),
+            clampv(tgt.bandChroma.highlights / std::max(src.bandChroma.highlights, 1.0), 0.5, 2.0),
+        };
+        // Automatic chroma-overshoot guard: damp the stat-derived auto chroma
+        // amplification for a large low->wide tone stretch; inert for ordinary sources.
+        guard = toneStretchChromaGuard(src, tgt);
+    } else {
+        t.shiftA = 0.0;
+        t.shiftB = 0.0;
+        t.kA = 1.0;
+        t.kB = 1.0;
+        t.bandScale = {1.0, 1.0, 1.0};
+    }
     t.guardGain = guard.gain;
 
     // Overrides (all optional; absent -> identity behaviour).
@@ -323,6 +458,43 @@ inline GradeTransform buildTransform(const FootageStats& src, const Theme& theme
         t.hasMidtoneTint = true;
         t.midtoneTint = *ov.midtoneTint;
     }
+
+    // --- Manual primary correction (Phase 6a) ---
+    const ManualGrade m = opts.manual.value_or(ManualGrade{});
+    if (opts.manual) {
+        t.mExpActive = m.exposure != 0.0;
+        t.mExpGain = t.mExpActive ? std::pow(2.0, m.exposure) : 1.0;
+        t.mContrastActive = m.contrast != 0.0;
+        t.mPivot = m.pivot;
+        t.mContrastSlope = t.mContrastActive
+                               ? (m.contrast >= 0.0 ? 1.0 + m.contrast / 100.0
+                                                    : 1.0 / (1.0 - m.contrast / 100.0))
+                               : 1.0;
+        t.mRegionActive =
+            m.highlights != 0.0 || m.shadows != 0.0 || m.whites != 0.0 || m.blacks != 0.0;
+        t.mAmtHi = (m.highlights / 100.0) * engine_detail::MANUAL_REGION_LIFT;
+        t.mAmtSh = (m.shadows / 100.0) * engine_detail::MANUAL_REGION_LIFT;
+        t.mAmtWh = (m.whites / 100.0) * engine_detail::MANUAL_REGION_LIFT;
+        t.mAmtBl = (m.blacks / 100.0) * engine_detail::MANUAL_REGION_LIFT;
+        t.mColorActive =
+            m.temperature != 0.0 || m.tint != 0.0 || m.saturation != 1.0 || m.vibrance != 0.0;
+        t.mSat = m.saturation;
+        t.mVib = m.vibrance / 100.0;
+        t.mTempB = (m.temperature / 100.0) * engine_detail::MANUAL_TEMP_MAX;
+        t.mTintA = (m.tint / 100.0) * engine_detail::MANUAL_TINT_MAX;
+    }
+    t.manualActive = t.mExpActive || t.mContrastActive || t.mRegionActive || t.mColorActive;
+
+    // Look Mix (0..1); blends the theme look over the manual-corrected pixel.
+    t.lookMix = clamp01(opts.lookMix.value_or(1.0));
+    t.lookMixActive = t.lookMix != 1.0;
+
+    // Fast identity path: theme contributes no look (stat-match off + no authored
+    // overrides) and the manual stage is neutral -> the transform is a clamp.
+    const bool themeLookIsIdentity =
+        !matchStats && !ov.shadowTint && !ov.highlightTint && !ov.midtoneTint &&
+        t.chromaGain == 1.0 && !ov.toneCurve && !ov.channelCurves && !ov.chromaShape;
+    t.identity = themeLookIsIdentity && !t.manualActive;
 
     return t;
 }
