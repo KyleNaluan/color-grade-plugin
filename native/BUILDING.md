@@ -268,7 +268,8 @@ is ready, verify in AE 2025:
    **Theme** (25 entries: None (Manual) /
    Teal-Orange / Warm-Film / Cool-Noir / Reference Match, then the 20-look PR #36
    library), **Strength**, **Skin Protection**, **Chroma Gain**,
-   **LUT Source** (Auto / Embedded / External), **Open Editor…** (Phase 3 button), and
+   **LUT Source** (Auto / Embedded / External / External + Correct/Basics),
+   **Open Editor…** (Phase 3 button), and
    the Phase 6a keyframeable manual params appended at the end: **Exposure**, **Look
    Mix**, **Temperature**. The **Grade Recipe** arb-data param is data-only (no visible
    control) but persists in the project - save, reopen the `.aep`, and confirm the grade
@@ -286,6 +287,11 @@ is ready, verify in AE 2025:
 4. **External .cube:** set `LUT Source` = "External .cube file" and either set env
    `CG_LUT_PATH` to a `.cube` **or** drop a `ColorGrade_LUT.cube` next to the `.aex` in
    MediaCore; the layer takes on that LUT. A bad/missing path falls back to the embedded LUT.
+   Then set `LUT Source` = "External .cube + Correct/Basics" (`fm/cg-lut-correct-stack`):
+   the same user `.cube` now applies UNDER the footage decode + manual Basics/LGG (chain
+   `decode -> correct/basics -> user LUT`), so a V-Log clip is decoded and any editor
+   Basics/Wheels edits show through the creative LUT. With a neutral correction the output
+   is identical to plain "External .cube file".
 5. **GPU path active:** Project Settings -> Video Rendering and Effects -> Mercury GPU
    Acceleration on; confirm the GPU path renders (same result as CPU). On this NVIDIA box
    (RTX 3090 + AMD) AE offers only CUDA, so expect the CUDA tracer lines; DirectX would

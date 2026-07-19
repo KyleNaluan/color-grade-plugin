@@ -16,8 +16,12 @@
  *   - "Embedded (Teal-Orange)" uses the compiled-in default LUT.
  *   - "External .cube file" loads from env CG_LUT_PATH, else <pluginDir>/ColorGrade_LUT.cube,
  *     falling back to the embedded LUT on any failure (so render never fails for a bad path).
- * The Auto path bakes strength into the LUT (post-LUT blend = 1.0); the embedded/
- * external paths blend by the strength slider, preserving Phase 1 behaviour.
+ *   - "External .cube + Correct/Basics" loads the same user .cube but folds the footage
+ *     decode + manual Basics/LGG UNDER it at bake time (chain decode -> correct/basics ->
+ *     user LUT); a neutral correction collapses to the plain "External .cube file" output.
+ * The Auto and "External .cube + Correct/Basics" paths bake strength into the LUT
+ * (post-LUT blend = 1.0); the embedded/plain-external paths blend by the strength
+ * slider, preserving Phase 1 behaviour.
  */
 
 // cuda_runtime.h must precede ColorGrade.h: it defines MAJOR_VERSION/MINOR_VERSION macros
