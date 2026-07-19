@@ -11,7 +11,11 @@
  *     edit (thread-safety of the cross-thread channel),
  *   - percent<->fraction mapping round-trips and the clamps hold their bands,
  *   - applyEdit models the param write: a drained edit lands back in the snapshot
- *     the window displays (the "edit reflects in Effect Controls" invariant, pure).
+ *     the window displays (the "edit reflects in Effect Controls" invariant, pure),
+ *   - the Phase 6b/6c curve/wheel point manipulation (curveInsert/Clamp/Remove and
+ *     the wheel-disc mapping) round-trips, including the far-drag monotone case
+ *     (a dragged point stays x-ascending and y-non-decreasing so the baked PCHIP
+ *     still passes through every dot).
  *
  * Self-asserting: returns non-zero and prints the first failure on any mismatch.
  */

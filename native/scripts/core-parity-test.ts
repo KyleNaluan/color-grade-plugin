@@ -1,12 +1,16 @@
 /*
- * core-parity-test.ts - Phase 2 cross-engine golden harness.
+ * core-parity-test.ts - Phase 2-6c cross-engine golden harness.
  *
  * Proves the C++ core port (native/ColorGradeFX/core/*.h) matches the TS oracle
  * (src/core/*) within TOL (~1e-4) end to end:
  *   - computeStats over representative synthetic frames,
  *   - bakeGradeLut(computeStats(frame), theme, opts) across all shipping themes
- *     and the typed knob space (strength / skinProtection overrides), and
- *   - bakeDecodeLut for every profile in PROFILES.
+ *     and the typed knob space (strength / skinProtection overrides),
+ *   - bakeDecodeLut for every profile in PROFILES,
+ *   - the arb-data recipe round-trip and later-phase stages: the Phase 6a manual
+ *     grade + Look Mix, the Phase 6c DaVinci LGG wheel stage, the Phase 6b/6c
+ *     `applyEditorOverrides` render-path composition (curves + wheel tints), and
+ *     the v2/v3 -> v4 recipe migration.
  *
  * The TS side generates the golden vectors; the C++ side (tests/parity/core_parity.cpp)
  * replays the SAME chain natively and writes its results as raw f32/f64 buffers,

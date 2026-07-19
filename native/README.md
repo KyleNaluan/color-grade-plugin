@@ -1,4 +1,4 @@
-# native/ - Color Grade native After Effects effect (Phase 6a)
+# native/ - Color Grade native After Effects effect (Phase 6b/6c)
 
 The Windows-first native re-platform of Color Grade from a CEP panel to a C++ AE Effect
 SDK plugin.
@@ -33,7 +33,7 @@ SDK plugin.
   `editor/Scopes.h`, and `splitViewGeometry` in `editor/PreviewCache.h`
   (see `docs/adr-editor-ui.md`, "Phase 5" section).
 
-- **Phase 6a** (this milestone): the **manual grade suite (Basics)** - a manual
+- **Phase 6a** (landed): the **manual grade suite (Basics)** - a manual
   primary-correction stage that runs *ahead* of the theme stages on decoded gamma-Rec.709
   (Exposure, Contrast+pivot, Highlights/Shadows/Whites/Blacks, Temperature/Tint, Saturation,
   Vibrance), every control neutral-gated to exact identity. A new **None (Manual)** theme
@@ -42,6 +42,16 @@ SDK plugin.
   (Exposure / Look Mix / Temperature) are appended after the recipe; the editor gains a
   **Basics** tab and the recipe grew a versioned migration (v2->v3) so old saved grades
   survive (see `docs/adr-editor-ui.md`, "Phase 6a" section).
+
+- **Phase 6b/6c** (this milestone): **Curves + Wheels** editor tabs. **6b Curves** is
+  UI-only (the engine already evaluated the tone + per-channel R/G/B curves) - an interactive
+  ImGui curve widget writing recipe-backed curve state. **6c Wheels** adds a new DaVinci
+  **Lift/Gamma/Gain** engine stage (per-channel printer-lights, neutral = exact identity,
+  oracle-first then bit-exact port) plus an Adobe-style **3-way** secondary mode that adds no
+  engine math (additive band tints + shared LGG-master luminance). All editor look-state
+  lives in dedicated **user** recipe fields composed onto the popup theme by the shared
+  `cg::core::applyEditorOverrides`; no new keyframeable params; the recipe migration grew a
+  v3->v4 arm so old grades survive (see `docs/adr-editor-ui.md`, "Phase 6b/6c" section).
 
 ## Layout
 
@@ -60,25 +70,25 @@ native/
       MonotoneCurve.h                 PCHIP tone/shape curves
       Stats.h                         FootageStats + computeStats
       Theme.h Themes.h                Theme type + the shipping themes (3 stat-match + None/Manual, data, transcribed)
-      Engine.h                        buildTransform (manual stage + the grade transform + Look Mix)
+      Engine.h                        buildTransform (manual stage + LGG wheels stage + the grade transform + Look Mix)
       BakeLut.h                       bakeLut / bakeGradeLut / bakeDecodeLut -> cg::Lut3D
-      Recipe.h                        POD arb-data recipe (+ manual block) + <-> Theme/stats + bakeFromRecipe + v2->v3 migrateRecipeInto
+      Recipe.h                        POD arb-data recipe (+ manual block + editor user fields) + <-> Theme/stats + bakeFromRecipe + applyEditorOverrides + v2/v3->v4 migrateRecipeInto
     lut/CubeLut.h                   ported parseCube + sampleLut (mirrors src/core/lut/cube.ts)
     embedded/EmbeddedLut.h          GENERATED default LUT (teal-orange grade, 17^3)
-    editor/                         Phase 3-5 editor window (see docs/adr-editor-ui.md)
-      EditorBridge.h                  pure effect<->window seam (edit queue + mapping); headless-tested
+    editor/                         Phase 3-6c editor window (see docs/adr-editor-ui.md)
+      EditorBridge.h                  pure effect<->window seam (edit queue + mapping + curve/wheel point logic); headless-tested
       PreviewCache.h                  Phase 4-5 pure preview core (cache/keying/fit/checkin + split geometry); headless-tested
       Analysis.h                      Phase 5 pure analysis core (frame-sampling schedule + incremental job + fingerprint/debounce); headless-tested
       Scopes.h                        Phase 5 pure scope synthesis (waveform/histogram/vectorscope binning -> RGBA8); headless-tested
-      EditorWindow.h / .cpp           Win32/D3D11/ImGui host + preview/scope textures (no-op stubs off Windows)
+      EditorWindow.h / .cpp           Win32/D3D11/ImGui host + preview/scope textures + curve/wheel widgets (no-op stubs off Windows)
     Win/ColorGradeFX.vcxproj/.sln   MSBuild project (CPU default; /p:CG_GPU=true builds DirectX + CUDA)
   third_party/imgui/                vendored Dear ImGui v1.91.5 (MIT) + Win32/D3D11 backends
-  docs/adr-editor-ui.md             Phase 3 toolkit decision (ImGui vs webview) + bridge design + Phase 4 preview + Phase 5 analysis/scopes + Phase 6a manual grade
+  docs/adr-editor-ui.md             Phase 3 toolkit decision (ImGui vs webview) + bridge design + Phase 4 preview + Phase 5 analysis/scopes + Phase 6a manual grade + Phase 6b/6c curves + wheels
   tests/parity/
     parity_test.cpp                 Phase 1: sampleLut vs TS oracle
-    core_parity.cpp                 Phase 2-6a: computeStats / bakeGradeLut / bakeDecodeLut / recipe / manual grade + Look Mix / v2->v3 migrate replay
+    core_parity.cpp                 Phase 2-6c: computeStats / bakeGradeLut / bakeDecodeLut / recipe / manual grade + Look Mix / LGG + editor-override render path / v2/v3->v4 migrate replay
   tests/editor/
-    bridge_test.cpp                 Phase 3: editor<->effect bridge logic (headless, self-asserting)
+    bridge_test.cpp                 Phase 3-6c: editor<->effect bridge logic + curve/wheel round-trip + far-drag monotone (headless, self-asserting)
     preview_test.cpp                Phase 4: live-preview core (cache/keying/fit/checkin; headless, self-asserting)
     analysis_test.cpp               Phase 5: analysis schedule/job/debounce (headless, self-asserting)
     scopes_test.cpp                 Phase 5: scope binning + image synthesis (headless, self-asserting)

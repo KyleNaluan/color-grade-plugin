@@ -1,5 +1,5 @@
 /*
- * core_parity.cpp - C++ side of the Phase 2 cross-engine golden harness.
+ * core_parity.cpp - C++ side of the Phase 2-6c cross-engine golden harness.
  *
  * Replays the ported core (computeStats -> buildTransform -> bakeLut, and the
  * Decode LUT bake) over inputs supplied by the TS oracle
@@ -16,6 +16,13 @@
  *   recipe <pixels.f32> <nFloats> <theme> <hasStr> <str> <hasSkin> <skin> <size> <out.f32>
  *       computeStats then recipeFromTheme -> bakeFromRecipe (the arb-data path);
  *       must match the plain `grade` result, proving the POD recipe round-trip.
+ *
+ * Later phases add further subcommands over the same channel (see the TS oracle for
+ * their exact arg lists): `grademid`/`chromaslider` (theme override + knob), the
+ * `*decode` family (Phase 3 decode composition), `grademanual`/`recipemanual` (Phase 6a
+ * manual stage + arb round-trip), `gradelgg`/`recipelgg` (Phase 6c DaVinci LGG stage),
+ * `recipeeditor` (the Phase 6b/6c `applyEditorOverrides` render-path composition guard),
+ * and `migrate` (v2/v3 -> v4 recipe migration).
  *
  * Buffers are raw little-endian arrays (matching JS Float32Array / Float64Array)
  * on the shared x86-64 host; not a portable serialization, just a test channel.
