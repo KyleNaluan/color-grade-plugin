@@ -142,12 +142,21 @@ enum {
 #define CG_THEME_COUNT 25
 
 // LUT-source popup order (1-based). Auto bakes the grade from theme + recipe.
+// "External .cube + Correct/Basics" applies the footage decode AND the manual
+// primary correction (Basics + LGG wheels from the recipe) UNDER the user's own
+// creative .cube: decode -> correct/basics -> user LUT (fm/cg-lut-correct-stack).
+// Appending a popup CHOICE is the established safe pattern (no arb-data change,
+// no AE_Effect_Version bump, no new editor-bridge field - the LUT Source stream
+// already round-trips through the editor). Plain "External .cube file" keeps its
+// prior decode -> user LUT behavior unchanged (correction disabled).
 enum {
     CG_SRC_AUTO = 1,
     CG_SRC_EMBEDDED,
-    CG_SRC_EXTERNAL
+    CG_SRC_EXTERNAL,
+    CG_SRC_EXTERNAL_CORRECT
 };
-#define CG_LUT_SOURCE_CHOICES "Auto (Theme + Analysis)|Embedded (Teal-Orange)|External .cube file"
+#define CG_LUT_SOURCE_CHOICES \
+    "Auto (Theme + Analysis)|Embedded (Teal-Orange)|External .cube file|External .cube + Correct/Basics"
 
 #define CG_STRENGTH_MIN    0
 #define CG_STRENGTH_MAX    100

@@ -179,30 +179,13 @@ inline ChromaGuard toneStretchChromaGuard(const FootageStats& src, const Footage
     return g;
 }
 
-struct GradeTransform {
-    // Precomputed grade state (built by buildTransform).
-    MonotoneCurve toneCurve;
-    double strength = 0.0;
-    double protection = 0.0;
-    bool skinActive = false;
-    double srcMeanA = 0.0, srcMeanB = 0.0;
-    double shiftA = 0.0, shiftB = 0.0;
-    double kA = 1.0, kB = 1.0;
-    Vec3d bandScale{1.0, 1.0, 1.0};
-    double chromaGain = 1.0;
-    double guardGain = 1.0;  // chroma-overshoot guard gain, folded into `scale`
-    engine_detail::ClampedCurve masterCurve, rCurve, gCurve, bCurve;
-    engine_detail::ChromaByLuma chromaByLuma;
-    double vibrance = 0.0;
-    bool hasSoftLimit = false;
-    double softLimit = 0.0;
-    bool hasShadowTint = false;
-    std::array<double, 2> shadowTint{0.0, 0.0};
-    bool hasHighlightTint = false;
-    std::array<double, 2> highlightTint{0.0, 0.0};
-    bool hasMidtoneTint = false;
-    std::array<double, 2> midtoneTint{0.0, 0.0};
-
+// The manual-primaries slot (Phase 6a manual basics + Phase 6c LGG wheels),
+// precomputed once. Mirrors buildManualPrimaries/ManualPrimaries in engine.ts.
+// buildTransform embeds one ahead of the theme look; makeManualPrimaries also
+// serves it standalone for the "Correct/Basics under a user LUT" composition
+// (decode -> correct/basics -> user LUT). Each sub-op is gated so a neutral
+// control contributes exact identity.
+struct ManualPrimaries {
     // --- Manual primary correction (Phase 6a) ---
     bool manualActive = false;
     bool mExpActive = false;
@@ -219,12 +202,8 @@ struct GradeTransform {
     double lgLift[3] = {0.0, 0.0, 0.0};
     double lgGain[3] = {1.0, 1.0, 1.0};
     double lgInvGamma[3] = {1.0, 1.0, 1.0};  // 1/gamma, precomputed
-    // Look Mix (0..1); blends the theme look over the manual-corrected pixel.
-    double lookMix = 1.0;
-    bool lookMixActive = false;
-    // Fast identity path: theme contributes no look and the manual stage is
-    // neutral, so the whole transform is a clamp (a clean identity LUT).
-    bool identity = false;
+
+    bool active() const { return manualActive || lggActive; }
 
     // Apply the manual stage on one decoded gamma-Rec.709 pixel (mirrors
     // applyManual in engine.ts): exposure (linear) -> contrast (about pivot) ->
@@ -292,6 +271,110 @@ struct GradeTransform {
                 ch(b, lgLift[2], lgGain[2], lgInvGamma[2])};
     }
 
+    // Manual basics then LGG wheels, each gated; identity when both are neutral.
+    Vec3d apply(const Vec3d& rgb) const {
+        double r = rgb[0], g = rgb[1], b = rgb[2];
+        if (manualActive) {
+            const Vec3d p = applyManual(r, g, b);
+            r = p[0];
+            g = p[1];
+            b = p[2];
+        }
+        if (lggActive) {
+            const Vec3d p = applyLgg(r, g, b);
+            r = p[0];
+            g = p[1];
+            b = p[2];
+        }
+        return {r, g, b};
+    }
+};
+
+// Precompute the manual-primaries stage from optional manual + LGG (mirrors
+// buildManualPrimaries in engine.ts).
+inline ManualPrimaries makeManualPrimaries(const std::optional<ManualGrade>& manual,
+                                           const std::optional<LiftGammaGain>& lgg) {
+    ManualPrimaries p;
+    if (manual) {
+        const ManualGrade m = *manual;
+        p.mExpActive = m.exposure != 0.0;
+        p.mExpGain = p.mExpActive ? std::pow(2.0, m.exposure) : 1.0;
+        p.mContrastActive = m.contrast != 0.0;
+        p.mPivot = m.pivot;
+        p.mContrastSlope = p.mContrastActive
+                               ? (m.contrast >= 0.0 ? 1.0 + m.contrast / 100.0
+                                                    : 1.0 / (1.0 - m.contrast / 100.0))
+                               : 1.0;
+        p.mRegionActive =
+            m.highlights != 0.0 || m.shadows != 0.0 || m.whites != 0.0 || m.blacks != 0.0;
+        p.mAmtHi = (m.highlights / 100.0) * engine_detail::MANUAL_REGION_LIFT;
+        p.mAmtSh = (m.shadows / 100.0) * engine_detail::MANUAL_REGION_LIFT;
+        p.mAmtWh = (m.whites / 100.0) * engine_detail::MANUAL_REGION_LIFT;
+        p.mAmtBl = (m.blacks / 100.0) * engine_detail::MANUAL_REGION_LIFT;
+        p.mColorActive =
+            m.temperature != 0.0 || m.tint != 0.0 || m.saturation != 1.0 || m.vibrance != 0.0;
+        p.mSat = m.saturation;
+        p.mVib = m.vibrance / 100.0;
+        p.mTempB = (m.temperature / 100.0) * engine_detail::MANUAL_TEMP_MAX;
+        p.mTintA = (m.tint / 100.0) * engine_detail::MANUAL_TINT_MAX;
+    }
+    p.manualActive = p.mExpActive || p.mContrastActive || p.mRegionActive || p.mColorActive;
+    if (lgg) {
+        const LiftGammaGain& lg = *lgg;
+        p.lggActive = lg.lift[0] != 0.0 || lg.lift[1] != 0.0 || lg.lift[2] != 0.0 ||
+                      lg.gamma[0] != 1.0 || lg.gamma[1] != 1.0 || lg.gamma[2] != 1.0 ||
+                      lg.gain[0] != 1.0 || lg.gain[1] != 1.0 || lg.gain[2] != 1.0;
+        for (int c = 0; c < 3; ++c) {
+            p.lgLift[c] = lg.lift[c];
+            p.lgGain[c] = lg.gain[c];
+            p.lgInvGamma[c] = 1.0 / std::max(LGG_GAMMA_FLOOR, lg.gamma[c]);
+        }
+    }
+    return p;
+}
+
+// Apply the manual-primaries stage to one gamma-Rec.709 pixel, standalone
+// (mirrors applyManualPrimaries in engine.ts).
+inline Vec3d applyManualPrimaries(const Vec3d& rgb, const std::optional<ManualGrade>& manual,
+                                  const std::optional<LiftGammaGain>& lgg) {
+    return makeManualPrimaries(manual, lgg).apply(rgb);
+}
+
+struct GradeTransform {
+    // Precomputed grade state (built by buildTransform).
+    MonotoneCurve toneCurve;
+    double strength = 0.0;
+    double protection = 0.0;
+    bool skinActive = false;
+    double srcMeanA = 0.0, srcMeanB = 0.0;
+    double shiftA = 0.0, shiftB = 0.0;
+    double kA = 1.0, kB = 1.0;
+    Vec3d bandScale{1.0, 1.0, 1.0};
+    double chromaGain = 1.0;
+    double guardGain = 1.0;  // chroma-overshoot guard gain, folded into `scale`
+    engine_detail::ClampedCurve masterCurve, rCurve, gCurve, bCurve;
+    engine_detail::ChromaByLuma chromaByLuma;
+    double vibrance = 0.0;
+    bool hasSoftLimit = false;
+    double softLimit = 0.0;
+    bool hasShadowTint = false;
+    std::array<double, 2> shadowTint{0.0, 0.0};
+    bool hasHighlightTint = false;
+    std::array<double, 2> highlightTint{0.0, 0.0};
+    bool hasMidtoneTint = false;
+    std::array<double, 2> midtoneTint{0.0, 0.0};
+
+    // --- Manual-primaries slot (Phase 6a basics + Phase 6c LGG wheels) ---
+    // Precomputed via makeManualPrimaries; also usable standalone for the
+    // Correct/Basics-under-LUT composition.
+    ManualPrimaries primaries;
+    // Look Mix (0..1); blends the theme look over the manual-corrected pixel.
+    double lookMix = 1.0;
+    bool lookMixActive = false;
+    // Fast identity path: theme contributes no look and the manual stage is
+    // neutral, so the whole transform is a clamp (a clean identity LUT).
+    bool identity = false;
+
     Vec3d operator()(const Vec3d& rgb) const {
         using engine_detail::lerp;
         const double VIBRANCE_FALLOFF = engine_detail::VIBRANCE_FALLOFF;
@@ -305,17 +388,11 @@ struct GradeTransform {
         // 0. Manual primary correction + LGG wheels on the decoded footage, ahead of
         //    the theme stages. The Strength/Skin identity target stays the ORIGINAL footage.
         double rm = rIn, gm = gIn, bm = bIn;
-        if (manualActive) {
-            const Vec3d pm = applyManual(rm, gm, bm);
+        if (primaries.active()) {
+            const Vec3d pm = primaries.apply({rm, gm, bm});
             rm = pm[0];
             gm = pm[1];
             bm = pm[2];
-        }
-        if (lggActive) {
-            const Vec3d pl = applyLgg(rm, gm, bm);
-            rm = pl[0];
-            gm = pl[1];
-            bm = pl[2];
         }
 
         // 1. Tone: stat-matching curve per channel, then authored curves.
@@ -498,44 +575,10 @@ inline GradeTransform buildTransform(const FootageStats& src, const Theme& theme
         t.midtoneTint = *ov.midtoneTint;
     }
 
-    // --- Manual primary correction (Phase 6a) ---
-    const ManualGrade m = opts.manual.value_or(ManualGrade{});
-    if (opts.manual) {
-        t.mExpActive = m.exposure != 0.0;
-        t.mExpGain = t.mExpActive ? std::pow(2.0, m.exposure) : 1.0;
-        t.mContrastActive = m.contrast != 0.0;
-        t.mPivot = m.pivot;
-        t.mContrastSlope = t.mContrastActive
-                               ? (m.contrast >= 0.0 ? 1.0 + m.contrast / 100.0
-                                                    : 1.0 / (1.0 - m.contrast / 100.0))
-                               : 1.0;
-        t.mRegionActive =
-            m.highlights != 0.0 || m.shadows != 0.0 || m.whites != 0.0 || m.blacks != 0.0;
-        t.mAmtHi = (m.highlights / 100.0) * engine_detail::MANUAL_REGION_LIFT;
-        t.mAmtSh = (m.shadows / 100.0) * engine_detail::MANUAL_REGION_LIFT;
-        t.mAmtWh = (m.whites / 100.0) * engine_detail::MANUAL_REGION_LIFT;
-        t.mAmtBl = (m.blacks / 100.0) * engine_detail::MANUAL_REGION_LIFT;
-        t.mColorActive =
-            m.temperature != 0.0 || m.tint != 0.0 || m.saturation != 1.0 || m.vibrance != 0.0;
-        t.mSat = m.saturation;
-        t.mVib = m.vibrance / 100.0;
-        t.mTempB = (m.temperature / 100.0) * engine_detail::MANUAL_TEMP_MAX;
-        t.mTintA = (m.tint / 100.0) * engine_detail::MANUAL_TINT_MAX;
-    }
-    t.manualActive = t.mExpActive || t.mContrastActive || t.mRegionActive || t.mColorActive;
-
-    // --- Lift/Gamma/Gain wheels (Phase 6c) ---
-    if (opts.lgg) {
-        const LiftGammaGain& lg = *opts.lgg;
-        t.lggActive = lg.lift[0] != 0.0 || lg.lift[1] != 0.0 || lg.lift[2] != 0.0 ||
-                      lg.gamma[0] != 1.0 || lg.gamma[1] != 1.0 || lg.gamma[2] != 1.0 ||
-                      lg.gain[0] != 1.0 || lg.gain[1] != 1.0 || lg.gain[2] != 1.0;
-        for (int c = 0; c < 3; ++c) {
-            t.lgLift[c] = lg.lift[c];
-            t.lgGain[c] = lg.gain[c];
-            t.lgInvGamma[c] = 1.0 / std::max(LGG_GAMMA_FLOOR, lg.gamma[c]);
-        }
-    }
+    // --- Manual-primaries slot (Phase 6a basics + Phase 6c LGG wheels) ---
+    // Precomputed once via the shared builder (also used standalone by the
+    // Correct/Basics-under-LUT path); neutral controls contribute exact identity.
+    t.primaries = makeManualPrimaries(opts.manual, opts.lgg);
 
     // Look Mix (0..1); blends the theme look over the manual-corrected pixel.
     t.lookMix = clamp01(opts.lookMix.value_or(1.0));
@@ -546,7 +589,7 @@ inline GradeTransform buildTransform(const FootageStats& src, const Theme& theme
     const bool themeLookIsIdentity =
         !matchStats && !ov.shadowTint && !ov.highlightTint && !ov.midtoneTint &&
         t.chromaGain == 1.0 && !ov.toneCurve && !ov.channelCurves && !ov.chromaShape;
-    t.identity = themeLookIsIdentity && !t.manualActive && !t.lggActive;
+    t.identity = themeLookIsIdentity && !t.primaries.active();
 
     return t;
 }

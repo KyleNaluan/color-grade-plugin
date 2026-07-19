@@ -19,7 +19,8 @@
  *
  * Later phases add further subcommands over the same channel (see the TS oracle for
  * their exact arg lists): `grademid`/`chromaslider` (theme override + knob), the
- * `*decode` family (Phase 3 decode composition), `grademanual`/`recipemanual` (Phase 6a
+ * `*decode` family (Phase 3 decode composition), `lutcorrect` (Correct/Basics folded
+ * under a user LUT, fm/cg-lut-correct-stack), `grademanual`/`recipemanual` (Phase 6a
  * manual stage + arb round-trip), `gradelgg`/`recipelgg` (Phase 6c DaVinci LGG stage),
  * `recipeeditor` (the Phase 6b/6c `applyEditorOverrides` render-path composition guard),
  * `migrate` (v2/v3 -> v4 recipe migration), `referencematch` (Phase 7 reference-image
@@ -316,6 +317,51 @@ int main(int argc, char** argv) {
             },
             size);
         writeF32(argv[12], lut.data);
+        return 0;
+    }
+
+    if (cmd == "lutcorrect" && argc == 11) {
+        // Exercise the effect's "External .cube + Correct/Basics" mode
+        // (ComposeDecodeIntoLut with ManualPrimaries; fm/cg-lut-correct-stack): fold the
+        // footage decode AND the manual primaries (Basics + LGG wheels) UNDER the user LUT,
+        // with Strength baked as a decoded-space blend:
+        //   newLut(x) = lerp(decode(x), rawLut(primaries(decode(x))), s).
+        // A baked grade LUT stands in for the user .cube. Mirrors ResolveRenderData's
+        // CG_SRC_EXTERNAL_CORRECT path exactly.
+        const size_t n = static_cast<size_t>(std::strtoull(argv[3], nullptr, 10));
+        std::vector<float> px = readF32(argv[2], n);
+        Theme theme;
+        if (!getTheme(argv[4], theme)) {
+            std::fprintf(stderr, "core_parity: unknown theme %s\n", argv[4]);
+            return 2;
+        }
+        const int size = std::atoi(argv[5]);
+        const LogProfile* profile = getProfile(argv[6]);
+        if (!profile) { std::fprintf(stderr, "core_parity: unknown profile %s\n", argv[6]); return 2; }
+        ManualGrade m;
+        double lookMix = 1.0;
+        parseManual(argv[7], m, lookMix);  // lookMix unused: primaries carry no theme look
+        LiftGammaGain lg;
+        parseLgg(argv[8], lg);
+        const double s01 = std::atof(argv[9]);
+        FootageStats stats = computeStats(px.data(), px.size());
+        cg::Lut3D raw = bakeGradeLut(stats, theme, EngineOptions{}, size);
+        const ManualPrimaries primaries = makeManualPrimaries(m, lg);
+        cg::Lut3D lut = bakeLut(
+            [&raw, profile, &primaries, s01](const Vec3d& x) -> Vec3d {
+                const Vec3d dec = decodePixelToRec709(x, *profile);
+                const Vec3d corrected = primaries.apply(dec);
+                const cg::Vec3 s = cg::sampleLut(
+                    raw, cg::Vec3{static_cast<float>(corrected[0]), static_cast<float>(corrected[1]),
+                                  static_cast<float>(corrected[2])});
+                return Vec3d{
+                    dec[0] * (1.0 - s01) + s[0] * s01,
+                    dec[1] * (1.0 - s01) + s[1] * s01,
+                    dec[2] * (1.0 - s01) + s[2] * s01,
+                };
+            },
+            size);
+        writeF32(argv[10], lut.data);
         return 0;
     }
 

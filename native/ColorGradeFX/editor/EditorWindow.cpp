@@ -799,7 +799,9 @@ const char* const kThemeNames[] = {
     "Cinematic Green", "Desaturated Doc", "Punchy Social", "Cross Process", "Rose Romance"};
 constexpr int kThemeCount = 25;
 const char* const kLutSourceNames[] = {"Auto (Theme + Analysis)", "Embedded (Teal-Orange)",
-                                       "External .cube file"};
+                                       "External .cube file",
+                                       "External .cube + Correct/Basics"};
+constexpr int kLutSourceCount = static_cast<int>(sizeof(kLutSourceNames) / sizeof(kLutSourceNames[0]));
 
 // Draw one ImGui frame from a working copy of the snapshot; push any change onto
 // the edit queue. Returns nothing - edits flow through w->edits to the effect.
@@ -994,10 +996,14 @@ void DrawEditorUI(WindowImpl* w, ParamSnapshot& ui) {
             // --- LUT source popup ---
             int srcIdx = ui.lutSource - 1;
             if (srcIdx < 0) srcIdx = 0;
-            if (srcIdx > 2) srcIdx = 2;
-            if (ImGui::Combo("LUT Source", &srcIdx, kLutSourceNames, 3)) {
+            if (srcIdx > kLutSourceCount - 1) srcIdx = kLutSourceCount - 1;
+            if (ImGui::Combo("LUT Source", &srcIdx, kLutSourceNames, kLutSourceCount)) {
                 ui.lutSource = srcIdx + 1;
                 w->edits.push({EditField::LutSource, static_cast<double>(ui.lutSource)});
+            }
+            if (ui.lutSource == 4) {
+                ImGui::TextWrapped("Applies the footage decode + Basics (and LGG wheels) under "
+                                   "your external .cube: decode -> correct/basics -> your LUT.");
             }
             ImGui::EndTabItem();
         }

@@ -30,8 +30,10 @@ import { computeStats, type FootageStats } from '../../src/core/analysis/stats.j
 import {
   toneStretchChromaGuard,
   buildTransform,
+  buildManualPrimaries,
   NEUTRAL_MANUAL,
   type ManualGrade,
+  type LiftGammaGain,
 } from '../../src/core/engine/engine.js';
 import { bakeGradeLut } from '../../src/core/lut/gradeLut.js';
 import { themeFromReferenceStats } from '../../src/core/engine/referenceTheme.js';
@@ -539,6 +541,49 @@ function main(): void {
           ]);
           track(recipeT, ref.data, readF32(outRecipe, ref.data.length),
             `recipelgg:${themeName}/${f.name}/${preset.label}/${optLabel}`);
+        }
+      }
+    }
+  }
+
+  // --- Correct/Basics under a user LUT parity (fm/cg-lut-correct-stack; effect
+  //     ComposeDecodeIntoLut with ManualPrimaries). The "External .cube + Correct/Basics"
+  //     LUT Source folds the footage decode AND the manual primaries (Basics + LGG wheels)
+  //     UNDER the user's creative LUT, with Strength baked in as a decoded-space blend:
+  //       newLut(x) = lerp(decode(x), rawLut(primaries(decode(x))), s).
+  //     A baked grade LUT stands in for the user .cube (both engines bake it identically).
+  //     Covers a log profile (V-Log) and Standard (Rec.709, decode = no-op) so the non-log
+  //     branch of the mode is proven too, at full and partial Strength. ---
+  const correctManual: ManualGrade = mk({
+    exposure: -0.6, contrast: 30, shadows: 35, temperature: 28, saturation: 1.15,
+  });
+  const correctLgg: LiftGammaGain = {
+    lift: [0.03, 0.0, -0.02], gamma: [0.95, 1.05, 1.0], gain: [1.08, 1.0, 0.92],
+  };
+  for (const [themeName, theme] of Object.entries(THEMES)) {
+    for (const f of [frames[0]!, frames[1]!]) {
+      const stats = computeStats(f.pixels);
+      const raw: Lut3D = bakeGradeLut(stats, theme, {}, 33); // stand-in user creative LUT
+      const primaries = buildManualPrimaries(correctManual, correctLgg);
+      for (const profileKey of ['vlog', 'rec709']) {
+        const profile = PROFILES[profileKey]!;
+        for (const s of [1, 0.5]) {
+          const ref: Lut3D = bakeLut((rgb) => {
+            const dec = decodePixelToRec709(rgb, profile);
+            const lut = sampleLut(raw, primaries.apply(dec));
+            return [
+              dec[0] * (1 - s) + lut[0] * s,
+              dec[1] * (1 - s) + lut[1] * s,
+              dec[2] * (1 - s) + lut[2] * s,
+            ] as [number, number, number];
+          }, 33);
+          const outPath = join(tmp, `lutcorrect-${themeName}-${f.name}-${profileKey}-s${s}.f32`);
+          runCpp(ctx, [
+            'lutcorrect', framePaths.get(f.name)!, String(f.pixels.length),
+            themeName, '33', profileKey, manualCsv(correctManual, 1), lggCsv(correctLgg), String(s), outPath,
+          ]);
+          track(gradeT, ref.data, readF32(outPath, ref.data.length),
+            `lutcorrect:${themeName}/${f.name}/${profileKey}/s${s}`);
         }
       }
     }
