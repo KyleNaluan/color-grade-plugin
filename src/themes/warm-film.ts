@@ -5,7 +5,7 @@ import type { Theme } from '../core/engine/theme.js';
  * slightly muted chroma.
  *
  * Tuned against the 12 S5IIx fixture families via `npm run spike` (issue #6).
- * Evidence (grade-impact report, `scripts/lib/gradeImpact.ts`):
+ * Evidence (grade-impact report, `src/core/analysis/gradeImpact.ts`):
  * - Already well-behaved on the named skin fixtures at baseline (skin hue shift
  *   under 2deg everywhere); bumped skinProtection default 0.7 -> 0.75 for margin.
  *   Chroma shift / hue shift, before -> after: vlog-tricky-skin 7.8%/-1.1deg ->

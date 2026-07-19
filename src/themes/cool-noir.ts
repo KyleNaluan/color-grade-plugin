@@ -4,7 +4,7 @@ import type { Theme } from '../core/engine/theme.js';
  * Cool moody look: deep shadows, desaturated, blue-leaning throughout.
  *
  * Tuned against the 12 S5IIx fixture families via `npm run spike` (issue #6).
- * Evidence (grade-impact report, `scripts/lib/gradeImpact.ts`):
+ * Evidence (grade-impact report, `src/core/analysis/gradeImpact.ts`):
  * - Best-behaved of the 3 themes at baseline: highlight clipping drops to ~0%
  *   on nearly every fixture (the restrained toneCurve shoulder does its job),
  *   and skin hue shift stayed under 5deg on all fixtures with meaningful skin

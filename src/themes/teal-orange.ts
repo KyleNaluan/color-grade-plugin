@@ -5,7 +5,7 @@ import type { Theme } from '../core/engine/theme.js';
  * shadows pushed toward teal.
  *
  * Tuned against the 12 S5IIx fixture families via `npm run spike` (issue #6).
- * Evidence (grade-impact report, `scripts/lib/gradeImpact.ts`):
+ * Evidence (grade-impact report, `src/core/analysis/gradeImpact.ts`):
  * - Original mids bandChroma target (24) + chromaGain 1.05 + vibrance 0.2 drove
  *   skin-region chroma shifts up to +47% (vlog-outdoor-bright), +48% (vlog-lowlight)
  *   even with the default 0.7 skin-protection knob. Pulled mids bandChroma to 20,

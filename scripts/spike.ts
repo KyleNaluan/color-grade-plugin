@@ -10,7 +10,7 @@
  *   vlog-decode.cube               decode LUT (V-Log -> Rec.709), when profile is vlog
  *   <frame>__<theme>-combined.cube convenience LUT (decode + grade in one), vlog only
  * plus a stats printout and a grade-impact report (skin hue/chroma shift and
- * overall cast magnitude/direction; see `scripts/lib/gradeImpact.ts`), the
+ * overall cast magnitude/direction; see `src/core/analysis/gradeImpact.ts`), the
  * numeric evidence for theme-tuning decisions.
  */
 import { mkdirSync, writeFileSync } from 'node:fs';
@@ -21,7 +21,7 @@ import { buildTransform } from '../src/core/engine/engine.js';
 import { bakeLut, writeCube } from '../src/core/lut/cube.js';
 import { THEMES } from '../src/themes/index.js';
 import { loadTiff, downsample } from './lib/loadTiff.js';
-import { computeGradeImpact } from './lib/gradeImpact.js';
+import { computeGradeImpact } from '../src/core/analysis/gradeImpact.js';
 import type { Vec3 } from '../src/core/color/types.js';
 import { mat3MulVec } from '../src/core/color/matrices.js';
 import { rec709Encode } from '../src/core/color/rec709.js';
