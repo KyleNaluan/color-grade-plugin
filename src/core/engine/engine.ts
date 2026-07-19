@@ -22,7 +22,75 @@ export interface EngineOptions {
   strength?: number;
   /** 0-1; overrides the theme knob default. */
   skinProtection?: number;
+  /**
+   * Manual primary correction (Phase 6a), applied on the decoded gamma-Rec.709
+   * signal *ahead* of the theme stages. Omit (or pass {@link NEUTRAL_MANUAL})
+   * for the pure theme grade - a neutral manual stage contributes exact identity.
+   */
+  manual?: ManualGrade;
+  /**
+   * Look Mix (Phase 6a, keyframeable PF param): 0-1, default 1. Blends the
+   * theme "look" contribution in and out while keeping the manual correction:
+   * 1 = full theme look, 0 = manual-corrected only (theme look removed). Distinct
+   * from `strength`, which dilutes the *whole* grade toward the original footage.
+   */
+  lookMix?: number;
 }
+
+/**
+ * Manual primary correction (Phase 6a). All controls are neutral at
+ * {@link NEUTRAL_MANUAL} and contribute exact identity when neutral. Applied on
+ * the decoded gamma-Rec.709 signal ahead of the theme stages; exposure
+ * multiplies in linear light, temp/tint/saturation/vibrance act in CIELAB.
+ */
+export interface ManualGrade {
+  /** Exposure in stops, -5..+5. Multiplies scene-linear light by 2^EV. 0 = none. */
+  exposure: number;
+  /** Contrast, -100..+100. S-slope about `pivot` in gamma space. 0 = none. */
+  contrast: number;
+  /** Contrast pivot in gamma-709 [0,1]; the tone contrast rotates about. */
+  pivot: number;
+  /** Highlights, -100..+100. Region lift of the upper tonal band. 0 = none. */
+  highlights: number;
+  /** Shadows, -100..+100. Region lift of the lower tonal band. 0 = none. */
+  shadows: number;
+  /** Whites, -100..+100. Region lift near the highlight shoulder. 0 = none. */
+  whites: number;
+  /** Blacks, -100..+100. Region lift near the shadow toe. 0 = none. */
+  blacks: number;
+  /** Temperature, -100..+100. White-balance along blue<->amber (LAB b bias). 0 = none. */
+  temperature: number;
+  /** Tint, -100..+100. Green<->magenta (LAB a bias). 0 = none. */
+  tint: number;
+  /** Saturation, 0..2 (1 = 100%, neutral). Linear LAB chroma multiply. */
+  saturation: number;
+  /** Vibrance, -100..+100. Nonlinear chroma (low-chroma pixels weighted more). 0 = none. */
+  vibrance: number;
+}
+
+/** The neutral manual grade: every control at its identity value. */
+export const NEUTRAL_MANUAL: ManualGrade = {
+  exposure: 0,
+  contrast: 0,
+  pivot: 0.435,
+  highlights: 0,
+  shadows: 0,
+  whites: 0,
+  blacks: 0,
+  temperature: 0,
+  tint: 0,
+  saturation: 1,
+  vibrance: 0,
+};
+
+// Manual-stage tuning. Ranges are UI ±100 (or 0..2 for saturation); these map the
+// UI extreme to an engine-space magnitude. Chosen as the shipping defaults.
+const MANUAL_REGION_LIFT = 0.5; // gamma-709 lift at ±100 for hi/sh/wh/bl
+const MANUAL_TEMP_MAX = 30; // LAB b units at ±100 (temperature)
+const MANUAL_TINT_MAX = 30; // LAB a units at ±100 (tint)
+// e-folding chroma for the vibrance falloff (shared by the manual stage and the
+// theme's authored vibrance): low-chroma pixels get the full effect.
+const VIBRANCE_FALLOFF = 25; // LAB chroma units
 
 const SKIN_PRESENCE_THRESHOLD = 0.02;
 
@@ -134,7 +202,11 @@ export function buildTransform(src: FootageStats, theme: Theme, opts: EngineOpti
   const protection = clamp01(opts.skinProtection ?? theme.knobs.skinProtection.default);
   const skinActive = src.skinPresence > SKIN_PRESENCE_THRESHOLD;
 
-  const toneCurve = buildToneCurve(src, tgt);
+  // Automatic stat-matching look: on for every shipping theme, off for the
+  // "None / Manual" theme (matchStats === false), where the tone curve, the LAB
+  // mean/std transfer, the per-band chroma scale, and the chroma-overshoot guard
+  // all collapse to identity so manual grading is the entire look.
+  const matchStats = theme.matchStats !== false;
 
   // Damped stat transfer in a/b: the target LAB mean is an attractor, not a
   // destination. The mean shift magnitude is soft-clamped (tanh) so a theme
@@ -145,18 +217,27 @@ export function buildTransform(src: FootageStats, theme: Theme, opts: EngineOpti
   const dB = tgt.lab.mean[2] - src.lab.mean[2];
   const dist = Math.hypot(dA, dB);
   const damp = dist > 1e-6 ? (MAX_MEAN_SHIFT * Math.tanh(dist / MAX_MEAN_SHIFT)) / dist : 1;
-  const shiftA = dA * damp;
-  const shiftB = dB * damp;
+
+  const identityCurve: MonotoneCurve = (x) => x;
+  const toneCurve = matchStats ? buildToneCurve(src, tgt) : identityCurve;
+  const shiftA = matchStats ? dA * damp : 0;
+  const shiftB = matchStats ? dB * damp : 0;
   // Std ratios clamped tighter than before so chroma spread changes stay gentle.
-  const kA = clamp(tgt.lab.std[1] / Math.max(tgt.lab.std[1] * 0.1, src.lab.std[1], 1e-3), 0.6, 1.8);
-  const kB = clamp(tgt.lab.std[2] / Math.max(tgt.lab.std[2] * 0.1, src.lab.std[2], 1e-3), 0.6, 1.8);
+  const kA = matchStats
+    ? clamp(tgt.lab.std[1] / Math.max(tgt.lab.std[1] * 0.1, src.lab.std[1], 1e-3), 0.6, 1.8)
+    : 1;
+  const kB = matchStats
+    ? clamp(tgt.lab.std[2] / Math.max(tgt.lab.std[2] * 0.1, src.lab.std[2], 1e-3), 0.6, 1.8)
+    : 1;
 
   // Per-tonal-band chroma scale toward target band chroma.
-  const bandScale: Vec3 = [
-    clamp(tgt.bandChroma.shadows / Math.max(src.bandChroma.shadows, 1), 0.5, 2.0),
-    clamp(tgt.bandChroma.mids / Math.max(src.bandChroma.mids, 1), 0.5, 2.0),
-    clamp(tgt.bandChroma.highlights / Math.max(src.bandChroma.highlights, 1), 0.5, 2.0),
-  ];
+  const bandScale: Vec3 = matchStats
+    ? [
+        clamp(tgt.bandChroma.shadows / Math.max(src.bandChroma.shadows, 1), 0.5, 2.0),
+        clamp(tgt.bandChroma.mids / Math.max(src.bandChroma.mids, 1), 0.5, 2.0),
+        clamp(tgt.bandChroma.highlights / Math.max(src.bandChroma.highlights, 1), 0.5, 2.0),
+      ]
+    : [1, 1, 1];
 
   const ov = theme.overrides ?? {};
   const chromaGain = ov.chromaGain ?? 1;
@@ -165,13 +246,15 @@ export function buildTransform(src: FootageStats, theme: Theme, opts: EngineOpti
   // source toward a much wider target, damp the stat-derived auto chroma
   // amplification (guard.gain, folded into `scale` below) so relocated pixels
   // can't neon-blow-up, and adopt an auto soft ceiling if the theme authored
-  // none. Inert (gain 1, no ceiling) for ordinary sources.
-  const guard = toneStretchChromaGuard(src, tgt);
+  // none. Inert (gain 1, no ceiling) for ordinary sources, and by construction
+  // when the stat-match is off (a 1:1 stretch keeps the guard inert).
+  const guard = matchStats
+    ? toneStretchChromaGuard(src, tgt)
+    : ({ stretch: 1, severity: 0, gain: 1, autoSoftLimit: undefined } as ChromaGuard);
 
   // Authored curves: monotone per-channel tone shapes, evaluated on the
   // stat-matched signal, then clamped so authored points outside [0,1] cannot
   // push the encoded signal out of range.
-  const identityCurve: MonotoneCurve = (x) => x;
   const makeToneOverride = (pts: CurvePoint[] | undefined): MonotoneCurve => {
     if (!pts || pts.length < 2) return identityCurve;
     const c = makeMonotoneCurve(pts.map((p) => p[0]), pts.map((p) => p[1]));
@@ -192,22 +275,129 @@ export function buildTransform(src: FootageStats, theme: Theme, opts: EngineOpti
         })()
       : () => 1;
   const vibrance = shape.vibrance ?? 0;
-  // e-folding chroma for the vibrance falloff: low-chroma pixels get the full
-  // effect, pixels beyond ~2-3x this are left mostly alone.
-  const VIBRANCE_FALLOFF = 25; // LAB chroma units
   // Authored ceiling wins; otherwise the guard's auto ceiling (undefined = none).
   const softLimit = shape.softLimit ?? guard.autoSoftLimit;
+
+  // --- Manual primary correction (Phase 6a) -------------------------------
+  // Precompute the manual coefficients once; each sub-op is gated on being
+  // non-neutral so a neutral control contributes exact identity (no lossy
+  // decode/encode or LAB round-trip on the neutral path).
+  const m = opts.manual;
+  const mExpActive = !!m && m.exposure !== 0;
+  const mExpGain = mExpActive ? Math.pow(2, m!.exposure) : 1;
+  const mContrastActive = !!m && m.contrast !== 0;
+  const mPivot = m?.pivot ?? NEUTRAL_MANUAL.pivot;
+  const mContrastSlope = mContrastActive
+    ? m!.contrast >= 0
+      ? 1 + m!.contrast / 100
+      : 1 / (1 - m!.contrast / 100)
+    : 1;
+  const mRegionActive =
+    !!m && (m.highlights !== 0 || m.shadows !== 0 || m.whites !== 0 || m.blacks !== 0);
+  const mAmtHi = ((m?.highlights ?? 0) / 100) * MANUAL_REGION_LIFT;
+  const mAmtSh = ((m?.shadows ?? 0) / 100) * MANUAL_REGION_LIFT;
+  const mAmtWh = ((m?.whites ?? 0) / 100) * MANUAL_REGION_LIFT;
+  const mAmtBl = ((m?.blacks ?? 0) / 100) * MANUAL_REGION_LIFT;
+  const mColorActive =
+    !!m && (m.temperature !== 0 || m.tint !== 0 || m.saturation !== 1 || m.vibrance !== 0);
+  const mSat = m?.saturation ?? 1;
+  const mVib = (m?.vibrance ?? 0) / 100; // -1..1
+  const mTempB = ((m?.temperature ?? 0) / 100) * MANUAL_TEMP_MAX;
+  const mTintA = ((m?.tint ?? 0) / 100) * MANUAL_TINT_MAX;
+  const manualActive = mExpActive || mContrastActive || mRegionActive || mColorActive;
+
+  // Apply the manual stage on one decoded gamma-Rec.709 pixel. Order: exposure
+  // (linear) -> contrast (about pivot) -> region lifts (bandWeights) -> color
+  // (LAB temp/tint/saturation/vibrance).
+  const applyManual = (r0: number, g0: number, b0: number): Vec3 => {
+    let r = r0;
+    let g = g0;
+    let b = b0;
+    if (mExpActive) {
+      r = rec709Encode(rec709Decode(r) * mExpGain);
+      g = rec709Encode(rec709Decode(g) * mExpGain);
+      b = rec709Encode(rec709Decode(b) * mExpGain);
+    }
+    if (mContrastActive) {
+      r = mPivot + (r - mPivot) * mContrastSlope;
+      g = mPivot + (g - mPivot) * mContrastSlope;
+      b = mPivot + (b - mPivot) * mContrastSlope;
+    }
+    if (mExpActive || mContrastActive) {
+      r = clamp01(r);
+      g = clamp01(g);
+      b = clamp01(b);
+    }
+    if (mRegionActive) {
+      const y = luma709(r, g, b);
+      // Shadows/highlights reuse the feathered band split; blacks/whites add an
+      // extra toe/shoulder edge weight so all four controls stay independent.
+      const [wsB, , whB] = bandWeights(y);
+      const wBlack = 1 - smoothstep(0, 0.2, y);
+      const wWhite = smoothstep(0.8, 1, y);
+      const dY = mAmtSh * wsB + mAmtHi * whB + mAmtBl * wBlack + mAmtWh * wWhite;
+      r = clamp01(r + dY);
+      g = clamp01(g + dY);
+      b = clamp01(b + dY);
+    }
+    if (mColorActive) {
+      const labm = linearRec709ToLab([rec709Decode(r), rec709Decode(g), rec709Decode(b)]);
+      let am = labm[1] * mSat;
+      let bm = labm[2] * mSat;
+      if (mVib !== 0) {
+        const chromam = Math.hypot(am, bm);
+        if (chromam > 1e-6) {
+          const mult = Math.max(0, 1 + mVib * Math.exp(-chromam / VIBRANCE_FALLOFF));
+          am *= mult;
+          bm *= mult;
+        }
+      }
+      am += mTintA;
+      bm += mTempB;
+      const linm = labToLinearRec709([labm[0], am, bm]);
+      r = clamp01(rec709Encode(Math.max(0, linm[0])));
+      g = clamp01(rec709Encode(Math.max(0, linm[1])));
+      b = clamp01(rec709Encode(Math.max(0, linm[2])));
+    }
+    return [r, g, b];
+  };
+
+  // Look Mix: blend the theme look in/out over the manual-corrected pixel.
+  const lookMix = clamp01(opts.lookMix ?? 1);
+  const lookMixActive = lookMix !== 1;
+
+  // Fast identity path: when the theme contributes no look (stat-match off and no
+  // authored overrides) and the manual stage is neutral, the whole transform is a
+  // clamp - so the "None / Manual" theme with no edits bakes a clean identity LUT.
+  const themeLookIsIdentity =
+    !matchStats &&
+    !ov.shadowTint &&
+    !ov.highlightTint &&
+    !ov.midtoneTint &&
+    chromaGain === 1 &&
+    !ov.toneCurve &&
+    !ov.channelCurves &&
+    !ov.chromaShape;
+  if (themeLookIsIdentity && !manualActive) {
+    return (rgb: Vec3): Vec3 => [clamp01(rgb[0]), clamp01(rgb[1]), clamp01(rgb[2])];
+  }
 
   return (rgb: Vec3): Vec3 => {
     const rIn = clamp01(rgb[0]);
     const gIn = clamp01(rgb[1]);
     const bIn = clamp01(rgb[2]);
 
+    // 0. Manual primary correction on the decoded footage, ahead of the theme
+    //    stages. The identity target for Strength/Skin below stays the ORIGINAL
+    //    footage (rIn/gIn/bIn), so Strength dilutes the whole grade - manual
+    //    included (decision D3) - and skin is keyed on the real footage.
+    const [rm, gm, bm] = manualActive ? applyManual(rIn, gIn, bIn) : [rIn, gIn, bIn];
+
     // 1. Tone: stat-matching curve per channel (matches luma percentiles,
     //    keeps color ratios), then the authored master + per-channel curves.
-    const r1 = rCurve(masterCurve(toneCurve(rIn)));
-    const g1 = gCurve(masterCurve(toneCurve(gIn)));
-    const b1 = bCurve(masterCurve(toneCurve(bIn)));
+    const r1 = rCurve(masterCurve(toneCurve(rm)));
+    const g1 = gCurve(masterCurve(toneCurve(gm)));
+    const b1 = bCurve(masterCurve(toneCurve(bm)));
 
     // 2. Color in LAB.
     const labIn = linearRec709ToLab([rec709Decode(rIn), rec709Decode(gIn), rec709Decode(bIn)]);
@@ -257,6 +447,13 @@ export function buildTransform(src: FootageStats, theme: Theme, opts: EngineOpti
       clamp01(rec709Encode(Math.max(0, linOut[1]))),
       clamp01(rec709Encode(Math.max(0, linOut[2]))),
     ];
+
+    // 3c. Look Mix: fade the theme look toward the manual-corrected pixel
+    //     (lookMix 1 = full look, 0 = manual only). Runs before Strength so the
+    //     two knobs compose (look mix, then overall grade intensity).
+    if (lookMixActive) {
+      out = [lerp(rm, out[0], lookMix), lerp(gm, out[1], lookMix), lerp(bm, out[2], lookMix)];
+    }
 
     // 4. Strength: interpolate toward identity.
     // 5. Skin-tone protection: within the soft chroma wedge around the skin

@@ -23,7 +23,12 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { computeStats, type FootageStats } from '../../src/core/analysis/stats.js';
-import { toneStretchChromaGuard, buildTransform } from '../../src/core/engine/engine.js';
+import {
+  toneStretchChromaGuard,
+  buildTransform,
+  NEUTRAL_MANUAL,
+  type ManualGrade,
+} from '../../src/core/engine/engine.js';
 import { bakeGradeLut } from '../../src/core/lut/gradeLut.js';
 import { bakeDecodeLut } from '../../src/core/lut/decodeLut.js';
 import { bakeLut, sampleLut, type Lut3D } from '../../src/core/lut/cube.js';
@@ -426,6 +431,72 @@ function main(): void {
       }
     }
   }
+
+  // --- Manual primary correction + Look Mix parity (Phase 6a): the new manual
+  //     stage baked in both engines, direct (grademanual) and carried through the
+  //     arb-data recipe (recipemanual). Presets cover each op, a combined grade,
+  //     and Look Mix < 1 on a real theme. Runs on every theme incl. none-manual. ---
+  const manualCsv = (m: ManualGrade, lookMix: number): string =>
+    [
+      m.exposure, m.contrast, m.pivot, m.highlights, m.shadows, m.whites, m.blacks,
+      m.temperature, m.tint, m.saturation, m.vibrance, lookMix,
+    ].join(',');
+  const mk = (over: Partial<ManualGrade>): ManualGrade => ({ ...NEUTRAL_MANUAL, ...over });
+  const manualPresets: { label: string; m: ManualGrade; lookMix: number }[] = [
+    { label: 'exposure', m: mk({ exposure: 1.3 }), lookMix: 1 },
+    { label: 'contrast', m: mk({ contrast: 70, pivot: 0.45 }), lookMix: 1 },
+    { label: 'regions', m: mk({ highlights: -40, shadows: 60, whites: 30, blacks: -50 }), lookMix: 1 },
+    { label: 'tempTint', m: mk({ temperature: 55, tint: -35 }), lookMix: 1 },
+    { label: 'satVib', m: mk({ saturation: 1.5, vibrance: 40 }), lookMix: 1 },
+    {
+      label: 'combined',
+      m: mk({ exposure: -0.8, contrast: 45, shadows: 30, temperature: 40, saturation: 1.3, vibrance: 25 }),
+      lookMix: 1,
+    },
+    { label: 'lookmix0', m: mk({ exposure: 0.5, saturation: 1.2 }), lookMix: 0 },
+    { label: 'lookmix0.5', m: mk({ contrast: 30 }), lookMix: 0.5 },
+  ];
+  const manualOpts: { label: string; opts: EngineOptions }[] = [
+    { label: 'default', opts: {} },
+    { label: 'str0.6-skin0.3', opts: { strength: 0.6, skinProtection: 0.3 } },
+  ];
+  for (const [themeName, theme] of Object.entries(THEMES)) {
+    for (const f of [frames[0]!, frames[1]!]) {
+      const stats = computeStats(f.pixels);
+      for (const preset of manualPresets) {
+        for (const { label: optLabel, opts } of manualOpts) {
+          const fullOpts: EngineOptions = { ...opts, manual: preset.m, lookMix: preset.lookMix };
+          const ref: Lut3D = bakeGradeLut(stats, theme, fullOpts, 33);
+          const hasStr = opts.strength !== undefined ? '1' : '0';
+          const strVal = String(opts.strength ?? 0);
+          const hasSkin = opts.skinProtection !== undefined ? '1' : '0';
+          const skinVal = String(opts.skinProtection ?? 0);
+          const csv = manualCsv(preset.m, preset.lookMix);
+          // Direct manual bake.
+          const outDirect = join(tmp, `grademanual-${themeName}-${f.name}-${preset.label}-${optLabel}.f32`);
+          runCpp(ctx, [
+            'grademanual', framePaths.get(f.name)!, String(f.pixels.length),
+            themeName, hasStr, strVal, hasSkin, skinVal, '33', csv, outDirect,
+          ]);
+          track(gradeT, ref.data, readF32(outDirect, ref.data.length),
+            `grademanual:${themeName}/${f.name}/${preset.label}/${optLabel}`);
+          // Same manual carried through the arb-data recipe.
+          const outRecipe = join(tmp, `recipemanual-${themeName}-${f.name}-${preset.label}-${optLabel}.f32`);
+          runCpp(ctx, [
+            'recipemanual', framePaths.get(f.name)!, String(f.pixels.length),
+            themeName, hasStr, strVal, hasSkin, skinVal, '33', csv, outRecipe,
+          ]);
+          track(recipeT, ref.data, readF32(outRecipe, ref.data.length),
+            `recipemanual:${themeName}/${f.name}/${preset.label}/${optLabel}`);
+        }
+      }
+    }
+  }
+
+  // --- Versioned arb-data migration self-test (Phase 6a landmine): old grades must
+  //     survive the RECIPE_VERSION bump. Self-checks in C++ (exits nonzero on failure). ---
+  runCpp(ctx, ['migrate']);
+  console.log('  migrate  self-test passed (arb-data v2->v3 forward migration)');
 
   // --- bakeDecodeLut parity: every profile, grade + fine grids ---
   for (const profileKey of Object.keys(PROFILES)) {

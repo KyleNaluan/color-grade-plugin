@@ -358,6 +358,49 @@ live-resize). **Deferred - dedicated UI-polish pass:** the captain wants the who
 restyled (prettier/sleeker) once all feature phases land (with/after Phase 6); do NOT restyle
 piecemeal before then - this is a tracked follow-up, not a Phase 5 gap.
 
+## Phase 6a: manual grade suite - Basics (built on this toolkit)
+
+Phase 6a adds a **manual primary-correction stage** to the engine, ahead of the theme
+stages, on the decoded gamma-Rec.709 signal (the V-Log decode invariant holds by
+construction - manual only ever sees decoded footage). Design proposal + captain
+decisions: `firstmate/data/grade-suite-design/{report.md,decisions.md}`.
+
+- **Engine (oracle-first, then ported bit-exact):** `ManualGrade` (exposure, contrast +
+  pivot, highlights/shadows/whites/blacks via the feathered `bandWeights`, temperature/tint
+  as LAB a/b bias, saturation as LAB chroma multiply, vibrance reusing the engine falloff)
+  and a `lookMix` blend live in `src/core/engine/engine.ts` `buildTransform`, ported to
+  `native/ColorGradeFX/core/Engine.h`. Each control is neutral-gated so a neutral value is
+  exact identity. A new **"None / Manual" theme** (`matchStats: false`) turns off the
+  stat-match look so manual grading is the whole grade with no stat-match staleness; with a
+  neutral manual grade it takes an identity fast path (clean identity LUT). Gated bit-exact
+  by `npm run native:core-parity` (manual/lookMix/None cases added; ~3e-7).
+- **Keyframeable params (decision D1):** `CG_EXPOSURE`, `CG_LOOK_MIX`, `CG_TEMPERATURE` are
+  appended AFTER `CG_RECIPE` (append-only - AE stores param values by index). Their live
+  values override the recipe's stored exposure/temperature and drive Look Mix at bake time
+  (`BakeAutoLut`). Everything else is recipe-backed editor state. Strength dilutes the whole
+  grade incl. manual (D3); skin protection applies as-is.
+- **Recipe migration (the 6a landmine):** `RecipeData` grew a `matchStats` flag + the manual
+  block + `lookMix`, all APPENDED after the v2 fields, and `RECIPE_VERSION` bumped 2->3. The
+  arb-data UNFLATTEN handler now MIGRATES instead of reseeding: `migrateRecipeInto`
+  (`core/Recipe.h`, the single source of truth, self-tested by the parity `migrate` case)
+  copies a v2 blob's prefix over v3 defaults and re-stamps the version, so old saved grades
+  survive; only a foreign/corrupt blob reseeds.
+- **Editor Basics tab + bridge:** the window's **Basics** tab has all the sliders. The three
+  keyframeable scalars round-trip as scalar streams (existing AEGP one_d path); the 9
+  recipe-backed controls round-trip through the `CG_RECIPE` **arb** stream - the idle hook
+  read-modify-writes it (`AEGP_GetNewStreamValue` -> `HandleSuite1->host_lock_handle` mutate
+  -> `AEGP_SetStreamValue`), and reads it back in the poll (`ReadRecipeViaAegp`). The pure
+  `ManualState` + `EditQueue` coalescing (now copies the whole edit) are headless-tested by
+  `npm run native:editor-test`. `previewParamFingerprint` folds the 3 scalars + a hash of the
+  whole recipe blob so a manual edit never serves a stale preview (`native:preview-test`).
+- **Grade LUT grid stays 33 (measured, not bumped):** a 65-point grade bake is ~8x slower
+  (~80-95ms vs ~10-13ms; measured with an aggressive manual grade), which is not affordable
+  for the keyframeable params that re-bake per animated frame. 33-point banding on extreme
+  manual grades (~3% worst case on a smooth ramp) matches the regime the shipping themes
+  already bake at. An adaptive grid (65 only for static aggressive grades) is a follow-up.
+- **Out of scope (separately tracked):** curves UI (6b), wheels (6c), secondary hue curves
+  (6d), the AI agent loop, the UI-polish overhaul.
+
 ## Consequences
 
 - **Positive:** single-file signed `.aex` stays intact; one UI codebase Win+Mac; the
@@ -473,3 +516,34 @@ and the build is loaded:
     the decoded original (on V-Log, decoded - not washed-out log), After the graded result,
     Split shows both across a draggable divider, all correctly letterboxed. The comp/preview
     updates after analysis completes (active comp re-renders).
+
+### Phase 6a (manual grade - Basics)
+
+Rebuild from THIS worktree with AE closed, then load the fresh `.aex` (all 4 configs build
+clean; CUDA is the engaged GPU path on the dev box). New Effect Controls params appear at the
+end: **Exposure**, **Look Mix**, **Temperature**. The editor gains a **Basics** tab and the
+Theme popup a **None (Manual)** entry.
+
+13. **Each control moves the preview:** with LUT Source = Auto, in the Basics tab, dragging
+    each of Exposure / Contrast / Contrast Pivot / Highlights / Shadows / Whites / Blacks /
+    Temperature / Tint / Saturation / Vibrance / Look Mix visibly changes the preview AND the
+    comp, live (no need to touch Effect Controls). The 9 recipe-backed sliders round-trip via
+    the arb stream; Exposure/Look Mix/Temperature also move their Effect Controls sliders.
+14. **Neutral = identity:** with theme **None (Manual)** and every Basics control at neutral
+    (Exposure 0, Contrast 0, region sliders 0, Temperature/Tint 0, Saturation 100%, Vibrance
+    0, Look Mix 100%), the output is visually identical to the effect disabled (an identity
+    grade). Nudging any single control away from neutral and back returns to identity.
+15. **Exposure keyframes ramp:** keyframe CG_EXPOSURE from -2 to +2 stops across the clip;
+    playback shows a smooth exposure ramp (the grade re-bakes per animated frame; 33-point
+    bake keeps this real-time). Confirm no banding regression on a smooth gradient/sky.
+16. **Strength dilutes manual (D3):** with a strong manual grade on None (Manual), lowering
+    the Grade tab **Strength** toward 0 fades the whole manual grade back toward the original
+    footage (manual is not Strength-immune).
+17. **Old-version grades survive load (the migration):** open a project SAVED WITH THE
+    PRE-6a build (v2 recipe) that has a non-default grade (e.g. a theme + adjusted
+    Strength/Chroma). It must load with that grade intact (NOT reset to default), and the new
+    Basics controls default to neutral. (If no pre-6a project exists, this is covered by the
+    `migrate` parity self-test; note that in the report.)
+18. **V-Log decode invariant:** on a V-Log clip with Footage = V-Log, manual controls act on
+    the decoded (corrected) image - e.g. Saturation/Temperature look natural, never like
+    they are operating on raw washed-out log.

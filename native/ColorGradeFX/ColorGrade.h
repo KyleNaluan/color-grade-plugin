@@ -70,6 +70,12 @@ enum {
     CG_LUT_SOURCE,
     CG_OPEN_EDITOR,   // momentary button: opens the native editor window (Phase 3)
     CG_RECIPE,
+    // Phase 6a keyframeable params. MUST stay APPENDED AFTER CG_RECIPE (never
+    // inserted mid-roster): AE stores project param values by index and the editor
+    // bridge addresses streams by index, so inserting mid-roster remaps saved values.
+    CG_EXPOSURE,      // stops, keyframeable; live value overrides recipe at bake
+    CG_LOOK_MIX,      // 0..100%, keyframeable theme-look blend
+    CG_TEMPERATURE,   // -100..100, keyframeable white-balance
     CG_NUM_PARAMS
 };
 
@@ -81,13 +87,17 @@ enum {
 };
 #define CG_FOOTAGE_CHOICES "Rec.709 (standard)|V-Log"
 
-// Theme popup order (1-based in AE); maps to cg::core::getTheme keys.
+// Theme popup order (1-based in AE); maps to cg::core::getTheme keys. None (Manual)
+// is appended (Phase 6a): adding a popup CHOICE keeps CG_THEME's param index, so
+// existing projects with value 1-3 still resolve.
 enum {
     CG_THEME_TEAL = 1,
     CG_THEME_WARM,
-    CG_THEME_COOL
+    CG_THEME_COOL,
+    CG_THEME_NONE
 };
-#define CG_THEME_CHOICES "Teal-Orange|Warm-Film|Cool-Noir"
+#define CG_THEME_CHOICES "Teal-Orange|Warm-Film|Cool-Noir|None (Manual)"
+#define CG_THEME_COUNT 4
 
 // LUT-source popup order (1-based). Auto bakes the grade from theme + recipe.
 enum {
@@ -110,6 +120,20 @@ enum {
 #define CG_CHROMA_MAX      300
 #define CG_CHROMA_SLIDER_MAX 200
 #define CG_CHROMA_DFLT     100
+
+// Phase 6a keyframeable params. Exposure in stops; Look Mix a percent (100 = full
+// look); Temperature -100..100. Neutral defaults keep a fresh effect byte-identical.
+#define CG_EXPOSURE_MIN    (-5.0)
+#define CG_EXPOSURE_MAX    5.0
+#define CG_EXPOSURE_DFLT   0.0
+
+#define CG_LOOK_MIX_MIN    0
+#define CG_LOOK_MIX_MAX    100
+#define CG_LOOK_MIX_DFLT   100
+
+#define CG_TEMPERATURE_MIN (-100.0)
+#define CG_TEMPERATURE_MAX 100.0
+#define CG_TEMPERATURE_DFLT 0.0
 
 // arb-data identity: unique id + refcon guard (see the arb callbacks).
 #define CG_ARB_ID          1

@@ -80,4 +80,13 @@ export interface Theme {
   targetStats: FootageStats;
   overrides?: ThemeOverrides;
   knobs: ThemeKnobs;
+  /**
+   * Whether the engine runs its automatic stat-matching look (tone curve toward
+   * the target percentiles, LAB mean/std transfer, per-band chroma scaling, and
+   * the chroma-overshoot guard). Default (undefined) is `true` for every shipping
+   * theme. The "None / Manual" theme sets it `false` so those stages contribute
+   * exact identity and manual grading (Phase 6a) is the entire look - no
+   * stat-match staleness interaction. Authored overrides, if any, still apply.
+   */
+  matchStats?: boolean;
 }

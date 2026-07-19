@@ -30,6 +30,30 @@
 namespace cg {
 namespace editor {
 
+// Manual primary correction (Phase 6a) - the recipe-backed editor state. Mirrors
+// the 9 recipe-only manual fields (RecipeData.manual*); exposure, temperature, and
+// lookMix are separate keyframeable PF params (see EditField below), not carried here.
+// Values are in engine units (the same the ManualGrade engine struct uses), so the
+// bridge stays a straight pass-through and this header needs no percent mapping.
+struct ManualState {
+    double contrast = 0.0;      // -100..100
+    double pivot = 0.435;       // gamma-709
+    double highlights = 0.0;    // -100..100
+    double shadows = 0.0;       // -100..100
+    double whites = 0.0;        // -100..100
+    double blacks = 0.0;        // -100..100
+    double tint = 0.0;          // -100..100
+    double saturation = 1.0;    // 0..2
+    double vibrance = 0.0;      // -100..100
+
+    bool operator==(const ManualState& o) const {
+        return contrast == o.contrast && pivot == o.pivot && highlights == o.highlights &&
+               shadows == o.shadows && whites == o.whites && blacks == o.blacks &&
+               tint == o.tint && saturation == o.saturation && vibrance == o.vibrance;
+    }
+    bool operator!=(const ManualState& o) const { return !(*this == o); }
+};
+
 // Which effect param an edit targets. Kept independent of the effect's CG_* enum
 // so this header stays free of ColorGrade.h (host coupling lives in EditorWindow).
 enum class EditField : int {
@@ -39,12 +63,19 @@ enum class EditField : int {
     SkinProtection,      // fraction 0..1
     ChromaGain,          // fraction; 1.0 == 100% (theme's authored gain)
     LutSource,           // 1-based popup index (CG_SRC_*)
+    // Phase 6a. Exposure/LookMix/Temperature are keyframeable PF scalar params;
+    // Manual carries the whole recipe-backed ManualState (written to the arb recipe).
+    Exposure,            // stops (engine units), typically -5..5
+    LookMix,             // fraction 0..1
+    Temperature,         // -100..100 (engine units)
+    Manual,              // payload = ParamEdit::manual (the 9 recipe-backed controls)
 };
 
 // A single control edit produced by the window, consumed by the effect side.
 struct ParamEdit {
-    EditField field;
-    double    value;  // fraction for sliders; the popup index (as a double) for popups
+    EditField   field;
+    double      value = 0.0;   // scalar edits: slider value / popup index (as a double)
+    ManualState manual;        // used only when field == Manual
 };
 
 // The effect's current param values, published to the window for display.
@@ -55,6 +86,14 @@ struct ParamSnapshot {
     double skinProtection = 0.75;
     double chromaGain = 1.0;    // fraction; 1.0 == 100%
     int    lutSource = 1;       // 1-based popup index
+    // Phase 6a: the three keyframeable PF scalar params + the recipe-backed manual
+    // block. `recipeHash` is a cheap fingerprint of the whole recipe blob (folded
+    // into the preview cache key so a manual edit never serves a stale frame).
+    double exposure = 0.0;      // stops
+    double lookMix = 1.0;       // fraction 0..1
+    double temperature = 0.0;   // -100..100
+    ManualState manual;         // the 9 recipe-backed manual controls
+    uint64_t recipeHash = 0;
     // A monotonically increasing stamp so the window can tell a genuinely newer
     // snapshot from a stale re-publish and avoid clobbering an in-flight drag.
     uint64_t revision = 0;
@@ -97,7 +136,7 @@ public:
         std::lock_guard<std::mutex> lk(mutex_);
         for (auto& existing : pending_) {
             if (existing.field == e.field) {
-                existing.value = e.value;  // coalesce: latest value wins
+                existing = e;  // coalesce: latest edit wins (incl. the Manual payload)
                 return;
             }
         }
@@ -138,6 +177,10 @@ inline void applyEdit(ParamSnapshot& s, const ParamEdit& e) {
         case EditField::SkinProtection: s.skinProtection = clamp01(e.value); break;
         case EditField::ChromaGain:     s.chromaGain = clampChromaFraction(e.value); break;
         case EditField::LutSource:      s.lutSource = static_cast<int>(e.value + 0.5); break;
+        case EditField::Exposure:       s.exposure = e.value; break;
+        case EditField::LookMix:        s.lookMix = clamp01(e.value); break;
+        case EditField::Temperature:    s.temperature = e.value; break;
+        case EditField::Manual:         s.manual = e.manual; break;
     }
 }
 

@@ -82,8 +82,14 @@ inline int64_t quantize(double v, double step = 1e-4) {
     return static_cast<int64_t>(s < 0 ? s - 0.5 : s + 0.5);
 }
 
+// Phase 6a: the manual grade lives in the recipe (folded in as `recipeHash`, a hash
+// of the whole recipe blob) plus the three keyframeable scalar params (exposure /
+// lookMix / temperature). Any manual edit changes the recipe hash or a scalar, so the
+// preview cache never serves a stale frame after a manual change.
 inline uint64_t previewParamFingerprint(int footage, int theme, int lutSource,
-                                        double strength, double skin, double chroma) {
+                                        double strength, double skin, double chroma,
+                                        double exposure = 0.0, double lookMix = 1.0,
+                                        double temperature = 0.0, uint64_t recipeHash = 0) {
     uint64_t h = 1469598103934665603ull;  // FNV offset basis
     h = fnv1a(h, static_cast<uint64_t>(static_cast<int64_t>(footage)));
     h = fnv1a(h, static_cast<uint64_t>(static_cast<int64_t>(theme)));
@@ -91,6 +97,10 @@ inline uint64_t previewParamFingerprint(int footage, int theme, int lutSource,
     h = fnv1a(h, static_cast<uint64_t>(quantize(strength)));
     h = fnv1a(h, static_cast<uint64_t>(quantize(skin)));
     h = fnv1a(h, static_cast<uint64_t>(quantize(chroma)));
+    h = fnv1a(h, static_cast<uint64_t>(quantize(exposure)));
+    h = fnv1a(h, static_cast<uint64_t>(quantize(lookMix)));
+    h = fnv1a(h, static_cast<uint64_t>(quantize(temperature)));
+    h = fnv1a(h, recipeHash);
     return h;
 }
 

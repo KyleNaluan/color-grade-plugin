@@ -486,7 +486,8 @@ void DrawScopesStrip(WindowImpl* w) {
 // --- the per-window UI content (the editor's controls) ----------------------
 
 const char* const kFootageNames[] = {"Rec.709 (standard)", "V-Log"};
-const char* const kThemeNames[] = {"Teal-Orange", "Warm-Film", "Cool-Noir"};
+const char* const kThemeNames[] = {"Teal-Orange", "Warm-Film", "Cool-Noir", "None (Manual)"};
+constexpr int kThemeCount = 4;
 const char* const kLutSourceNames[] = {"Auto (Theme + Analysis)", "Embedded (Teal-Orange)",
                                        "External .cube file"};
 
@@ -545,12 +546,93 @@ void DrawEditorUI(WindowImpl* w, ParamSnapshot& ui) {
                                "the Auto grade to the whole shot.");
             ImGui::EndTabItem();
         }
+        if (ImGui::BeginTabItem("Basics")) {
+            // Manual primary correction (Phase 6a). Exposure/Look Mix/Temperature are
+            // keyframeable PF scalar params (written as scalar edits); the rest are the
+            // recipe-backed ManualState (pushed as one coalesced Manual edit). Applied
+            // ahead of the theme look; neutral = no change. Requires LUT Source = Auto.
+            auto pushManual = [w](ParamSnapshot& s) {
+                ParamEdit e;
+                e.field = EditField::Manual;
+                e.manual = s.manual;
+                w->edits.push(e);
+            };
+            ImGui::TextWrapped("Manual primary correction, applied before the theme look. "
+                               "Exposure, Look Mix and Temperature are keyframeable in Effect "
+                               "Controls. Uses LUT Source = Auto.");
+            ImGui::Spacing();
+
+            float exposure = static_cast<float>(ui.exposure);
+            if (ImGui::SliderFloat("Exposure", &exposure, -5.0f, 5.0f, "%.2f stops")) {
+                ui.exposure = exposure;
+                w->edits.push({EditField::Exposure, ui.exposure});
+            }
+            float contrast = static_cast<float>(ui.manual.contrast);
+            if (ImGui::SliderFloat("Contrast", &contrast, -100.0f, 100.0f, "%.0f")) {
+                ui.manual.contrast = contrast;
+                pushManual(ui);
+            }
+            float pivot = static_cast<float>(ui.manual.pivot);
+            if (ImGui::SliderFloat("Contrast Pivot", &pivot, 0.05f, 0.95f, "%.3f")) {
+                ui.manual.pivot = pivot;
+                pushManual(ui);
+            }
+            ImGui::Separator();
+            float highlights = static_cast<float>(ui.manual.highlights);
+            if (ImGui::SliderFloat("Highlights", &highlights, -100.0f, 100.0f, "%.0f")) {
+                ui.manual.highlights = highlights;
+                pushManual(ui);
+            }
+            float shadows = static_cast<float>(ui.manual.shadows);
+            if (ImGui::SliderFloat("Shadows", &shadows, -100.0f, 100.0f, "%.0f")) {
+                ui.manual.shadows = shadows;
+                pushManual(ui);
+            }
+            float whites = static_cast<float>(ui.manual.whites);
+            if (ImGui::SliderFloat("Whites", &whites, -100.0f, 100.0f, "%.0f")) {
+                ui.manual.whites = whites;
+                pushManual(ui);
+            }
+            float blacks = static_cast<float>(ui.manual.blacks);
+            if (ImGui::SliderFloat("Blacks", &blacks, -100.0f, 100.0f, "%.0f")) {
+                ui.manual.blacks = blacks;
+                pushManual(ui);
+            }
+            ImGui::Separator();
+            float temperature = static_cast<float>(ui.temperature);
+            if (ImGui::SliderFloat("Temperature", &temperature, -100.0f, 100.0f, "%.0f")) {
+                ui.temperature = temperature;
+                w->edits.push({EditField::Temperature, ui.temperature});
+            }
+            float tint = static_cast<float>(ui.manual.tint);
+            if (ImGui::SliderFloat("Tint", &tint, -100.0f, 100.0f, "%.0f")) {
+                ui.manual.tint = tint;
+                pushManual(ui);
+            }
+            float satPct = static_cast<float>(ui.manual.saturation * 100.0);
+            if (ImGui::SliderFloat("Saturation", &satPct, 0.0f, 200.0f, "%.0f%%")) {
+                ui.manual.saturation = satPct / 100.0;
+                pushManual(ui);
+            }
+            float vibrance = static_cast<float>(ui.manual.vibrance);
+            if (ImGui::SliderFloat("Vibrance", &vibrance, -100.0f, 100.0f, "%.0f")) {
+                ui.manual.vibrance = vibrance;
+                pushManual(ui);
+            }
+            ImGui::Separator();
+            float lookMixPct = static_cast<float>(ui.lookMix * 100.0);
+            if (ImGui::SliderFloat("Look Mix", &lookMixPct, 0.0f, 100.0f, "%.0f%%")) {
+                ui.lookMix = clamp01(lookMixPct / 100.0);
+                w->edits.push({EditField::LookMix, ui.lookMix});
+            }
+            ImGui::EndTabItem();
+        }
         if (ImGui::BeginTabItem("Grade")) {
             // --- Theme popup: writes EditField::Theme (1-based to match CG_THEME_*) ---
             int themeIdx = ui.theme - 1;
             if (themeIdx < 0) themeIdx = 0;
-            if (themeIdx > 2) themeIdx = 2;
-            if (ImGui::Combo("Theme", &themeIdx, kThemeNames, 3)) {
+            if (themeIdx > kThemeCount - 1) themeIdx = kThemeCount - 1;
+            if (ImGui::Combo("Theme", &themeIdx, kThemeNames, kThemeCount)) {
                 ui.theme = themeIdx + 1;
                 w->edits.push({EditField::Theme, static_cast<double>(ui.theme)});
             }

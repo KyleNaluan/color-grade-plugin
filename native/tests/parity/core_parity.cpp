@@ -68,6 +68,30 @@ static std::vector<double> flattenStats(const FootageStats& s) {
     return std::vector<double>(d.v, d.v + STATS_FIELDS);
 }
 
+// Parse a manual-grade CSV "exp,con,piv,hi,sh,wh,bl,temp,tint,sat,vib,lookMix" into a
+// ManualGrade + lookMix (mirrors the TS harness manualToCsv order).
+static void parseManual(const char* csv, ManualGrade& m, double& lookMix) {
+    double v[12] = {0, 0, 0.435, 0, 0, 0, 0, 0, 0, 1, 0, 1};
+    const char* p = csv;
+    for (int i = 0; i < 12 && p && *p; i++) {
+        v[i] = std::atof(p);
+        const char* c = std::strchr(p, ',');
+        p = c ? c + 1 : nullptr;
+    }
+    m.exposure = v[0];
+    m.contrast = v[1];
+    m.pivot = v[2];
+    m.highlights = v[3];
+    m.shadows = v[4];
+    m.whites = v[5];
+    m.blacks = v[6];
+    m.temperature = v[7];
+    m.tint = v[8];
+    m.saturation = v[9];
+    m.vibrance = v[10];
+    lookMix = v[11];
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) { std::fprintf(stderr, "usage: core_parity <stats|grade|decode> ...\n"); return 2; }
     const std::string cmd = argv[1];
@@ -266,6 +290,118 @@ int main(int argc, char** argv) {
             size);
         writeF32(argv[12], lut.data);
         return 0;
+    }
+
+    if (cmd == "grademanual" && argc == 12) {
+        // Exercise the Phase 6a manual primary-correction stage + Look Mix directly in
+        // buildTransform (bakeGradeLut), against the TS oracle's same manual+lookMix opts.
+        const size_t n = static_cast<size_t>(std::strtoull(argv[3], nullptr, 10));
+        std::vector<float> px = readF32(argv[2], n);
+        Theme theme;
+        if (!getTheme(argv[4], theme)) {
+            std::fprintf(stderr, "core_parity: unknown theme %s\n", argv[4]);
+            return 2;
+        }
+        EngineOptions opts;
+        if (std::atoi(argv[5])) opts.strength = std::atof(argv[6]);
+        if (std::atoi(argv[7])) opts.skinProtection = std::atof(argv[8]);
+        const int size = std::atoi(argv[9]);
+        ManualGrade m;
+        double lookMix = 1.0;
+        parseManual(argv[10], m, lookMix);
+        opts.manual = m;
+        opts.lookMix = lookMix;
+        FootageStats stats = computeStats(px.data(), px.size());
+        cg::Lut3D lut = bakeGradeLut(stats, theme, opts, size);
+        writeF32(argv[11], lut.data);
+        return 0;
+    }
+
+    if (cmd == "recipemanual" && argc == 12) {
+        // Exercise the manual grade carried THROUGH the arb-data recipe: seed a recipe
+        // from the theme, stamp the manual block + lookMix into it, and bakeFromRecipe
+        // (no manual in opts, so it is taken from the recipe). Must match the plain
+        // grademanual/oracle result - proving the POD recipe carries the manual grade.
+        const size_t n = static_cast<size_t>(std::strtoull(argv[3], nullptr, 10));
+        std::vector<float> px = readF32(argv[2], n);
+        Theme theme;
+        if (!getTheme(argv[4], theme)) {
+            std::fprintf(stderr, "core_parity: unknown theme %s\n", argv[4]);
+            return 2;
+        }
+        EngineOptions opts;
+        if (std::atoi(argv[5])) opts.strength = std::atof(argv[6]);
+        if (std::atoi(argv[7])) opts.skinProtection = std::atof(argv[8]);
+        const int size = std::atoi(argv[9]);
+        ManualGrade m;
+        double lookMix = 1.0;
+        parseManual(argv[10], m, lookMix);
+        FootageStats stats = computeStats(px.data(), px.size());
+        RecipeData recipe = recipeFromTheme(theme, stats);
+        recipe.manualExposure = m.exposure;
+        recipe.manualContrast = m.contrast;
+        recipe.manualPivot = m.pivot;
+        recipe.manualHighlights = m.highlights;
+        recipe.manualShadows = m.shadows;
+        recipe.manualWhites = m.whites;
+        recipe.manualBlacks = m.blacks;
+        recipe.manualTemperature = m.temperature;
+        recipe.manualTint = m.tint;
+        recipe.manualSaturation = m.saturation;
+        recipe.manualVibrance = m.vibrance;
+        recipe.lookMix = lookMix;
+        cg::Lut3D lut = bakeFromRecipe(recipe, opts, size);
+        writeF32(argv[11], lut.data);
+        return 0;
+    }
+
+    if (cmd == "migrate" && argc == 2) {
+        // Self-checking versioned arb-data migration test (the Phase 6a landmine): a v2
+        // blob migrates forward with its fields intact and the new fields defaulted; a
+        // current blob round-trips verbatim; a foreign blob reseeds. Exit nonzero on any
+        // failure so the harness (stdio inherit) surfaces it.
+        int fail = 0;
+        RecipeData fallback = recipeFromTheme(tealOrangeTheme(), tealOrangeTheme().targetStats);
+        // Build a distinctive "v2" blob (v3 recipe truncated to the v2 prefix, version=2).
+        RecipeData v3 = recipeFromTheme(coolNoirTheme(), coolNoirTheme().targetStats);
+        v3.chromaGain = 0.777;
+        v3.hasChromaGain = 1;
+        v3.strengthDefault = 0.66;
+        v3.skinProtectionDefault = 0.44;
+        std::vector<char> buf(RECIPE_V2_SIZE);
+        std::memcpy(buf.data(), &v3, RECIPE_V2_SIZE);
+        uint32_t two = 2;
+        std::memcpy(buf.data() + sizeof(uint32_t), &two, sizeof(uint32_t));
+        RecipeData out;
+        migrateRecipeInto(&out, buf.data(), buf.size(), fallback);
+        if (out.version != RECIPE_VERSION) { std::fprintf(stderr, "migrate: version\n"); fail = 1; }
+        if (out.magic != RECIPE_MAGIC) { std::fprintf(stderr, "migrate: magic\n"); fail = 1; }
+        if (out.chromaGain != 0.777) { std::fprintf(stderr, "migrate: chromaGain\n"); fail = 1; }
+        if (out.strengthDefault != 0.66) { std::fprintf(stderr, "migrate: strength\n"); fail = 1; }
+        if (out.skinProtectionDefault != 0.44) { std::fprintf(stderr, "migrate: skin\n"); fail = 1; }
+        if (out.matchStats != 1) { std::fprintf(stderr, "migrate: matchStats default\n"); fail = 1; }
+        if (out.manualSaturation != 1.0) { std::fprintf(stderr, "migrate: sat default\n"); fail = 1; }
+        if (out.manualExposure != 0.0) { std::fprintf(stderr, "migrate: exp default\n"); fail = 1; }
+        if (out.manualPivot != 0.435) { std::fprintf(stderr, "migrate: pivot default\n"); fail = 1; }
+        if (out.lookMix != 1.0) { std::fprintf(stderr, "migrate: lookMix default\n"); fail = 1; }
+        // Current-version blob copies verbatim.
+        RecipeData out2;
+        v3.version = RECIPE_VERSION;
+        migrateRecipeInto(&out2, &v3, sizeof(RecipeData), fallback);
+        if (std::memcmp(&out2, &v3, sizeof(RecipeData)) != 0) {
+            std::fprintf(stderr, "migrate: verbatim\n");
+            fail = 1;
+        }
+        // Foreign blob reseeds to the fallback.
+        RecipeData out3;
+        uint32_t junk = 0xDEADBEEF;
+        migrateRecipeInto(&out3, &junk, sizeof(junk), fallback);
+        if (std::memcmp(&out3, &fallback, sizeof(RecipeData)) != 0) {
+            std::fprintf(stderr, "migrate: reseed\n");
+            fail = 1;
+        }
+        std::printf(fail ? "  migrate  FAIL\n" : "  migrate  PASS (v2->v3 forward, verbatim, reseed)\n");
+        return fail;
     }
 
     if (cmd == "decode" && argc == 5) {

@@ -67,6 +67,20 @@ static void test_fingerprint() {
     CHECK(previewParamFingerprint(1, 1, 1, 0.8010, 0.75, 1.00) !=
               previewParamFingerprint(1, 1, 1, 0.8000, 0.75, 1.00),
           "1e-3 strength step distinguished");
+
+    // Phase 6a: omitting the manual/scalar args keeps the legacy fingerprint (neutral
+    // defaults exposure 0 / lookMix 1 / temperature 0 / recipeHash 0), so pre-6a keys
+    // are unchanged, and each new input moves the fingerprint.
+    const uint64_t base6a = previewParamFingerprint(1, 1, 1, 0.80, 0.75, 1.00, 0.0, 1.0, 0.0, 0);
+    CHECK(base6a == base, "neutral manual/scalars == legacy fingerprint");
+    CHECK(previewParamFingerprint(1, 1, 1, 0.80, 0.75, 1.00, 0.5, 1.0, 0.0, 0) != base,
+          "exposure changes fp");
+    CHECK(previewParamFingerprint(1, 1, 1, 0.80, 0.75, 1.00, 0.0, 0.5, 0.0, 0) != base,
+          "look mix changes fp");
+    CHECK(previewParamFingerprint(1, 1, 1, 0.80, 0.75, 1.00, 0.0, 1.0, 30.0, 0) != base,
+          "temperature changes fp");
+    CHECK(previewParamFingerprint(1, 1, 1, 0.80, 0.75, 1.00, 0.0, 1.0, 0.0, 0xABCDULL) != base,
+          "recipe hash (manual state) changes fp");
 }
 
 static void test_key_equality() {
