@@ -12,6 +12,8 @@
     "spike": "tsx scripts/spike.ts",
     "author": "tsx scripts/authorTheme.ts",
     "auto-grade": "tsx scripts/autoGrade.ts",
+    "gallery": "tsx scripts/genThemeGallery.ts",
+    "theme:health": "tsx scripts/themeLibraryReport.ts",
     "dev": "vite",
     "build": "vite build && node scripts/assemble-cep.mjs",
     "lint": "tsx scripts/check-core-purity.ts",
