@@ -277,7 +277,7 @@ static bool LoadExternalCube(cg::Lut3D& outLut) {
 // Resolve the reference-match stats sidecar (Phase 7, "match this look" - data/cg-agents-
 // study/report.md sec 1d): env CG_REF_STATS_PATH first, then <pluginDir>/ColorGrade_Reference.stats.
 // Mirrors LoadExternalCube's resolution order exactly. No image codec lives in native/, so
-// the sidecar is pre-computed stats (written by src/panel/referenceMatch.ts via
+// the sidecar is pre-computed stats (written by src/core/analysis/referenceStats.ts's
 // writeReferenceStatsFile), not the reference image itself - this is the minimal native
 // entry point; a polished drop-zone/picker ships later with the UI overhaul.
 static bool LoadReferenceStats(cg::core::StatsData& out) {
