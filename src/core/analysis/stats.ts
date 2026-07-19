@@ -179,3 +179,41 @@ export function computeStats(pixels: Float32Array, clipEps = 0.001): FootageStat
     },
   };
 }
+
+/** Number of fields in the canonical flat stat vector (see {@link flattenStats}). */
+export const STATS_FIELDS = 21;
+
+/**
+ * Canonical FootageStats <-> flat 21-number vector, in the SAME field order as
+ * the native port's `statsToData`/`statsFromData` (`native/ColorGradeFX/core/Recipe.h`)
+ * and the cross-engine parity harness's `flattenStats` (`native/scripts/core-parity-test.ts`).
+ * This order is the shared contract every stats interchange format keys off - the
+ * reference-match sidecar file (`src/core/analysis/referenceStats.ts`) included.
+ */
+export function flattenStats(s: FootageStats): number[] {
+  const p = s.lumaPercentiles;
+  return [
+    p.p1, p.p5, p.p25, p.p50, p.p75, p.p95, p.p99,
+    s.lab.mean[0], s.lab.mean[1], s.lab.mean[2],
+    s.lab.std[0], s.lab.std[1], s.lab.std[2],
+    s.bandChroma.shadows, s.bandChroma.mids, s.bandChroma.highlights,
+    s.saturation.mean, s.saturation.std,
+    s.skinPresence,
+    s.clipping.low, s.clipping.high,
+  ];
+}
+
+/** Inverse of {@link flattenStats}. Throws if `v` is not exactly `STATS_FIELDS` long. */
+export function unflattenStats(v: number[]): FootageStats {
+  if (v.length !== STATS_FIELDS) {
+    throw new Error(`unflattenStats: expected ${STATS_FIELDS} values, got ${v.length}`);
+  }
+  return {
+    lumaPercentiles: { p1: v[0]!, p5: v[1]!, p25: v[2]!, p50: v[3]!, p75: v[4]!, p95: v[5]!, p99: v[6]! },
+    lab: { mean: [v[7]!, v[8]!, v[9]!], std: [v[10]!, v[11]!, v[12]!] },
+    bandChroma: { shadows: v[13]!, mids: v[14]!, highlights: v[15]! },
+    saturation: { mean: v[16]!, std: v[17]! },
+    skinPresence: v[18]!,
+    clipping: { low: v[19]!, high: v[20]! },
+  };
+}
