@@ -23,7 +23,13 @@ export interface ChromaShape {
   vibrance?: number;
   /**
    * Soft ceiling on LAB chroma (tanh compression). Chroma asymptotically
-   * approaches this value instead of growing unbounded. Omit for no limit.
+   * approaches this value instead of growing unbounded. In LAB chroma units -
+   * the same scale as `bandChroma` and grade-impact `castMagnitude`, NOT a 0-1
+   * fraction. Sensible range about 10-40; lower clamps harder (14-30 tamed the
+   * tone-stretch overshoot and highlight-blotch failure modes in the scout
+   * report, `data/cg-agent-grade-s7`). For reference, the automatic
+   * overshoot guard sets its own ceiling at 3-6x the target's max band chroma.
+   * Omit for no limit.
    */
   softLimit?: number;
 }
@@ -52,7 +58,15 @@ export interface ThemeOverrides {
    * Typically 1-20 LAB units; values much past ~20 read as an obvious color cast.
    */
   midtoneTint?: [number, number];
-  /** Global multiplier on LAB chroma after stat matching (1 = none). */
+  /**
+   * Global multiplier on LAB chroma after stat matching. 1 = none; below 1
+   * mutes overall color, above 1 boosts it. A plain multiplier, NOT a 0-1
+   * fraction. Sensible range about 0.2-1.5; dropping to 0.2-0.5 tamed the
+   * tone-stretch overshoot and highlight-blotch failure modes in the scout
+   * report (`data/cg-agent-grade-s7`). Note: in the engine's large-tone-stretch
+   * safety regime the automatic overshoot guard bounds the total auto chroma
+   * amplification, this gain included (see `toneStretchChromaGuard`).
+   */
   chromaGain?: number;
   /**
    * Authored master tone curve on gamma-encoded [0,1], applied per channel
