@@ -191,6 +191,23 @@ After the captain approved ImGui, the full control set landed on it:
   Both compositions are proven bit-exact / within 3.3e-7 of the TS oracle by the
   `gradedecode` and `lutdecode` cases in `npm run native:core-parity`. (Analyze/scopes
   stay Phase 5.)
+
+  **Correct/Basics under a user LUT** (`fm/cg-lut-correct-stack`): a 4th LUT Source
+  choice, **"External .cube + Correct/Basics"** (`CG_SRC_EXTERNAL_CORRECT`), folds the
+  manual primary correction (Basics + LGG wheels) UNDER the user's own creative `.cube`,
+  so the chain becomes `decode -> correct/basics -> user LUT` (plain "External .cube file"
+  stays `decode -> user LUT`, basics bypassed - unchanged). The composition is bake-time
+  only (`ComposeDecodeIntoLut` now takes an optional `cg::core::ManualPrimaries*`):
+  `lerp(decode(x), userLut(primaries(decode(x))), strength)`, applied at strength 1.0, so
+  the render path still samples ONE composite once per pixel. `primaries` come from the
+  recipe (`manualFromRecipe`+`lggFromRecipe`, with the live keyframeable
+  Exposure/Temperature overriding it per D1); the manual-primaries stage is the shared
+  core seam `makeManualPrimaries`/`ManualPrimaries` (`core/Engine.h`, mirroring
+  `buildManualPrimaries` in `engine.ts`). A neutral correction collapses to the plain
+  External output. Because it is a popup CHOICE, there is no arb-data / `RECIPE_VERSION` /
+  `AE_Effect_Version` change and no new bridge field (LUT Source already round-trips).
+  Proven by the `lutcorrect` core-parity case (bit-exact, V-Log + Rec.709, full/partial
+  strength) and `tests/unit/correctUnderLut.test.ts`.
 - **Grade tab:** Theme popup, Strength / Skin Protection / Chroma Gain sliders, LUT
   Source popup - all round-trip through the bridge to their params.
 - **Every control** reads (via `publishSnapshot`) and writes (via `drainEdits` ->

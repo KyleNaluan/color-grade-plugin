@@ -227,6 +227,157 @@ export function toneStretchChromaGuard(src: FootageStats, tgt: FootageStats): Ch
 }
 
 /**
+ * The manual-primaries slot as a whole: manual basics (Phase 6a) followed by the
+ * Lift/Gamma/Gain wheels (Phase 6c), applied to one decoded gamma-Rec.709 pixel
+ * ahead of the theme stages. `active` is false when both stages are neutral, in
+ * which case `apply` is exact identity on its input.
+ */
+export interface ManualPrimaries {
+  /** True when the manual or LGG stage does anything (neutral -> false). */
+  readonly active: boolean;
+  /** Apply manual basics then LGG wheels to one gamma-Rec.709 pixel. */
+  apply(rgb: Vec3): Vec3;
+}
+
+/**
+ * Precompute the manual-primaries stage (manual basics + LGG wheels) once and
+ * return a reusable applier. This is the single source of truth for that stage:
+ * {@link buildTransform} folds it in ahead of the theme look, and
+ * {@link applyManualPrimaries} exposes it standalone for the "Correct/Basics under
+ * a user LUT" composition (decode -> correct/basics -> user LUT), where the same
+ * math must run outside a full grade. Each sub-op is gated on being non-neutral so
+ * a neutral control contributes exact identity (no lossy decode/encode or LAB
+ * round-trip on the neutral path).
+ */
+export function buildManualPrimaries(manual?: ManualGrade, lgg?: LiftGammaGain): ManualPrimaries {
+  // --- Manual primary correction (Phase 6a) -------------------------------
+  const m = manual;
+  const mExpActive = !!m && m.exposure !== 0;
+  const mExpGain = mExpActive ? Math.pow(2, m!.exposure) : 1;
+  const mContrastActive = !!m && m.contrast !== 0;
+  const mPivot = m?.pivot ?? NEUTRAL_MANUAL.pivot;
+  const mContrastSlope = mContrastActive
+    ? m!.contrast >= 0
+      ? 1 + m!.contrast / 100
+      : 1 / (1 - m!.contrast / 100)
+    : 1;
+  const mRegionActive =
+    !!m && (m.highlights !== 0 || m.shadows !== 0 || m.whites !== 0 || m.blacks !== 0);
+  const mAmtHi = ((m?.highlights ?? 0) / 100) * MANUAL_REGION_LIFT;
+  const mAmtSh = ((m?.shadows ?? 0) / 100) * MANUAL_REGION_LIFT;
+  const mAmtWh = ((m?.whites ?? 0) / 100) * MANUAL_REGION_LIFT;
+  const mAmtBl = ((m?.blacks ?? 0) / 100) * MANUAL_REGION_LIFT;
+  const mColorActive =
+    !!m && (m.temperature !== 0 || m.tint !== 0 || m.saturation !== 1 || m.vibrance !== 0);
+  const mSat = m?.saturation ?? 1;
+  const mVib = (m?.vibrance ?? 0) / 100; // -1..1
+  const mTempB = ((m?.temperature ?? 0) / 100) * MANUAL_TEMP_MAX;
+  const mTintA = ((m?.tint ?? 0) / 100) * MANUAL_TINT_MAX;
+  const manualActive = mExpActive || mContrastActive || mRegionActive || mColorActive;
+
+  // --- Lift/Gamma/Gain wheels (Phase 6c) ----------------------------------
+  const lggActive =
+    !!lgg &&
+    (lgg.lift[0] !== 0 || lgg.lift[1] !== 0 || lgg.lift[2] !== 0 ||
+      lgg.gamma[0] !== 1 || lgg.gamma[1] !== 1 || lgg.gamma[2] !== 1 ||
+      lgg.gain[0] !== 1 || lgg.gain[1] !== 1 || lgg.gain[2] !== 1);
+  const lgLift: Vec3 = lgg ? lgg.lift : [0, 0, 0];
+  const lgGain: Vec3 = lgg ? lgg.gain : [1, 1, 1];
+  const lgInvGamma: Vec3 = lgg
+    ? [
+        1 / Math.max(LGG_GAMMA_FLOOR, lgg.gamma[0]),
+        1 / Math.max(LGG_GAMMA_FLOOR, lgg.gamma[1]),
+        1 / Math.max(LGG_GAMMA_FLOOR, lgg.gamma[2]),
+      ]
+    : [1, 1, 1];
+  const lggChannel = (x: number, lift: number, gain: number, invGamma: number): number => {
+    const base = gain * x + lift * (1 - x);
+    return clamp01(Math.pow(Math.max(0, base), invGamma));
+  };
+  const applyLgg = (r: number, g: number, b: number): Vec3 => [
+    lggChannel(r, lgLift[0], lgGain[0], lgInvGamma[0]),
+    lggChannel(g, lgLift[1], lgGain[1], lgInvGamma[1]),
+    lggChannel(b, lgLift[2], lgGain[2], lgInvGamma[2]),
+  ];
+
+  // Apply the manual stage on one decoded gamma-Rec.709 pixel. Order: exposure
+  // (linear) -> contrast (about pivot) -> region lifts (bandWeights) -> color
+  // (LAB temp/tint/saturation/vibrance).
+  const applyManual = (r0: number, g0: number, b0: number): Vec3 => {
+    let r = r0;
+    let g = g0;
+    let b = b0;
+    if (mExpActive) {
+      r = rec709Encode(rec709Decode(r) * mExpGain);
+      g = rec709Encode(rec709Decode(g) * mExpGain);
+      b = rec709Encode(rec709Decode(b) * mExpGain);
+    }
+    if (mContrastActive) {
+      r = mPivot + (r - mPivot) * mContrastSlope;
+      g = mPivot + (g - mPivot) * mContrastSlope;
+      b = mPivot + (b - mPivot) * mContrastSlope;
+    }
+    if (mExpActive || mContrastActive) {
+      r = clamp01(r);
+      g = clamp01(g);
+      b = clamp01(b);
+    }
+    if (mRegionActive) {
+      const y = luma709(r, g, b);
+      // Shadows/highlights reuse the feathered band split; blacks/whites add an
+      // extra toe/shoulder edge weight so all four controls stay independent.
+      const [wsB, , whB] = bandWeights(y);
+      const wBlack = 1 - smoothstep(0, 0.2, y);
+      const wWhite = smoothstep(0.8, 1, y);
+      const dY = mAmtSh * wsB + mAmtHi * whB + mAmtBl * wBlack + mAmtWh * wWhite;
+      r = clamp01(r + dY);
+      g = clamp01(g + dY);
+      b = clamp01(b + dY);
+    }
+    if (mColorActive) {
+      const labm = linearRec709ToLab([rec709Decode(r), rec709Decode(g), rec709Decode(b)]);
+      let am = labm[1] * mSat;
+      let bm = labm[2] * mSat;
+      if (mVib !== 0) {
+        const chromam = Math.hypot(am, bm);
+        if (chromam > 1e-6) {
+          const mult = Math.max(0, 1 + mVib * Math.exp(-chromam / VIBRANCE_FALLOFF));
+          am *= mult;
+          bm *= mult;
+        }
+      }
+      am += mTintA;
+      bm += mTempB;
+      const linm = labToLinearRec709([labm[0], am, bm]);
+      r = clamp01(rec709Encode(Math.max(0, linm[0])));
+      g = clamp01(rec709Encode(Math.max(0, linm[1])));
+      b = clamp01(rec709Encode(Math.max(0, linm[2])));
+    }
+    return [r, g, b];
+  };
+
+  const active = manualActive || lggActive;
+  const apply = (rgb: Vec3): Vec3 => {
+    let r = rgb[0];
+    let g = rgb[1];
+    let b = rgb[2];
+    if (manualActive) [r, g, b] = applyManual(r, g, b);
+    if (lggActive) [r, g, b] = applyLgg(r, g, b);
+    return [r, g, b];
+  };
+  return { active, apply };
+}
+
+/**
+ * Apply the manual-primaries stage (basics + LGG wheels) to one gamma-Rec.709
+ * pixel, standalone. Convenience over {@link buildManualPrimaries} for a single
+ * pixel; when baking a LUT, build once and reuse {@link ManualPrimaries.apply}.
+ */
+export function applyManualPrimaries(rgb: Vec3, manual?: ManualGrade, lgg?: LiftGammaGain): Vec3 {
+  return buildManualPrimaries(manual, lgg).apply(rgb);
+}
+
+/**
  * Build the grade transform: measured footage stats -> transform toward the
  * theme's target stats, scaled by knobs, with skin-tone protection.
  *
@@ -315,121 +466,11 @@ export function buildTransform(src: FootageStats, theme: Theme, opts: EngineOpti
   // Authored ceiling wins; otherwise the guard's auto ceiling (undefined = none).
   const softLimit = shape.softLimit ?? guard.autoSoftLimit;
 
-  // --- Manual primary correction (Phase 6a) -------------------------------
-  // Precompute the manual coefficients once; each sub-op is gated on being
-  // non-neutral so a neutral control contributes exact identity (no lossy
-  // decode/encode or LAB round-trip on the neutral path).
-  const m = opts.manual;
-  const mExpActive = !!m && m.exposure !== 0;
-  const mExpGain = mExpActive ? Math.pow(2, m!.exposure) : 1;
-  const mContrastActive = !!m && m.contrast !== 0;
-  const mPivot = m?.pivot ?? NEUTRAL_MANUAL.pivot;
-  const mContrastSlope = mContrastActive
-    ? m!.contrast >= 0
-      ? 1 + m!.contrast / 100
-      : 1 / (1 - m!.contrast / 100)
-    : 1;
-  const mRegionActive =
-    !!m && (m.highlights !== 0 || m.shadows !== 0 || m.whites !== 0 || m.blacks !== 0);
-  const mAmtHi = ((m?.highlights ?? 0) / 100) * MANUAL_REGION_LIFT;
-  const mAmtSh = ((m?.shadows ?? 0) / 100) * MANUAL_REGION_LIFT;
-  const mAmtWh = ((m?.whites ?? 0) / 100) * MANUAL_REGION_LIFT;
-  const mAmtBl = ((m?.blacks ?? 0) / 100) * MANUAL_REGION_LIFT;
-  const mColorActive =
-    !!m && (m.temperature !== 0 || m.tint !== 0 || m.saturation !== 1 || m.vibrance !== 0);
-  const mSat = m?.saturation ?? 1;
-  const mVib = (m?.vibrance ?? 0) / 100; // -1..1
-  const mTempB = ((m?.temperature ?? 0) / 100) * MANUAL_TEMP_MAX;
-  const mTintA = ((m?.tint ?? 0) / 100) * MANUAL_TINT_MAX;
-  const manualActive = mExpActive || mContrastActive || mRegionActive || mColorActive;
-
-  // --- Lift/Gamma/Gain wheels (Phase 6c) ----------------------------------
-  // Per-channel printer-lights operator, applied right after the manual stage on
-  // the decoded signal. Neutral (lift 0, gamma 1, gain 1) is exact identity, so
-  // the whole stage is gated off when neutral (no lossy pow round-trip).
-  const lgg = opts.lgg;
-  const lggActive =
-    !!lgg &&
-    (lgg.lift[0] !== 0 || lgg.lift[1] !== 0 || lgg.lift[2] !== 0 ||
-      lgg.gamma[0] !== 1 || lgg.gamma[1] !== 1 || lgg.gamma[2] !== 1 ||
-      lgg.gain[0] !== 1 || lgg.gain[1] !== 1 || lgg.gain[2] !== 1);
-  const lgLift: Vec3 = lgg ? lgg.lift : [0, 0, 0];
-  const lgGain: Vec3 = lgg ? lgg.gain : [1, 1, 1];
-  const lgInvGamma: Vec3 = lgg
-    ? [
-        1 / Math.max(LGG_GAMMA_FLOOR, lgg.gamma[0]),
-        1 / Math.max(LGG_GAMMA_FLOOR, lgg.gamma[1]),
-        1 / Math.max(LGG_GAMMA_FLOOR, lgg.gamma[2]),
-      ]
-    : [1, 1, 1];
-  const lggChannel = (x: number, lift: number, gain: number, invGamma: number): number => {
-    const base = gain * x + lift * (1 - x);
-    return clamp01(Math.pow(Math.max(0, base), invGamma));
-  };
-  const applyLgg = (r: number, g: number, b: number): Vec3 => [
-    lggChannel(r, lgLift[0], lgGain[0], lgInvGamma[0]),
-    lggChannel(g, lgLift[1], lgGain[1], lgInvGamma[1]),
-    lggChannel(b, lgLift[2], lgGain[2], lgInvGamma[2]),
-  ];
-
-  // The manual-primaries slot as a whole (manual basics + LGG wheels).
-  const correctionActive = manualActive || lggActive;
-
-  // Apply the manual stage on one decoded gamma-Rec.709 pixel. Order: exposure
-  // (linear) -> contrast (about pivot) -> region lifts (bandWeights) -> color
-  // (LAB temp/tint/saturation/vibrance).
-  const applyManual = (r0: number, g0: number, b0: number): Vec3 => {
-    let r = r0;
-    let g = g0;
-    let b = b0;
-    if (mExpActive) {
-      r = rec709Encode(rec709Decode(r) * mExpGain);
-      g = rec709Encode(rec709Decode(g) * mExpGain);
-      b = rec709Encode(rec709Decode(b) * mExpGain);
-    }
-    if (mContrastActive) {
-      r = mPivot + (r - mPivot) * mContrastSlope;
-      g = mPivot + (g - mPivot) * mContrastSlope;
-      b = mPivot + (b - mPivot) * mContrastSlope;
-    }
-    if (mExpActive || mContrastActive) {
-      r = clamp01(r);
-      g = clamp01(g);
-      b = clamp01(b);
-    }
-    if (mRegionActive) {
-      const y = luma709(r, g, b);
-      // Shadows/highlights reuse the feathered band split; blacks/whites add an
-      // extra toe/shoulder edge weight so all four controls stay independent.
-      const [wsB, , whB] = bandWeights(y);
-      const wBlack = 1 - smoothstep(0, 0.2, y);
-      const wWhite = smoothstep(0.8, 1, y);
-      const dY = mAmtSh * wsB + mAmtHi * whB + mAmtBl * wBlack + mAmtWh * wWhite;
-      r = clamp01(r + dY);
-      g = clamp01(g + dY);
-      b = clamp01(b + dY);
-    }
-    if (mColorActive) {
-      const labm = linearRec709ToLab([rec709Decode(r), rec709Decode(g), rec709Decode(b)]);
-      let am = labm[1] * mSat;
-      let bm = labm[2] * mSat;
-      if (mVib !== 0) {
-        const chromam = Math.hypot(am, bm);
-        if (chromam > 1e-6) {
-          const mult = Math.max(0, 1 + mVib * Math.exp(-chromam / VIBRANCE_FALLOFF));
-          am *= mult;
-          bm *= mult;
-        }
-      }
-      am += mTintA;
-      bm += mTempB;
-      const linm = labToLinearRec709([labm[0], am, bm]);
-      r = clamp01(rec709Encode(Math.max(0, linm[0])));
-      g = clamp01(rec709Encode(Math.max(0, linm[1])));
-      b = clamp01(rec709Encode(Math.max(0, linm[2])));
-    }
-    return [r, g, b];
-  };
+  // --- Manual-primaries slot (Phase 6a basics + Phase 6c LGG wheels) ------
+  // Precomputed once via the shared builder (also used standalone by the
+  // Correct/Basics-under-LUT path); neutral controls contribute exact identity.
+  const primaries = buildManualPrimaries(opts.manual, opts.lgg);
+  const correctionActive = primaries.active;
 
   // Look Mix: blend the theme look in/out over the manual-corrected pixel.
   const lookMix = clamp01(opts.lookMix ?? 1);
@@ -463,8 +504,7 @@ export function buildTransform(src: FootageStats, theme: Theme, opts: EngineOpti
     let rm = rIn;
     let gm = gIn;
     let bm = bIn;
-    if (manualActive) [rm, gm, bm] = applyManual(rm, gm, bm);
-    if (lggActive) [rm, gm, bm] = applyLgg(rm, gm, bm);
+    if (correctionActive) [rm, gm, bm] = primaries.apply([rm, gm, bm]);
 
     // 1. Tone: stat-matching curve per channel (matches luma percentiles,
     //    keeps color ratios), then the authored master + per-channel curves.

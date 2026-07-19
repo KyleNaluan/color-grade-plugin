@@ -16,8 +16,12 @@
  *   - "Embedded (Teal-Orange)" uses the compiled-in default LUT.
  *   - "External .cube file" loads from env CG_LUT_PATH, else <pluginDir>/ColorGrade_LUT.cube,
  *     falling back to the embedded LUT on any failure (so render never fails for a bad path).
- * The Auto path bakes strength into the LUT (post-LUT blend = 1.0); the embedded/
- * external paths blend by the strength slider, preserving Phase 1 behaviour.
+ *   - "External .cube + Correct/Basics" loads the same user .cube but folds the footage
+ *     decode + manual Basics/LGG UNDER it at bake time (chain decode -> correct/basics ->
+ *     user LUT); a neutral correction collapses to the plain "External .cube file" output.
+ * The Auto and "External .cube + Correct/Basics" paths bake strength into the LUT
+ * (post-LUT blend = 1.0); the embedded/plain-external paths blend by the strength
+ * slider, preserving Phase 1 behaviour.
  */
 
 // cuda_runtime.h must precede ColorGrade.h: it defines MAJOR_VERSION/MINOR_VERSION macros
@@ -299,8 +303,12 @@ static bool LoadReferenceStats(cg::core::StatsData&) { return false; }
 #endif
 
 // Fill dst with the LUT chosen by the source popup, always leaving a valid LUT.
+// Both External modes ("External .cube file" and "External .cube + Correct/Basics")
+// load the user's creative .cube; they differ only in whether the Correct/Basics
+// stage is composed UNDER it (see ResolveRenderData).
 static void ResolveLut(A_long source, cg::Lut3D& dst) {
-    if (source == CG_SRC_EXTERNAL && LoadExternalCube(dst)) return;
+    if ((source == CG_SRC_EXTERNAL || source == CG_SRC_EXTERNAL_CORRECT) && LoadExternalCube(dst))
+        return;
     dst = cg::EmbeddedLut();
 }
 
@@ -420,27 +428,36 @@ static void BakeAutoLut(A_long themePopup, A_long footagePopup, double strength0
     }
 }
 
-// Resample a baked LUT so the Footage/Correct decode applies *before* it and the
-// Strength blend happens in DECODED space:
-//   newLut(x) = lerp(decode(x), rawLut(decode(x)), strength01)
-//             = decode(x)*(1-s) + rawLut(decode(x))*s.
-// This makes the decode stage apply in the Embedded/External raw-LUT modes too
-// (captain directive: never leave V-Log footage undecoded under any LUT Source) AND
-// bakes Strength into the composed LUT so at s<100% the blend is decoded-vs-graded,
-// never a raw-log term. Callers apply this LUT at applyStrength=1.0. The per-pixel
-// apply stays a single trilinear sample (CPU/GPU identical). Rec.709 decodes to
-// itself, so it is a no-op and the caller keeps the raw LUT + slider strength.
-// (The Auto path composes the decode into the *continuous* grade in BakeAutoLut, which
-// avoids this resample's extra interpolation; here we only have a baked LUT to compose.)
-static cg::Lut3D ComposeDecodeIntoLut(const cg::Lut3D& lut, A_long footagePopup, double strength01) {
-    if (!FootageIsLog(footagePopup)) return lut;
-    const cg::core::LogProfile& profile = ProfileFromFootagePopup(footagePopup);
+// Resample a baked raw LUT so the Footage/Correct decode - and, optionally, the
+// manual primary correction (Basics + LGG wheels) - apply *before* it, with the
+// Strength blend happening in DECODED space:
+//   newLut(x) = lerp(decode(x), rawLut(correct(decode(x))), strength01)
+//             = decode(x)*(1-s) + rawLut(correct(decode(x)))*s
+// where correct = the manual primaries when `primaries` is non-null, else identity.
+// This makes the decode stage apply in the Embedded/External raw-LUT modes (captain
+// directive: never leave log footage undecoded under any LUT Source) AND, for the
+// "External .cube + Correct/Basics" mode, folds the Correct/Basics stage UNDER the
+// user's creative LUT (fm/cg-lut-correct-stack): decode -> correct/basics -> user LUT.
+// Strength is baked into the composed LUT so at s<100% the blend is decoded-vs-fully-
+// processed, never a raw-log or un-corrected term; the identity target stays the plain
+// decoded footage (decision D3: Strength dilutes the whole grade, Basics included).
+// Callers apply this LUT at applyStrength=1.0. The per-pixel apply stays a single
+// trilinear sample (CPU/GPU identical) - the chain change is at bake time, not per pixel.
+// Rec.709 decodes to itself, so with no primaries this is a no-op and the caller keeps
+// the raw LUT + slider strength; with primaries it still composes them under the LUT.
+static cg::Lut3D ComposeDecodeIntoLut(const cg::Lut3D& lut, A_long footagePopup, double strength01,
+                                      const cg::core::ManualPrimaries* primaries = nullptr) {
+    const bool isLog = FootageIsLog(footagePopup);
+    if (!isLog && !primaries) return lut;  // nothing to compose (pure raw path)
+    const cg::core::LogProfile& profile =
+        isLog ? ProfileFromFootagePopup(footagePopup) : cg::core::REC709_PROFILE();
     return cg::core::bakeLut(
-        [&lut, &profile, strength01](const cg::core::Vec3d& x) -> cg::core::Vec3d {
+        [&lut, &profile, strength01, primaries](const cg::core::Vec3d& x) -> cg::core::Vec3d {
             const cg::core::Vec3d dec = cg::core::decodePixelToRec709(x, profile);
+            const cg::core::Vec3d corrected = primaries ? primaries->apply(dec) : dec;
             const cg::Vec3 s = cg::sampleLut(
-                lut, cg::Vec3{static_cast<float>(dec[0]), static_cast<float>(dec[1]),
-                              static_cast<float>(dec[2])});
+                lut, cg::Vec3{static_cast<float>(corrected[0]), static_cast<float>(corrected[1]),
+                              static_cast<float>(corrected[2])});
             return cg::core::Vec3d{
                 dec[0] * (1.0 - strength01) + s[0] * strength01,
                 dec[1] * (1.0 - strength01) + s[1] * strength01,
@@ -620,8 +637,25 @@ static void ResolveRenderData(PF_InData* in_data, A_long source, A_long themePop
         // (captain directive). Rec.709 decodes to itself: keep the raw LUT + slider strength.
         cg::Lut3D raw;
         ResolveLut(source, raw);
-        if (FootageIsLog(footagePopup)) {
-            d.lut = ComposeDecodeIntoLut(raw, footagePopup, strength01);
+
+        // "External .cube + Correct/Basics" (fm/cg-lut-correct-stack): fold the manual
+        // primary correction (Basics + LGG wheels from the recipe) UNDER the user LUT, so
+        // the chain becomes decode -> correct/basics -> user LUT. The live keyframeable
+        // Exposure/Temperature params override the recipe's stored values, mirroring the
+        // Auto path (decision D1). A neutral correction (nothing to apply) collapses to the
+        // plain External behavior, so "correction disabled" stays byte-for-byte unchanged.
+        cg::core::ManualPrimaries primaries;
+        const cg::core::ManualPrimaries* primPtr = nullptr;
+        if (source == CG_SRC_EXTERNAL_CORRECT) {
+            cg::core::ManualGrade manual = cg::core::manualFromRecipe(recipe);
+            manual.exposure = exposure;
+            manual.temperature = temperature;
+            primaries = cg::core::makeManualPrimaries(manual, cg::core::lggFromRecipe(recipe));
+            if (primaries.active()) primPtr = &primaries;
+        }
+
+        if (FootageIsLog(footagePopup) || primPtr) {
+            d.lut = ComposeDecodeIntoLut(raw, footagePopup, strength01, primPtr);
             d.applyStrength = 1.0f;
         } else {
             d.lut = raw;
