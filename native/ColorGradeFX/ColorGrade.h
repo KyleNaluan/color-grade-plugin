@@ -88,17 +88,51 @@ enum {
 #define CG_FOOTAGE_CHOICES "Rec.709 (standard)|V-Log"
 
 // Theme popup order (1-based in AE); maps to cg::core::getTheme keys. None (Manual)
-// is appended (Phase 6a), Reference Match (Phase 7) after that: adding a popup CHOICE
-// keeps CG_THEME's param index, so existing projects with value 1-4 still resolve.
+// leads the list (captain decision [key=none-first]): a bare AE popup stores its
+// selection as a 1-based index, so this reorder DELIBERATELY breaks the stored
+// mapping - projects saved with the earlier Teal-first order have their theme
+// selection shifted by the permutation and must be re-picked once (accepted:
+// ~2 pre-release test clips). ThemeFromPopup + the editor's kThemeNames[] switch
+// on these named constants, so both surfaces track this order automatically.
+// The default popup value stays CG_THEME_TEAL (see PF_ADD_POPUPX) so a freshly
+// applied effect keeps the teal-orange look the Strength/Skin defaults mirror.
+// Adding future looks stays append-at-end; keep labels ASCII (AE strings are
+// narrow/CP-1252).
 enum {
-    CG_THEME_TEAL = 1,
+    CG_THEME_NONE = 1,
+    CG_THEME_TEAL,
     CG_THEME_WARM,
     CG_THEME_COOL,
-    CG_THEME_NONE,
-    CG_THEME_REFERENCE
+    CG_THEME_REFERENCE,
+    // Curated library (PR #36), appended after the original set.
+    CG_THEME_GOLDEN_HOUR,
+    CG_THEME_BLEACH_BYPASS,
+    CG_THEME_VINTAGE_FADE,
+    CG_THEME_HIGH_KEY_CLEAN,
+    CG_THEME_LOW_KEY_MOODY,
+    CG_THEME_WINTER_BLUE,
+    CG_THEME_WARM_PORTRAIT,
+    CG_THEME_PASTEL_DREAM,
+    CG_THEME_NEON_CYBERPUNK,
+    CG_THEME_DAY_FOR_NIGHT,
+    CG_THEME_AUTUMN,
+    CG_THEME_SUMMER_BLOCKBUSTER,
+    CG_THEME_MUTED_TEAL_ORANGE,
+    CG_THEME_MONOCHROME_BW,
+    CG_THEME_SEPIA,
+    CG_THEME_CINEMATIC_GREEN,
+    CG_THEME_DESATURATED_DOC,
+    CG_THEME_PUNCHY_SOCIAL,
+    CG_THEME_CROSS_PROCESS,
+    CG_THEME_ROSE_ROMANCE
 };
-#define CG_THEME_CHOICES "Teal-Orange|Warm-Film|Cool-Noir|None (Manual)|Reference Match"
-#define CG_THEME_COUNT 5
+#define CG_THEME_CHOICES \
+    "None (Manual)|Teal-Orange|Warm-Film|Cool-Noir|Reference Match|" \
+    "Golden Hour|Bleach Bypass|Vintage Fade|High-Key Clean|Low-Key Moody|" \
+    "Winter Blue|Warm Portrait|Pastel Dream|Neon Cyberpunk|Day for Night|" \
+    "Autumn|Summer Blockbuster|Muted Teal-Orange|Monochrome B&W|Sepia|" \
+    "Cinematic Green|Desaturated Doc|Punchy Social|Cross Process|Rose Romance"
+#define CG_THEME_COUNT 25
 
 // LUT-source popup order (1-based). Auto bakes the grade from theme + recipe.
 enum {

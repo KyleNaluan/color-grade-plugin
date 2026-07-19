@@ -69,7 +69,7 @@ native/
       LogProfile.h Decode.h           profiles (V-Log/Rec.709) + decode-to-Rec.709
       MonotoneCurve.h                 PCHIP tone/shape curves
       Stats.h                         FootageStats + computeStats
-      Theme.h Themes.h                Theme type + the shipping themes (3 stat-match + None/Manual, data, transcribed)
+      Theme.h Themes.h                Theme type + all 24 registry looks (getTheme-by-name builders, data, transcribed)
       Engine.h                        buildTransform (manual stage + LGG wheels stage + the grade transform + Look Mix)
       BakeLut.h                       bakeLut / bakeGradeLut / bakeDecodeLut -> cg::Lut3D
       Recipe.h                        POD arb-data recipe (+ manual block + editor user fields) + <-> Theme/stats + bakeFromRecipe + applyEditorOverrides + v2/v3->v4 migrateRecipeInto + reference-match theme + stats-sidecar parse

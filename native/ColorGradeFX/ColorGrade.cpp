@@ -322,6 +322,27 @@ static cg::core::Theme ThemeFromPopup(A_long themePopup) {
             if (LoadReferenceStats(d)) return cg::core::referenceMatchTheme(cg::core::statsFromData(d));
             return cg::core::noneManualTheme();
         }
+        // Curated library (PR #36), appended after the original 5.
+        case CG_THEME_GOLDEN_HOUR: return cg::core::goldenHourTheme();
+        case CG_THEME_BLEACH_BYPASS: return cg::core::bleachBypassTheme();
+        case CG_THEME_VINTAGE_FADE: return cg::core::vintageFadeTheme();
+        case CG_THEME_HIGH_KEY_CLEAN: return cg::core::highKeyCleanTheme();
+        case CG_THEME_LOW_KEY_MOODY: return cg::core::lowKeyMoodyTheme();
+        case CG_THEME_WINTER_BLUE: return cg::core::winterBlueTheme();
+        case CG_THEME_WARM_PORTRAIT: return cg::core::warmPortraitTheme();
+        case CG_THEME_PASTEL_DREAM: return cg::core::pastelDreamTheme();
+        case CG_THEME_NEON_CYBERPUNK: return cg::core::neonCyberpunkTheme();
+        case CG_THEME_DAY_FOR_NIGHT: return cg::core::dayForNightTheme();
+        case CG_THEME_AUTUMN: return cg::core::autumnTheme();
+        case CG_THEME_SUMMER_BLOCKBUSTER: return cg::core::summerBlockbusterTheme();
+        case CG_THEME_MUTED_TEAL_ORANGE: return cg::core::mutedTealOrangeTheme();
+        case CG_THEME_MONOCHROME_BW: return cg::core::monochromeBwTheme();
+        case CG_THEME_SEPIA: return cg::core::sepiaTheme();
+        case CG_THEME_CINEMATIC_GREEN: return cg::core::cinematicGreenTheme();
+        case CG_THEME_DESATURATED_DOC: return cg::core::desaturatedDocTheme();
+        case CG_THEME_PUNCHY_SOCIAL: return cg::core::punchySocialTheme();
+        case CG_THEME_CROSS_PROCESS: return cg::core::crossProcessTheme();
+        case CG_THEME_ROSE_ROMANCE: return cg::core::roseRomanceTheme();
         case CG_THEME_TEAL:
         default: return cg::core::tealOrangeTheme();
     }
