@@ -24,7 +24,7 @@ Read this file first, then the pointed-to files for depth.
 
 - Correct stack per clip: Decode LUT (generated from the log profile, via Apply Color LUT) then Lumetri with auto-set sliders. Fully editable in vanilla AE.
 - Grade stack on adjustment layer: one baked .cube via Apply Color LUT. All creative work lives there. Never mix the two.
-- Log profiles are pluggable `{name, decode, gamut}`; V-Log + Rec.709 only for now. `decode()` is the single source of truth (bakes Decode LUT, informs analysis).
+- Log profiles are pluggable `{name, decode, gamut}`; Rec.709 plus 11 camera log profiles ship (V-Log, S-Log3, C-Log2/3, LogC3/LogC4, D-Log, Film Gen5, F-Log/F-Log2, N-Log; ADR 0004). `decode()` is the single source of truth (bakes Decode LUT, informs analysis).
 
 ### Auto-grade engine
 
