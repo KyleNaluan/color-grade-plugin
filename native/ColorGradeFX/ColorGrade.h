@@ -88,19 +88,23 @@ enum {
 #define CG_FOOTAGE_CHOICES "Rec.709 (standard)|V-Log"
 
 // Theme popup order (1-based in AE); maps to cg::core::getTheme keys. None (Manual)
-// is appended (Phase 6a), Reference Match (Phase 7) after that, then the 20-look
-// curated library (PR #36) appended after Reference Match: adding popup CHOICES
-// keeps CG_THEME's param index AND every existing choice's 1-based value, so
-// existing projects keep whatever theme they had (values 1-5 unchanged). New
-// looks go at 6+ to preserve that stability - do NOT reorder existing entries.
-// Keep labels ASCII (AE param strings are narrow/CP-1252).
+// leads the list (captain decision [key=none-first]): a bare AE popup stores its
+// selection as a 1-based index, so this reorder DELIBERATELY breaks the stored
+// mapping - projects saved with the earlier Teal-first order have their theme
+// selection shifted by the permutation and must be re-picked once (accepted:
+// ~2 pre-release test clips). ThemeFromPopup + the editor's kThemeNames[] switch
+// on these named constants, so both surfaces track this order automatically.
+// The default popup value stays CG_THEME_TEAL (see PF_ADD_POPUPX) so a freshly
+// applied effect keeps the teal-orange look the Strength/Skin defaults mirror.
+// Adding future looks stays append-at-end; keep labels ASCII (AE strings are
+// narrow/CP-1252).
 enum {
-    CG_THEME_TEAL = 1,
+    CG_THEME_NONE = 1,
+    CG_THEME_TEAL,
     CG_THEME_WARM,
     CG_THEME_COOL,
-    CG_THEME_NONE,
     CG_THEME_REFERENCE,
-    // Curated library (PR #36), appended after the original 5.
+    // Curated library (PR #36), appended after the original set.
     CG_THEME_GOLDEN_HOUR,
     CG_THEME_BLEACH_BYPASS,
     CG_THEME_VINTAGE_FADE,
@@ -123,7 +127,7 @@ enum {
     CG_THEME_ROSE_ROMANCE
 };
 #define CG_THEME_CHOICES \
-    "Teal-Orange|Warm-Film|Cool-Noir|None (Manual)|Reference Match|" \
+    "None (Manual)|Teal-Orange|Warm-Film|Cool-Noir|Reference Match|" \
     "Golden Hour|Bleach Bypass|Vintage Fade|High-Key Clean|Low-Key Moody|" \
     "Winter Blue|Warm Portrait|Pastel Dream|Neon Cyberpunk|Day for Night|" \
     "Autumn|Summer Blockbuster|Muted Teal-Orange|Monochrome B&W|Sepia|" \

@@ -786,10 +786,11 @@ const char* const kFootageNames[] = {"Rec.709 (standard)", "V-Log"};
 // image codec in native/ - see ColorGrade.cpp's LoadReferenceStats / ThemeFromPopup and
 // data/cg-agents-study/report.md sec 1d); falls back to identity (None/Manual) with no
 // sidecar loaded. The polished drop-zone/picker ships later with the UI overhaul.
-// Order MUST match the CG_THEME_* popup enum in ColorGrade.h (1-based). The
-// original 5 stay first (stable saved-project values); the PR #36 library follows.
+// Order MUST match the CG_THEME_* popup enum in ColorGrade.h (1-based). None
+// (Manual) leads (captain decision [key=none-first]); Reference Match then the
+// PR #36 library follow.
 const char* const kThemeNames[] = {
-    "Teal-Orange", "Warm-Film", "Cool-Noir", "None (Manual)", "Reference Match",
+    "None (Manual)", "Teal-Orange", "Warm-Film", "Cool-Noir", "Reference Match",
     "Golden Hour", "Bleach Bypass", "Vintage Fade", "High-Key Clean", "Low-Key Moody",
     "Winter Blue", "Warm Portrait", "Pastel Dream", "Neon Cyberpunk", "Day for Night",
     "Autumn", "Summer Blockbuster", "Muted Teal-Orange", "Monochrome B&W", "Sepia",
