@@ -88,17 +88,47 @@ enum {
 #define CG_FOOTAGE_CHOICES "Rec.709 (standard)|V-Log"
 
 // Theme popup order (1-based in AE); maps to cg::core::getTheme keys. None (Manual)
-// is appended (Phase 6a), Reference Match (Phase 7) after that: adding a popup CHOICE
-// keeps CG_THEME's param index, so existing projects with value 1-4 still resolve.
+// is appended (Phase 6a), Reference Match (Phase 7) after that, then the 20-look
+// curated library (PR #36) appended after Reference Match: adding popup CHOICES
+// keeps CG_THEME's param index AND every existing choice's 1-based value, so
+// existing projects keep whatever theme they had (values 1-5 unchanged). New
+// looks go at 6+ to preserve that stability - do NOT reorder existing entries.
+// Keep labels ASCII (AE param strings are narrow/CP-1252).
 enum {
     CG_THEME_TEAL = 1,
     CG_THEME_WARM,
     CG_THEME_COOL,
     CG_THEME_NONE,
-    CG_THEME_REFERENCE
+    CG_THEME_REFERENCE,
+    // Curated library (PR #36), appended after the original 5.
+    CG_THEME_GOLDEN_HOUR,
+    CG_THEME_BLEACH_BYPASS,
+    CG_THEME_VINTAGE_FADE,
+    CG_THEME_HIGH_KEY_CLEAN,
+    CG_THEME_LOW_KEY_MOODY,
+    CG_THEME_WINTER_BLUE,
+    CG_THEME_WARM_PORTRAIT,
+    CG_THEME_PASTEL_DREAM,
+    CG_THEME_NEON_CYBERPUNK,
+    CG_THEME_DAY_FOR_NIGHT,
+    CG_THEME_AUTUMN,
+    CG_THEME_SUMMER_BLOCKBUSTER,
+    CG_THEME_MUTED_TEAL_ORANGE,
+    CG_THEME_MONOCHROME_BW,
+    CG_THEME_SEPIA,
+    CG_THEME_CINEMATIC_GREEN,
+    CG_THEME_DESATURATED_DOC,
+    CG_THEME_PUNCHY_SOCIAL,
+    CG_THEME_CROSS_PROCESS,
+    CG_THEME_ROSE_ROMANCE
 };
-#define CG_THEME_CHOICES "Teal-Orange|Warm-Film|Cool-Noir|None (Manual)|Reference Match"
-#define CG_THEME_COUNT 5
+#define CG_THEME_CHOICES \
+    "Teal-Orange|Warm-Film|Cool-Noir|None (Manual)|Reference Match|" \
+    "Golden Hour|Bleach Bypass|Vintage Fade|High-Key Clean|Low-Key Moody|" \
+    "Winter Blue|Warm Portrait|Pastel Dream|Neon Cyberpunk|Day for Night|" \
+    "Autumn|Summer Blockbuster|Muted Teal-Orange|Monochrome B&W|Sepia|" \
+    "Cinematic Green|Desaturated Doc|Punchy Social|Cross Process|Rose Romance"
+#define CG_THEME_COUNT 25
 
 // LUT-source popup order (1-based). Auto bakes the grade from theme + recipe.
 enum {
