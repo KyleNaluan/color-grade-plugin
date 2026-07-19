@@ -83,15 +83,63 @@ static SPBasicSuite*    g_spbasic = nullptr;   // cached PICA basic suite (from 
 static AEGP_PluginID    g_aegpId = 0;          // our AEGP id (for stream/undo calls)
 static bool             g_idleHookRegistered = false;
 
-// Per-instance AEGP effect refs, captured on the main thread (button-open), used by
-// the idle hook to reach the effect's param streams. Disposed on close/setdown.
-static std::mutex                                         g_effMutex;
-static std::map<cg::editor::InstanceKey, AEGP_EffectRefH> g_effectRefs;
+// Per-instance effect CONTEXT, captured on the main thread (button-open): the parent
+// layer + our installed-effect key. The idle hook does NOT keep a persistent
+// AEGP_EffectRefH - a captured ref dangles the moment the user deletes the effect, and
+// ANY stream call on that stale ref (even indexing into its stream group) makes AE raise
+// an uncatchable modal + crash. Instead the hook re-enumerates the *live* layer's effects
+// each tick (AEGP_GetLayerEffectByIndex on a live layer is always safe) and matches ours
+// by installed key, so every stream/render call runs on a fresh, valid handle. When no
+// matching effect remains on the layer, the effect was deleted -> close the window.
+// AEGP_LayerH from AEGP_GetEffectLayer is not owned (no dispose); it stays valid while the
+// layer exists (which outlives an effect deletion).
+static std::mutex g_effMutex;
+// Only STABLE identities are cached - NO AEGP handles. A deleted comp OR layer zombies in
+// AE's undo buffer, where a cached AEGP_CompH/AEGP_LayerH keeps resolving; identities do
+// not. Each idle tick re-resolves the current comp (by item id, via the live project item
+// list) and the current layer (by layer id, within that comp), so liveness is genuine
+// membership and every handle used is freshly derived (robust across delete+undo of the
+// effect, layer, or comp).
+struct EffectContext {
+    A_long                  compItemID = 0;  // comp's project-item id (0 = unset)
+    AEGP_LayerIDVal         layerID = AEGP_LayerIDVal_NONE;  // stable layer identity
+    AEGP_InstalledEffectKey installedKey = AEGP_InstalledEffectKey_NONE;
+};
+static std::map<cg::editor::InstanceKey, EffectContext> g_effectCtx;
+
+// Consecutive "cannot verify" idle ticks per instance (main thread only). A single
+// could-not-verify tick is treated as transient and never force-closes the window
+// (review finding: a stale/failed capture must not kill a live window). But a PERSISTENT
+// failure - the parent layer or comp was deleted, so the cached layer handle no longer
+// enumerates - closes the lingering window once it reaches CG_VERIFY_FAIL_LIMIT
+// (captain: layer/comp deletion is crash-safe but leaves the window open; close it).
+static std::map<cg::editor::InstanceKey, int> g_verifyFailures;
+#define CG_VERIFY_FAIL_LIMIT 6  // ~0.8s at the windowed idle cadence (<=133ms/tick)
 
 // Last param values the idle hook published to each window (touched only from the
 // idle hook, which runs serially on the main thread - so no mutex). Lets the EC->window
 // poll publish only when something actually changed, avoiding revision churn.
 static std::map<cg::editor::InstanceKey, cg::editor::ParamSnapshot> g_lastPolled;
+
+// --- Phase 4 live-preview driver state (idle hook / main thread only) --------
+//
+// The idle hook checks out the layer frame DOWNSTREAM of this effect (so decode + grade
+// is already applied - the pipeline invariant holds by construction), copies it to a
+// PreviewFrame, and publishes it to the window. A bounded per-instance LRU cache keyed
+// by (frame time + grade-param fingerprint) keeps scrubbing interactive: revisiting a
+// visited time/param state serves the cached CPU frame instead of re-rendering. All of
+// this runs serially on AE's main thread, so no mutex is needed here (the cache/keying
+// LOGIC lives in the pure, unit-tested editor/PreviewCache.h).
+#define CG_PREVIEW_CACHE_CAP  16    // bounded LRU: keep ~16 decoded frames for scrub-back
+#define CG_PREVIEW_MAX_DIM    960   // decimate the checked-out frame to <= this on the long side
+#define CG_PREVIEW_DOWNSAMPLE 2     // render at 50% (preview is small; keeps the sync render cheap)
+
+struct PreviewDriver {
+    cg::editor::PreviewCache cache{CG_PREVIEW_CACHE_CAP};
+    cg::editor::PreviewKey   lastKey;      // key of the frame currently shown by the window
+    bool                     hasLast = false;
+};
+static std::map<cg::editor::InstanceKey, PreviewDriver> g_previewDrivers;
 
 // Flat POD sequence data: just a stable per-instance uid for the window registry.
 #define CG_SEQ_MAGIC   0x43475351u  // 'CGSQ'
@@ -537,38 +585,169 @@ static bool StreamForEdit(const cg::editor::ParamEdit& e, PF_ParamIndex& idx, do
     return false;
 }
 
-// Capture this effect instance's AEGP effect ref (main-thread contexts only), so the
-// idle hook can reach its param streams. Replaces any stale ref for the same key.
-static void CaptureEffectRefForKey(PF_InData* in_data, cg::editor::InstanceKey key) {
+// Compute an effect instance's stable identity (comp project-item id + layer id + installed
+// key) from a LIVE effect_ref (main-thread command context only). Returns false if any AEGP
+// step fails or the identity is incomplete. Shared by capture and the Open-Editor
+// duplicate-window reap so both agree on "which effect is this".
+static bool ComputeEffectContext(AEGP_SuiteHandler& sh, PF_ProgPtr effectRef, EffectContext& out) {
+    AEGP_LayerH layerH = nullptr;
+    if (sh.PFInterfaceSuite1()->AEGP_GetEffectLayer(effectRef, &layerH) || !layerH) return false;
+    AEGP_CompH compH = nullptr;
+    if (sh.LayerSuite9()->AEGP_GetLayerParentComp(layerH, &compH) || !compH) return false;
+    AEGP_ItemH itemH = nullptr;
+    if (sh.CompSuite12()->AEGP_GetItemFromComp(compH, &itemH) || !itemH) return false;
+    if (sh.ItemSuite9()->AEGP_GetItemID(itemH, &out.compItemID) || out.compItemID == 0) return false;
+    if (sh.LayerSuite9()->AEGP_GetLayerID(layerH, &out.layerID) ||
+        out.layerID == AEGP_LayerIDVal_NONE) {
+        return false;
+    }
+    AEGP_EffectRefH tmpH = nullptr;
+    if (!sh.PFInterfaceSuite1()->AEGP_GetNewEffectForEffect(g_aegpId, effectRef, &tmpH) && tmpH) {
+        sh.EffectSuite5()->AEGP_GetInstalledKeyFromLayerEffect(tmpH, &out.installedKey);
+        sh.EffectSuite5()->AEGP_DisposeEffect(tmpH);
+    }
+    return out.installedKey != AEGP_InstalledEffectKey_NONE;
+}
+
+// Capture this effect instance's stable identity at button-open (in_data->effect_ref valid).
+static void CaptureEffectContextForKey(PF_InData* in_data, cg::editor::InstanceKey key) {
     if (!g_spbasic || !g_aegpId || !in_data->effect_ref) return;
     try {
         AEGP_SuiteHandler sh(g_spbasic);
-        AEGP_EffectRefH effectH = nullptr;
-        A_Err e = sh.PFInterfaceSuite1()->AEGP_GetNewEffectForEffect(g_aegpId, in_data->effect_ref, &effectH);
-        if (e || !effectH) return;
-        AEGP_EffectRefH stale = nullptr;
-        {
-            std::lock_guard<std::mutex> lk(g_effMutex);
-            auto it = g_effectRefs.find(key);
-            if (it != g_effectRefs.end()) stale = it->second;
-            g_effectRefs[key] = effectH;
-        }
-        if (stale) sh.EffectSuite4()->AEGP_DisposeEffect(stale);
+        EffectContext ctx;
+        if (!ComputeEffectContext(sh, in_data->effect_ref, ctx)) return;
+        std::lock_guard<std::mutex> lk(g_effMutex);
+        g_effectCtx[key] = ctx;
     } catch (...) { /* AEGP unavailable - the on-param-change stand-in still applies edits */ }
 }
 
-static void DisposeEffectRefForKey(cg::editor::InstanceKey key) {
-    AEGP_EffectRefH effectH = nullptr;
+static void ForgetEffectContextForKey(cg::editor::InstanceKey key) {
+    std::lock_guard<std::mutex> lk(g_effMutex);
+    g_effectCtx.erase(key);  // nothing owned to dispose - only stable ids are stored
+}
+
+// Re-resolve the CURRENT comp handle for a stored comp project-item id by walking the live
+// project's item list (AEGP_GetFirstProjItem/AEGP_GetNextProjItem). A deleted comp is not in
+// that list (it zombies in the undo buffer, off the live tree), so this returns null exactly
+// when the comp is gone - and re-succeeds after an undo restores it. Null => comp not live.
+static AEGP_CompH ResolveCompByItemID(AEGP_SuiteHandler& sh, A_long compItemID) {
+    if (compItemID == 0) return nullptr;
+    AEGP_ProjectH projH = nullptr;
+    if (sh.ProjSuite6()->AEGP_GetProjectByIndex(0, &projH) || !projH) return nullptr;
+    AEGP_ItemH itemH = nullptr;
+    if (sh.ItemSuite9()->AEGP_GetFirstProjItem(projH, &itemH)) return nullptr;
+    while (itemH) {
+        A_long id = 0;
+        if (!sh.ItemSuite9()->AEGP_GetItemID(itemH, &id) && id == compItemID) {
+            AEGP_ItemType type = AEGP_ItemType_NONE;
+            if (!sh.ItemSuite9()->AEGP_GetItemType(itemH, &type) && type == AEGP_ItemType_COMP) {
+                AEGP_CompH compH = nullptr;
+                if (!sh.CompSuite12()->AEGP_GetCompFromItem(itemH, &compH) && compH) return compH;
+            }
+            return nullptr;  // id present but not a live comp
+        }
+        AEGP_ItemH nextH = nullptr;
+        if (sh.ItemSuite9()->AEGP_GetNextProjItem(projH, itemH, &nextH)) break;
+        itemH = nextH;
+    }
+    return nullptr;  // comp id not found in the live project -> deleted
+}
+
+// Enforce exactly one editor window per effect. Closes any window bound to the SAME effect
+// (same comp-item + layer id) under a DIFFERENT instance key - e.g. a stale orphan left when
+// a delete+undo reseeded this effect's sequence-data uid. Called on Open Editor before
+// opening the current key, so a fresh open REPLACES a lingering orphan rather than spawning a
+// second window fighting over one effect. Main-thread only (button command), like the idle
+// hook, so the un-mutexed idle-hook maps are safe to touch here.
+static void CloseDuplicateWindowsForEffect(AEGP_SuiteHandler& sh, PF_ProgPtr effectRef,
+                                           cg::editor::InstanceKey currentKey) {
+    EffectContext cur;
+    if (!ComputeEffectContext(sh, effectRef, cur)) return;
+    std::vector<cg::editor::InstanceKey> dups;
     {
         std::lock_guard<std::mutex> lk(g_effMutex);
-        auto it = g_effectRefs.find(key);
-        if (it == g_effectRefs.end()) return;
-        effectH = it->second;
-        g_effectRefs.erase(it);
+        for (auto& kv : g_effectCtx) {
+            if (kv.first != currentKey && kv.second.compItemID == cur.compItemID &&
+                kv.second.layerID == cur.layerID) {
+                dups.push_back(kv.first);
+            }
+        }
     }
-    if (effectH && g_spbasic) {
-        try { AEGP_SuiteHandler sh(g_spbasic); sh.EffectSuite4()->AEGP_DisposeEffect(effectH); } catch (...) {}
+    for (auto k : dups) {
+        cg::editor::EditorHost::instance().close(k);
+        ForgetEffectContextForKey(k);
+        g_lastPolled.erase(k);
+        g_verifyFailures.erase(k);
+        g_previewDrivers.erase(k);
     }
+}
+
+// Outcome of trying to re-derive a live effect ref for an open window this tick.
+enum class EffectResolution {
+    Alive,         // found our effect on its live, comp-resident layer; outH set (caller disposes)
+    ConfirmedGone, // the layer is a live comp member but no longer carries our effect -> deleted
+    CannotVerify,  // couldn't determine: no/partial context, or the layer is not a current comp
+                   // member (layer/comp deleted) - transient until it PERSISTS (see the hook)
+};
+
+// Re-derive a FRESH, valid AEGP effect ref for `key`. Liveness is genuine PROJECT/COMP
+// MEMBERSHIP, not call success: AE moves a deleted comp OR layer into the undo buffer, where
+// a cached AEGP_CompH/AEGP_LayerH keeps resolving ("zombie") so call-failure counting never
+// fires. Instead we re-resolve, from stable ids, every tick: the comp by its project-item id
+// (ResolveCompByItemID - fails when the comp left the live project), then the layer by its id
+// within that comp (AEGP_GetLayerFromLayerID - fails when the layer left the comp), then the
+// effect by installed key. Each fails exactly on real deletion and re-succeeds after an undo,
+// handing back the CURRENT handle so the write path never touches a stale ref. On
+// EffectResolution::Alive, `outH` receives the matched ref and the CALLER MUST dispose it.
+// (Multi-instance note: two CG effects on one layer -> first match; non-crashing; documented.)
+static EffectResolution ResolveLiveEffect(AEGP_SuiteHandler& sh, cg::editor::InstanceKey key,
+                                          AEGP_EffectRefH& outH) {
+    outH = nullptr;
+    EffectContext ctx;
+    {
+        std::lock_guard<std::mutex> lk(g_effMutex);
+        auto it = g_effectCtx.find(key);
+        if (it == g_effectCtx.end()) return EffectResolution::CannotVerify;  // never captured
+        ctx = it->second;
+    }
+    // Partial/failed capture: nothing to match on. Not a confirmed deletion, just
+    // unverifiable (the idle hook's counter still closes it if it never recovers).
+    if (ctx.compItemID == 0 || ctx.layerID == AEGP_LayerIDVal_NONE ||
+        ctx.installedKey == AEGP_InstalledEffectKey_NONE) {
+        return EffectResolution::CannotVerify;
+    }
+    // Comp membership: is our comp still a live project item? (Deleted comp zombies off the
+    // live item tree.) Re-resolves the CURRENT comp handle, robust across comp delete+undo.
+    AEGP_CompH compH = ResolveCompByItemID(sh, ctx.compItemID);
+    if (!compH) return EffectResolution::CannotVerify;  // comp not in the live project -> gone
+    // Layer membership within that live comp. Failure == not a member == gone.
+    AEGP_LayerH liveLayerH = nullptr;
+    if (sh.LayerSuite9()->AEGP_GetLayerFromLayerID(compH, ctx.layerID, &liveLayerH) ||
+        !liveLayerH) {
+        return EffectResolution::CannotVerify;  // layer not resident -> persistent -> close
+    }
+    // Enumerate the CURRENT layer's effects (never the cached handle) and match ours.
+    A_long num = 0;
+    if (sh.EffectSuite5()->AEGP_GetLayerNumEffects(liveLayerH, &num) || num <= 0) {
+        return EffectResolution::ConfirmedGone;  // live layer, no effects -> ours is gone
+    }
+    for (A_long i = 0; i < num; ++i) {
+        AEGP_EffectRefH candH = nullptr;
+        if (sh.EffectSuite5()->AEGP_GetLayerEffectByIndex(g_aegpId, liveLayerH,
+                                                          static_cast<AEGP_EffectIndex>(i), &candH) ||
+            !candH) {
+            continue;
+        }
+        AEGP_InstalledEffectKey candKey = AEGP_InstalledEffectKey_NONE;
+        A_Err e = sh.EffectSuite5()->AEGP_GetInstalledKeyFromLayerEffect(candH, &candKey);
+        if (!e && candKey == ctx.installedKey) {
+            outH = candH;  // caller disposes; write/read/render this tick use this live ref
+            return EffectResolution::Alive;
+        }
+        sh.EffectSuite5()->AEGP_DisposeEffect(candH);
+    }
+    // Live comp-resident layer, but our effect is no longer on it: it was deleted.
+    return EffectResolution::ConfirmedGone;
 }
 
 // Read one param stream's scalar (one_d) value at t=0 (our value params don't
@@ -576,6 +755,16 @@ static void DisposeEffectRefForKey(cg::editor::InstanceKey key) {
 static bool ReadStreamOneD(AEGP_SuiteHandler& sh, AEGP_EffectRefH effectH, PF_ParamIndex idx, double& out) {
     AEGP_StreamRefH streamH = nullptr;
     if (sh.StreamSuite5()->AEGP_GetNewEffectStreamByIndex(g_aegpId, effectH, idx, &streamH) || !streamH) {
+        return false;
+    }
+    // Guard the NO_DATA case: if the effect was deleted out from under an open window, a
+    // stale effect_ref yields a AEGP_StreamType_NO_DATA stream, and AEGP_GetNewStreamValue
+    // on it raises AE's modal "Cannot get AEGP_StreamValue2 for NO_DATA streams" (5027::247)
+    // - which no catch(...) can swallow. Reject exactly NO_DATA (the death signal); any
+    // other type is left readable so this never regresses a live popup/slider read.
+    AEGP_StreamType stype = AEGP_StreamType_NO_DATA;
+    if (sh.StreamSuite5()->AEGP_GetStreamType(streamH, &stype) || stype == AEGP_StreamType_NO_DATA) {
+        sh.StreamSuite5()->AEGP_DisposeStream(streamH);
         return false;
     }
     AEGP_StreamValue2 val;
@@ -620,6 +809,143 @@ static bool SnapshotChanged(const cg::editor::ParamSnapshot& a, const cg::editor
            std::fabs(a.chromaGain - b.chromaGain) > 1e-6;
 }
 
+/* ============= Live preview: layer-frame checkout via AEGP (Phase 4) ======= */
+//
+// Render the layer frame with an already-configured AEGP_LayerRenderOptionsH into `out`
+// (ARGB8 world -> RGBA8, decimated so the long side is <= CG_PREVIEW_MAX_DIM), then check
+// the AE frame receipt straight back in - unconditionally, via ScopedCheckin, so an
+// exception while copying can never leak the checkout (leaked checkouts destabilize AE).
+// Returns false on any AEGP failure; the window then keeps its previous frame.
+static bool RenderPreviewFromOptions(AEGP_SuiteHandler& sh, AEGP_LayerRenderOptionsH optsH,
+                                     cg::editor::PreviewFrame& out) {
+    AEGP_FrameReceiptH receiptH = nullptr;
+    // Synchronous checkout on the UI (idle) thread: sanctioned here because the cache
+    // makes repeats free and only genuinely new (time/param) frames pay a render. The
+    // async variant is a documented future refinement (see native/docs/adr-editor-ui.md).
+    if (sh.RenderSuite5()->AEGP_RenderAndCheckoutLayerFrame(optsH, nullptr, nullptr, &receiptH) ||
+        !receiptH) {
+        return false;
+    }
+    auto checkin = cg::editor::makeScopedCheckin(
+        [&] { sh.RenderSuite5()->AEGP_CheckinFrame(receiptH); });
+
+    AEGP_WorldH worldH = nullptr;
+    if (sh.RenderSuite5()->AEGP_GetReceiptWorld(receiptH, &worldH) || !worldH) return false;
+
+    AEGP_WorldSuite3* ws = sh.WorldSuite3();
+    AEGP_WorldType wt = AEGP_WorldType_NONE;
+    if (ws->AEGP_GetType(worldH, &wt) || wt != AEGP_WorldType_8) return false;  // we asked for 8-bit
+
+    A_long w = 0, h = 0;
+    A_u_long rowBytes = 0;
+    PF_Pixel8* base = nullptr;
+    if (ws->AEGP_GetSize(worldH, &w, &h) || w <= 0 || h <= 0) return false;
+    if (ws->AEGP_GetRowBytes(worldH, &rowBytes)) return false;
+    if (ws->AEGP_GetBaseAddr8(worldH, &base) || !base) return false;
+
+    // Nearest-neighbour decimation to cap the CPU frame (and thus texture + cache memory)
+    // at CG_PREVIEW_MAX_DIM on the long side. AE already downsampled by CG_PREVIEW_DOWNSAMPLE.
+    const int longSide = w > h ? w : h;
+    int step = 1;
+    if (longSide > CG_PREVIEW_MAX_DIM) step = (longSide + CG_PREVIEW_MAX_DIM - 1) / CG_PREVIEW_MAX_DIM;
+    const int outW = (w + step - 1) / step;
+    const int outH = (h + step - 1) / step;
+    out.width = outW;
+    out.height = outH;
+    out.rgba.assign(static_cast<size_t>(outW) * outH * 4u, 0);
+
+    for (int y = 0; y < outH; ++y) {
+        const PF_Pixel8* srcRow = reinterpret_cast<const PF_Pixel8*>(
+            reinterpret_cast<const uint8_t*>(base) + static_cast<size_t>(y * step) * rowBytes);
+        uint8_t* dstRow = out.rgba.data() + static_cast<size_t>(y) * outW * 4u;
+        for (int x = 0; x < outW; ++x) {
+            const PF_Pixel8& p = srcRow[x * step];  // AE PF_Pixel8 is A,R,G,B
+            uint8_t* d = dstRow + static_cast<size_t>(x) * 4u;
+            d[0] = p.red;
+            d[1] = p.green;
+            d[2] = p.blue;
+            // Force opaque: AE worlds are premultiplied and a footage-clip preview is
+            // opaque; drawing straight-alpha premult pixels would darken any partial-alpha
+            // edges against the pane. (Partial-alpha layers look slightly off - accepted.)
+            d[3] = 255;
+        }
+    }
+    return true;  // checkin fires here as `checkin` unwinds
+}
+
+// Drive the live preview for one open window: read the current frame time, decide via the
+// pure state machine whether the window is already current / a cached frame serves / a
+// fresh AE render is needed, and act. UI-thread only (AEGP_NewFromDownstreamOfEffect
+// requires it - the idle hook satisfies that). Best-effort: any AEGP failure just leaves
+// the last frame up.
+static void DrivePreviewForKey(AEGP_SuiteHandler& sh, cg::editor::InstanceKey key,
+                               AEGP_EffectRefH effectH) {
+    AEGP_LayerRenderOptionsSuite2* lro = sh.LayerRenderOptionsSuite2();
+    AEGP_LayerRenderOptionsH optsH = nullptr;
+    // "Downstream of effect" = the layer output INCLUDING this effect, so the checked-out
+    // pixels are already decoded + graded. AEGP_NewFrom* seeds the options' Time to the
+    // layer's current time (the scrub position), so we read it back for the cache key.
+    if (lro->AEGP_NewFromDownstreamOfEffect(g_aegpId, effectH, &optsH) || !optsH) return;
+    bool disposed = false;
+    auto dispose = [&] {
+        if (!disposed) {
+            lro->AEGP_Dispose(optsH);
+            disposed = true;
+        }
+    };
+
+    A_Time t;
+    AEFX_CLR_STRUCT(t);
+    t.scale = 1;
+    if (lro->AEGP_GetTime(optsH, &t)) { dispose(); return; }
+
+    // Fingerprint the grade-affecting params from the last polled snapshot (the values the
+    // window shows, read straight from the effect's streams by the poll above).
+    cg::editor::ParamSnapshot ps;
+    auto pit = g_lastPolled.find(key);
+    if (pit != g_lastPolled.end()) ps = pit->second;
+    cg::editor::PreviewKey pk;
+    pk.timeValue = static_cast<int64_t>(t.value);
+    pk.timeScale = t.scale ? static_cast<uint32_t>(t.scale) : 1u;
+    pk.paramFingerprint = cg::editor::previewParamFingerprint(
+        ps.footageProfile, ps.theme, ps.lutSource, ps.strength, ps.skinProtection, ps.chromaGain);
+
+    PreviewDriver& drv = g_previewDrivers[key];
+    cg::editor::PreviewAction action =
+        cg::editor::decidePreviewAction(drv.hasLast, drv.lastKey, pk, drv.cache.contains(pk));
+
+    if (action == cg::editor::PreviewAction::UpToDate) { dispose(); return; }
+
+    if (action == cg::editor::PreviewAction::ServeCached) {
+        auto f = drv.cache.get(pk);
+        if (f) {
+            cg::editor::EditorHost::instance().publishPreviewFrame(key, f);
+            drv.lastKey = pk;
+            drv.hasLast = true;
+        }
+        dispose();
+        return;
+    }
+
+    // Render a fresh frame at reduced resolution, 8-bit (uniform RGBA upload path).
+    lro->AEGP_SetWorldType(optsH, AEGP_WorldType_8);
+    lro->AEGP_SetDownsampleFactor(optsH, CG_PREVIEW_DOWNSAMPLE, CG_PREVIEW_DOWNSAMPLE);
+    auto frame = std::make_shared<cg::editor::PreviewFrame>();
+    bool ok = RenderPreviewFromOptions(sh, optsH, *frame);
+    dispose();
+    if (ok && frame->valid()) {
+        std::shared_ptr<const cg::editor::PreviewFrame> cf = frame;
+        drv.cache.put(pk, cf);
+        cg::editor::EditorHost::instance().publishPreviewFrame(key, cf);
+    }
+    // Record the attempted key as current EITHER WAY. On success the window now shows it;
+    // on failure this suppresses an immediate re-render of the same key next tick (a
+    // persistently-failing checkout would otherwise drive a hot synchronous render every
+    // idle tick). The next genuine scrub/param change moves the key and retries.
+    drv.lastKey = pk;
+    drv.hasLast = true;
+}
+
 // The AEGP idle hook: main thread, fires while AE is idle. Cheap-noops unless a window
 // has pending edits, so it never burdens AE. Applies drained edits inside one undo
 // group per tick, polls Effect Controls -> window on change, and reaps effect refs
@@ -628,30 +954,71 @@ static A_Err CG_IdleHook(AEGP_GlobalRefcon, AEGP_IdleRefcon, A_long* max_sleepPL
     auto& host = cg::editor::EditorHost::instance();
     std::vector<cg::editor::InstanceKey> keys = host.openKeys();
 
-    // Reap effect refs whose window is gone (user closed it) - dispose to avoid leaks.
+    // Forget captured context whose window is gone (user closed it). No AEGP handle to
+    // dispose (layerH is not owned); this just frees the map slot.
     {
         std::vector<cg::editor::InstanceKey> orphans;
         {
             std::lock_guard<std::mutex> lk(g_effMutex);
-            for (auto& kv : g_effectRefs) {
+            for (auto& kv : g_effectCtx) {
                 if (std::find(keys.begin(), keys.end(), kv.first) == keys.end()) orphans.push_back(kv.first);
             }
         }
         for (auto k : orphans) {
-            DisposeEffectRefForKey(k);
+            ForgetEffectContextForKey(k);
             g_lastPolled.erase(k);
+            g_verifyFailures.erase(k);
+            g_previewDrivers.erase(k);  // free the closed window's cached preview frames
         }
     }
 
     if (g_spbasic && g_aegpId) {
         for (auto key : keys) {
+            // Re-derive a FRESH, valid effect ref by enumerating the live layer's effects
+            // (never dereference a possibly-stale captured ref - that crashes AE when the
+            // effect was deleted). The tri-state resolution decides how to react:
+            //   Alive         -> use the fresh handle this tick; reset the failure counter.
+            //   ConfirmedGone -> our effect is gone from its live comp-resident layer: close
+            //                    the window promptly (Phase 3 "delete effect -> window closes").
+            //   CannotVerify  -> the layer is not a current comp member (layer/comp deleted or
+            //                    source removed), or the capture was partial. A single such
+            //                    tick is treated as transient and never force-closes a live
+            //                    window; only a PERSISTENT run (>= CG_VERIFY_FAIL_LIMIT) closes
+            //                    the lingering window.
+            // In BOTH not-Alive cases the effect is not confirmed live, so we drop any edits
+            // the (now-orphaned) window queued rather than writing them onto a stale/absent
+            // effect - which is what replayed the "internal verification" modal after a
+            // delete+undo. Writes only ever happen in the Alive branch, on the fresh ref.
+            auto closeAndForget = [&](cg::editor::InstanceKey k) {
+                host.close(k);
+                ForgetEffectContextForKey(k);
+                g_lastPolled.erase(k);
+                g_verifyFailures.erase(k);
+                g_previewDrivers.erase(k);
+            };
             AEGP_EffectRefH effectH = nullptr;
-            {
-                std::lock_guard<std::mutex> lk(g_effMutex);
-                auto it = g_effectRefs.find(key);
-                if (it != g_effectRefs.end()) effectH = it->second;
+            EffectResolution res = EffectResolution::CannotVerify;
+            try {
+                AEGP_SuiteHandler sh(g_spbasic);
+                res = ResolveLiveEffect(sh, key, effectH);
+            } catch (...) { res = EffectResolution::CannotVerify; effectH = nullptr; }
+
+            if (res == EffectResolution::ConfirmedGone) {
+                closeAndForget(key);
+                continue;
             }
-            if (!effectH) continue;
+            if (res == EffectResolution::CannotVerify) {
+                (void)host.drainEdits(key);  // discard: never write to an unconfirmed effect
+                int fails = ++g_verifyFailures[key];
+                if (fails >= CG_VERIFY_FAIL_LIMIT) closeAndForget(key);
+                continue;  // transient: leave the window open and retry next tick
+            }
+            g_verifyFailures[key] = 0;  // Alive: clear any accrued transient failures
+            // Dispose the fresh ref no matter how we leave this iteration.
+            auto effGuard = cg::editor::makeScopedCheckin([&] {
+                try { AEGP_SuiteHandler sh(g_spbasic); sh.EffectSuite5()->AEGP_DisposeEffect(effectH); }
+                catch (...) {}
+            });
 
             // window -> effect: apply any queued edits (writes param streams).
             if (host.hasPendingEdits(key)) {
@@ -697,6 +1064,15 @@ static A_Err CG_IdleHook(AEGP_GlobalRefcon, AEGP_IdleRefcon, A_long* max_sleepPL
                     }
                 }
             } catch (...) { /* swallow */ }
+
+            // Live preview (Phase 4): keep the window's centered clip frame current with
+            // the scrub position + params. Runs after the poll so the fingerprint uses
+            // the freshly-read params. Guarded independently so a preview hiccup never
+            // affects the edit/poll paths above.
+            try {
+                AEGP_SuiteHandler sh(g_spbasic);
+                DrivePreviewForKey(sh, key, effectH);
+            } catch (...) { /* swallow: preview must never destabilize AE */ }
         }
     }
     // With a window open, poll promptly (sub-second) so EC edits track; otherwise let
@@ -792,11 +1168,12 @@ static PF_Err SequenceResetup(PF_InData* in_data, PF_OutData* out_data, PF_Param
 }
 
 // Effect instance removed (deleted from the layer, comp closed): close its window,
-// dispose its captured AEGP effect ref, and free the sequence data.
+// forget its captured effect context, and free the sequence data.
 static PF_Err SequenceSetdown(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef*[], PF_LayerDef*) {
     const cg::editor::InstanceKey key = SeqKey(in_data);
     cg::editor::EditorHost::instance().close(key);
-    DisposeEffectRefForKey(key);
+    ForgetEffectContextForKey(key);
+    g_verifyFailures.erase(key);
     if (in_data->sequence_data) {
         PF_DISPOSE_HANDLE(in_data->sequence_data);
         out_data->sequence_data = NULL;
@@ -863,8 +1240,10 @@ static PF_Err ParamsSetup(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef*
     // sends PF_Cmd_USER_CHANGED_PARAM on click (buttons require it); the handler
     // opens/focuses the single per-instance window.
     AEFX_CLR_STRUCT(def);
+    // ASCII "..." - AE param names are narrow (CP-1252), so a UTF-8 ellipsis (E2 80 A6)
+    // renders as mojibake ("Open Editorâ€¦"). Round-2 captain finding.
     PF_ADD_BUTTON("Editor",
-                  "Open Editor\xE2\x80\xA6",  // "Open Editor…" (UTF-8 ellipsis)
+                  "Open Editor...",
                   0,
                   PF_ParamFlag_SUPERVISE,
                   CG_OPEN_EDITOR);
@@ -915,10 +1294,19 @@ static PF_Err UserChangedParam(PF_InData* in_data, PF_OutData* out_data,
             params[CG_CHROMA_GAIN]->u.fs_d.value / 100.0,
             params[CG_LUT_SOURCE]->u.pd.value);
         const cg::editor::InstanceKey key = SeqKey(in_data);
+        // Exactly one window per effect: close any orphan window bound to this same effect
+        // under a stale key (e.g. from a delete+undo that reseeded the uid) before opening.
+        if (g_spbasic && g_aegpId && in_data->effect_ref) {
+            try {
+                AEGP_SuiteHandler sh(g_spbasic);
+                CloseDuplicateWindowsForEffect(sh, in_data->effect_ref, key);
+            } catch (...) { /* best-effort */ }
+        }
         cg::editor::EditorHost::instance().open(key, seed);
-        // Capture this instance's AEGP effect ref (main-thread context) so the idle
-        // hook can write window edits back onto its param streams.
-        CaptureEffectRefForKey(in_data, key);
+        // Capture this instance's stable identity (comp item id + layer id + installed key)
+        // so the idle hook re-resolves a fresh, valid effect ref each tick without ever
+        // touching a stale handle (see ResolveLiveEffect).
+        CaptureEffectContextForKey(in_data, key);
     }
 
     // Flush any edits the editor window produced back onto the params (spike driver:

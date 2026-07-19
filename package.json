@@ -18,6 +18,7 @@
     "native:parity": "tsx native/scripts/parity-test.ts",
     "native:core-parity": "tsx native/scripts/core-parity-test.ts",
     "native:editor-test": "tsx native/scripts/editor-bridge-test.ts",
+    "native:preview-test": "tsx native/scripts/preview-test.ts",
     "native:build": "native/scripts/build.sh"
   },
   "devDependencies": {

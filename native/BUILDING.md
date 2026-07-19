@@ -17,6 +17,7 @@ npm run native:gen-lut      # (re)generate the embedded default LUT header (comm
 npm run native:parity       # C++ sampleLut vs TS oracle, ~1e-4 (needs g++/clang; not in CI)
 npm run native:core-parity  # full C++ core vs TS oracle end-to-end (needs g++/clang; not in CI)
 npm run native:editor-test  # headless editor<->effect bridge logic (needs g++/clang; not in CI)
+npm run native:preview-test # headless live-preview core: cache/keying/fit/checkin (g++/clang; not in CI)
 
 native/scripts/build.sh Debug            # CPU-only  .aex -> MediaCore
 native/scripts/build.sh Debug --gpu      # CPU + GPU (DirectX + CUDA) .aex + DirectX_Assets
@@ -125,7 +126,7 @@ file ...aex"**.
   `GetModuleHandleEx` string arg to `LPCSTR`; Unicode would break it. Our own code uses
   explicit `...W` Win32 APIs, so it is charset-agnostic.
 
-### Editor window (Phase 3)
+### Editor window (Phase 3-4)
 
 The editor is a Dear ImGui + Win32/D3D11 window opened from the **Open Editor…**
 button param. Toolkit rationale + the effect<->window bridge design live in
@@ -138,9 +139,12 @@ button param. Toolkit rationale + the effect<->window bridge design live in
   `third_party/imgui[/backends]` to the include path (both configs).
 - **Editor sources** `native/ColorGradeFX/editor/`: `EditorBridge.h` (pure,
   AE/Win32-free seam - the thread-safe edit queue + value mapping, headless-tested by
-  `npm run native:editor-test`), `EditorWindow.{h,cpp}` (Win32/D3D11/ImGui host,
-  single-instance-per-effect, own UI thread). The `.cpp` compiles to no-op stubs off
-  Windows so the interface still links for the eventual Mac backend.
+  `npm run native:editor-test`), `PreviewCache.h` (Phase 4: the pure live-preview core -
+  cache keying/eviction, scrub/param decision, letterbox fit, ScopedCheckin guarantee,
+  headless-tested by `npm run native:preview-test`), `EditorWindow.{h,cpp}` (Win32/D3D11/
+  ImGui host + the preview texture upload, single-instance-per-effect, own UI thread).
+  The `.cpp` compiles to no-op stubs off Windows so the interface still links for the
+  eventual Mac backend.
 - **Effect wiring** (`ColorGrade.cpp`): `CG_OPEN_EDITOR` button (SUPERVISE) opens the
   window in `UserChangedParam`; `PreRender` publishes a param snapshot to it;
   `GLOBAL_SETDOWN`/`SEQUENCE_SETDOWN` tear windows down (no orphans). The window's
@@ -271,10 +275,13 @@ is ready, verify in AE 2025:
    log). "Rec.709 (standard)" leaves the decode out. (The decode applies in every LUT
    Source mode - Embedded/External resample their raw LUT through it - so V-Log is never
    left undecoded; repeat with LUT Source = "Embedded"/"External" to confirm.)
-7. **Editor window (Phase 3):** click **Open Editor…**; the native editor window opens and
+7. **Editor window (Phase 3-4):** click **Open Editor…**; the native editor window opens and
    AE stays responsive. Run the full editor checklist in
    `native/docs/adr-editor-ui.md` (button opens, single instance, controls round-trip
-   both ways, no dialogs/hangs, sane close/reopen/project-close lifecycle, undo).
+   both ways, no dialogs/hangs, sane close/reopen/project-close lifecycle, undo, plus the
+   Phase 4 live-preview and deletion-lifecycle items - the window shows the letterboxed
+   clip frame, updates on scrub/param change, and closes cleanly on effect/layer/comp
+   delete without a stale-ref modal).
 
 The numerical correctness of the ported engine is proven unattended by the cross-engine
 golden harness (`npm run native:core-parity`), so AE verification here is about the SDK glue

@@ -80,6 +80,17 @@ struct WindowImpl {
     IDXGISwapChain*         swapChain = nullptr;
     ID3D11RenderTargetView* rtv = nullptr;
 
+    // Phase 4 live preview: the effect pushes a CPU frame (pendingPreview); the UI
+    // thread uploads it into previewTex (recreated on a size change) and draws it. The
+    // texture + its SRV are owned by the UI thread; only pendingPreview crosses threads.
+    std::mutex                         previewMutex;
+    std::shared_ptr<const PreviewFrame> pendingPreview;   // newest frame awaiting upload
+    bool                               previewDirty = false;
+    ID3D11Texture2D*                   previewTex = nullptr;   // UI thread only
+    ID3D11ShaderResourceView*          previewSrv = nullptr;   // UI thread only
+    int                                previewTexW = 0;
+    int                                previewTexH = 0;
+
     ParamSnapshot readSnapshot() {
         std::lock_guard<std::mutex> lk(snapMutex);
         return snapshot;
@@ -89,6 +100,18 @@ struct WindowImpl {
         // Only accept a strictly newer publish, so a stale re-publish can't stomp
         // the value the user is mid-drag on (see ParamSnapshot::revision).
         if (s.revision >= snapshot.revision) snapshot = s;
+    }
+    void writePreview(std::shared_ptr<const PreviewFrame> f) {
+        std::lock_guard<std::mutex> lk(previewMutex);
+        pendingPreview = std::move(f);
+        previewDirty = true;
+    }
+    // UI thread: take the newest pending frame if one arrived since the last upload.
+    std::shared_ptr<const PreviewFrame> takePendingPreview() {
+        std::lock_guard<std::mutex> lk(previewMutex);
+        if (!previewDirty) return nullptr;
+        previewDirty = false;
+        return pendingPreview;  // keep it (harmless) so a resize can re-upload if needed
     }
 };
 
@@ -104,6 +127,62 @@ bool CreateRenderTarget(WindowImpl* w) {
 
 void CleanupRenderTarget(WindowImpl* w) {
     if (w->rtv) { w->rtv->Release(); w->rtv = nullptr; }
+}
+
+// --- live-preview texture (UI thread only) ----------------------------------
+
+void ReleasePreviewTexture(WindowImpl* w) {
+    if (w->previewSrv) { w->previewSrv->Release(); w->previewSrv = nullptr; }
+    if (w->previewTex) { w->previewTex->Release(); w->previewTex = nullptr; }
+    w->previewTexW = 0;
+    w->previewTexH = 0;
+}
+
+// Upload an RGBA8 preview frame into previewTex, (re)creating the texture + SRV when the
+// frame size changes and updating pixels in place otherwise. Runs on the window's UI
+// thread with its D3D device. Leaves previewSrv null (and returns) on any failure so the
+// draw path falls back to the placeholder rather than showing garbage.
+void UploadPreviewFrame(WindowImpl* w, const PreviewFrame& f) {
+    if (!w->device || !w->context || !f.valid()) return;
+
+    if (!w->previewTex || w->previewTexW != f.width || w->previewTexH != f.height) {
+        ReleasePreviewTexture(w);
+        D3D11_TEXTURE2D_DESC td;
+        ZeroMemory(&td, sizeof(td));
+        td.Width = static_cast<UINT>(f.width);
+        td.Height = static_cast<UINT>(f.height);
+        td.MipLevels = 1;
+        td.ArraySize = 1;
+        td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+
+        D3D11_SUBRESOURCE_DATA sd;
+        ZeroMemory(&sd, sizeof(sd));
+        sd.pSysMem = f.rgba.data();
+        sd.SysMemPitch = static_cast<UINT>(f.width) * 4u;
+
+        if (FAILED(w->device->CreateTexture2D(&td, &sd, &w->previewTex)) || !w->previewTex) {
+            w->previewTex = nullptr;
+            return;
+        }
+        D3D11_SHADER_RESOURCE_VIEW_DESC srvd;
+        ZeroMemory(&srvd, sizeof(srvd));
+        srvd.Format = td.Format;
+        srvd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+        srvd.Texture2D.MipLevels = 1;
+        if (FAILED(w->device->CreateShaderResourceView(w->previewTex, &srvd, &w->previewSrv))) {
+            ReleasePreviewTexture(w);
+            return;
+        }
+        w->previewTexW = f.width;
+        w->previewTexH = f.height;
+    } else {
+        // Same size: overwrite the pixels in place (cheap, no realloc).
+        w->context->UpdateSubresource(w->previewTex, 0, nullptr, f.rgba.data(),
+                                      static_cast<UINT>(f.width) * 4u, 0);
+    }
 }
 
 bool CreateDeviceD3D(WindowImpl* w) {
@@ -278,7 +357,11 @@ void DrawEditorUI(WindowImpl* w, ParamSnapshot& ui) {
 
     ImGui::SameLine();
 
-    // Live preview placeholder (Phase 4: AEGP_RenderAndCheckoutLayerFrame -> GPU texture).
+    // Live preview (Phase 4): the effect's AEGP idle hook checks out the layer frame
+    // DOWNSTREAM of this effect (decode + grade already applied - the pipeline invariant
+    // holds), copies it into a PreviewFrame, and publishes it here; the UI thread uploads
+    // it to previewTex. Draw it centered + letterboxed inside the preview pane; fall back
+    // to the placeholder until the first frame arrives.
     ImGui::BeginChild("preview", ImVec2(0, 0), true);
     ImVec2 avail = ImGui::GetContentRegionAvail();
     ImGui::Dummy(ImVec2(avail.x, avail.y - 28.0f));
@@ -286,10 +369,17 @@ void DrawEditorUI(WindowImpl* w, ParamSnapshot& ui) {
     ImVec2 p0 = ImGui::GetItemRectMin();
     ImVec2 p1 = ImGui::GetItemRectMax();
     dl->AddRectFilled(p0, p1, IM_COL32(24, 24, 28, 255));
-    const char* label = "Live preview (Phase 4)  -  scopes / before-after (Phase 5)";
-    ImVec2 ts = ImGui::CalcTextSize(label);
-    dl->AddText(ImVec2((p0.x + p1.x - ts.x) * 0.5f, (p0.y + p1.y - ts.y) * 0.5f),
-                IM_COL32(150, 150, 160, 255), label);
+    if (w->previewSrv && w->previewTexW > 0 && w->previewTexH > 0) {
+        FitRect fit = letterboxFit(p1.x - p0.x, p1.y - p0.y, w->previewTexW, w->previewTexH);
+        ImVec2 imgMin(p0.x + fit.x, p0.y + fit.y);
+        ImVec2 imgMax(imgMin.x + fit.w, imgMin.y + fit.h);
+        dl->AddImage(reinterpret_cast<ImTextureID>(w->previewSrv), imgMin, imgMax);
+    } else {
+        const char* label = "Live preview - waiting for frame (scrub the timeline)";
+        ImVec2 ts = ImGui::CalcTextSize(label);
+        dl->AddText(ImVec2((p0.x + p1.x - ts.x) * 0.5f, (p0.y + p1.y - ts.y) * 0.5f),
+                    IM_COL32(150, 150, 160, 255), label);
+    }
     ImGui::EndChild();
 
     ImGui::End();
@@ -354,6 +444,12 @@ void RunWindowThread(WindowImpl* w, ParamSnapshot seed) {
         ParamSnapshot latest = w->readSnapshot();
         if (latest.revision > ui.revision && !ImGui::IsAnyItemActive()) ui = latest;
 
+        // Upload the newest live-preview frame (if the effect published one) into the
+        // GPU texture before drawing. Only touches D3D on this UI thread.
+        if (auto frame = w->takePendingPreview()) {
+            if (frame->valid()) UploadPreviewFrame(w, *frame);
+        }
+
         ImGui_ImplDX11_NewFrame();
         ImGui_ImplWin32_NewFrame();
         ImGui::NewFrame();
@@ -366,6 +462,7 @@ void RunWindowThread(WindowImpl* w, ParamSnapshot seed) {
         w->swapChain->Present(1, 0);  // vsync-paced; ~cheap when idle
     }
 
+    ReleasePreviewTexture(w);
     ImGui_ImplDX11_Shutdown();
     ImGui_ImplWin32_Shutdown();
     ImGui::DestroyContext(w->imguiCtx);
@@ -449,6 +546,13 @@ void EditorHost::publishSnapshot(InstanceKey key, const ParamSnapshot& snapshot)
     if (it != g_windows.end()) it->second->writeSnapshot(snapshot);
 }
 
+void EditorHost::publishPreviewFrame(InstanceKey key, std::shared_ptr<const PreviewFrame> frame) {
+    std::lock_guard<std::mutex> lk(g_mapMutex);
+    ReapFinishedLocked();
+    auto it = g_windows.find(key);
+    if (it != g_windows.end()) it->second->writePreview(std::move(frame));
+}
+
 std::vector<ParamEdit> EditorHost::drainEdits(InstanceKey key) {
     std::lock_guard<std::mutex> lk(g_mapMutex);
     ReapFinishedLocked();
@@ -511,6 +615,7 @@ EditorHost& EditorHost::instance() { static EditorHost h; return h; }
 EditorHost::~EditorHost() {}
 void EditorHost::open(InstanceKey, const ParamSnapshot&) {}
 void EditorHost::publishSnapshot(InstanceKey, const ParamSnapshot&) {}
+void EditorHost::publishPreviewFrame(InstanceKey, std::shared_ptr<const PreviewFrame>) {}
 std::vector<ParamEdit> EditorHost::drainEdits(InstanceKey) { return {}; }
 std::vector<InstanceKey> EditorHost::openKeys() { return {}; }
 bool EditorHost::hasPendingEdits(InstanceKey) { return false; }

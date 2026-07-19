@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "EditorBridge.h"
+#include "PreviewCache.h"  // Phase 4: PreviewFrame carried effect -> window for display
 
 namespace cg {
 namespace editor {
@@ -48,6 +49,13 @@ public:
     // Effect -> window: publish the effect's latest param values so the window's
     // controls reflect Effect Controls. Ignored if no window is open for `key`.
     void publishSnapshot(InstanceKey key, const ParamSnapshot& snapshot);
+
+    // Effect -> window: publish the latest live-preview frame (Phase 4) - the decoded +
+    // graded clip pixels the effect's AEGP idle hook checked out and copied. The window
+    // uploads it to a D3D texture on its UI thread and draws it letterboxed. Ignored if
+    // no window is open for `key`. The frame is shared (const), so the cache can keep or
+    // evict its own copy independently of what the window is displaying.
+    void publishPreviewFrame(InstanceKey key, std::shared_ptr<const PreviewFrame> frame);
 
     // Window -> effect: take the edits the user made since the last drain (empty if
     // none / no window). The caller applies them to the effect's params.

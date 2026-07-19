@@ -236,6 +236,57 @@ live AE. The key is now a uid stored in **sequence data** (flat POD, reseeded on
 SETUP/RESETUP so a duplicated/reloaded effect never shares a key), consistent across
 every command for one instance.
 
+## Phase 4: live clip preview (built on this toolkit)
+
+The editor window now shows a **live preview of the actual clip frame**, centered and
+letterboxed, updating as the captain scrubs the timeline or changes any effect param.
+This is the payoff the ImGui choice was made for (axis 3): a checked-out GPU-renderable
+frame drawn with near-zero impedance.
+
+**Frame source - the decode invariant for free.** The effect's global AEGP idle hook
+(the same one that drives the window<->effect bridge) checks out the layer frame
+**downstream of this effect** via
+`AEGP_LayerRenderOptionsSuite2::AEGP_NewFromDownstreamOfEffect` +
+`AEGP_RenderSuite5::AEGP_RenderAndCheckoutLayerFrame`. "Downstream of effect" = the
+layer output *including* our effect, so the checked-out pixels are already decoded +
+graded. V-Log is therefore **never left undecoded** in the preview under any LUT Source -
+the invariant holds by construction, with no second decode path to keep in sync. The
+options handle is seeded to the layer's current time, which we read back
+(`AEGP_GetTime`) as the scrub position - no separate comp-time lookup needed.
+`AEGP_NewFromDownstreamOfEffect` is **UI-thread only**; the idle hook satisfies that.
+
+**Display.** The 8-bit ARGB receipt world is copied (ARGB->RGBA, decimated so the long
+side is <= 960 px) into a CPU `PreviewFrame`, published to the window, and uploaded on
+the window's own UI thread into a per-window D3D11 texture
+(`DXGI_FORMAT_R8G8B8A8_UNORM`), drawn with `ImDrawList::AddImage` centered + letterboxed
+(`letterboxFit`). AE worlds are premultiplied and a footage-clip preview is opaque, so
+the copy forces alpha = 255 (partial-alpha layers look slightly off - accepted for v1).
+
+**Refresh + caching = interactivity.** The idle hook computes a `PreviewKey` = (frame
+time + a fingerprint of the grade-affecting params, read from the same stream poll that
+feeds the controls). A pure state machine (`decidePreviewAction`) decides: window already
+current (do nothing), a **cached** CPU frame matches (publish it - the interactive
+scrub-back path, no AE render), or a fresh render is needed. A bounded per-instance LRU
+cache (16 frames) of decoded frames keeps scrubbing interactive; the render is
+**synchronous** on the idle thread, which is sanctioned here precisely because the cache
+makes repeats free and only genuinely new time/param states pay a render. **Every**
+checkout is checked back in unconditionally (a `ScopedCheckin` RAII guard that fires even
+if the pixel copy throws) - a leaked receipt destabilizes AE, so this is load-bearing.
+
+**Testable seam.** All the risky logic - cache keying/eviction, the scrub/param-change
+decision, the letterbox fit math, and the once-and-always check-in guarantee - lives in
+the pure, AE-free `editor/PreviewCache.h` and is proven headlessly by
+`npm run native:preview-test` (`native/tests/editor/preview_test.cpp`, g++/clang, NOT in
+CI). The AE-side integration (the AEGP checkout + D3D upload) is captain-verified.
+
+**Known limitations / deferred.** (a) Sync UI-thread checkout is flagged in the SDK as
+deprecated for *passive* redraws in favor of `AEGP_RenderAndCheckoutLayerFrame_Async`;
+async (with in-flight request cancellation on fast scrub) is the documented future
+refinement if interactivity needs it - the state machine is already shaped for one
+in-flight request. (b) The cache fingerprint keys on time + *our* params; an unrelated
+change (another effect, a source swap without a time change) can leave the preview stale
+until the next scrub/param nudge. (c) Scopes + before/after are Phase 5.
+
 ## Consequences
 
 - **Positive:** single-file signed `.aex` stays intact; one UI codebase Win+Mac; the
@@ -244,9 +295,10 @@ every command for one instance.
 - **Negative:** `src/panel` Preact controls are not reused as code (the design is).
   Immediate-mode UI is less "designer-friendly" than HTML/CSS for heavy visual
   polish - acceptable for a pro color tool, revisit if that changes.
-- **Follow-ups:** Metal/Cocoa backend for the Mac target; live preview + scopes
-  (Phases 4-5). (The idle-hook write driver, sequence-data uid, and the full
-  Correct/Grade control set landed in Phase 3.)
+- **Follow-ups:** Metal/Cocoa backend for the Mac target; scopes + before/after
+  (Phase 5); async checkout if scrub interactivity needs it. (The idle-hook write
+  driver, sequence-data uid, and the full Correct/Grade control set landed in Phase 3;
+  the live clip preview landed in Phase 4 - see the Phase 4 section above.)
 
 ## Known limitations
 
@@ -259,6 +311,52 @@ every command for one instance.
   ordinary flatten/RAM-preview cycle for a still-live instance, the open editor would
   be dismissed out from under the user. Revisit (e.g. defer teardown, or re-open on the
   matching RESETUP) if that surfaces.
+
+- **Effect deletion is detected by the idle hook re-enumerating the layer, not by
+  SEQUENCE_SETDOWN and not by touching the effect ref.** Phase 4 captain verification
+  found that deleting the effect while its editor window is open does **not** reliably
+  reach `SEQUENCE_SETDOWN` in time (the window stayed open), leaving the idle hook to use
+  a now-stale effect ref. Any call against that stale ref crashes AE with an uncatchable
+  modal: `AEGP_GetNewStreamValue` on the collapsed stream raised *"...NO_DATA streams"
+  (5027::247)* (round 1), and even `AEGP_GetNewEffectStreamByIndex` / `AEGP_GetStreamType`
+  by index into the collapsed stream group raised *"invalid index in indexed group"* then
+  a hard crash (round 2). **Conclusion: never touch ANY stream of a possibly-stale ref.**
+  Final design: the idle hook keeps **no AEGP handles at all** - effect ref, layer handle,
+  AND comp handle all go stale across delete/undo. At button-open it captures only **stable
+  ids**: the parent comp's **project-item id** (`AEGP_GetItemFromComp` + `AEGP_GetItemID`),
+  the layer's **layer-ID** (`AEGP_GetLayerID`), and our **installed-effect key**. Each tick
+  `ResolveLiveEffect` re-resolves everything from those ids and returns a **tri-state**:
+  (1) **comp membership** - re-resolve the current comp handle by walking the *live project's*
+  item list (`AEGP_GetFirstProjItem`/`AEGP_GetNextProjItem`) for our item id
+  (`ResolveCompByItemID`); (2) **layer membership** - `AEGP_GetLayerFromLayerID` within that
+  comp; (3) **effect match** - enumerate that layer's effects by installed key. -> **Alive**
+  (use the fresh ref for read/write/render, disposed at end of pass); live comp+layer but no
+  effect match -> **ConfirmedGone** (effect deleted: close promptly); comp or layer not a live
+  member, or partial context -> **CannotVerify**.
+
+  **Why membership, not call-failure (rounds 4-5):** deleting a layer *or a whole comp* moves
+  it into AE's *undo buffer* as a "zombie" - a cached `AEGP_LayerH`/`AEGP_CompH` keeps
+  resolving against it, so a "failed-enumeration" counter never fires and the window lingers.
+  The fix is to re-resolve from the *live* project/comp tree by id: a deleted comp is not in
+  the project item list, a deleted layer (or one whose source footage was removed) is not in
+  the comp's layer list, and an **undo** restores the id and hands back the *current* handle -
+  so the write path re-derives the live effect and never writes onto a stale ref (that stale
+  write was the intermittent "internal verification" modal on edit-after-undo). A single
+  `CannotVerify` never force-closes (transient guard); a persistent run closes at
+  `CG_VERIFY_FAIL_LIMIT` (~0.8 s). While not `Alive`, the hook also **drops any edits the
+  orphaned window queued** (writes happen only in the `Alive` branch, on the fresh ref). A
+  defensive `NO_DATA` type-check remains in `ReadStreamOneD`.
+
+  **Exactly one window per effect:** the registry is keyed on the sequence-data uid, but a
+  delete+undo can reseed that uid (SEQUENCE_RESETUP), which would let a fresh Open Editor
+  spawn a second window while a stale orphan lingers. So Open Editor first calls
+  `CloseDuplicateWindowsForEffect`: it closes any window whose captured (comp-item id, layer
+  id) matches the effect being opened but under a *different* key, then opens/adopts the
+  current key - a fresh open replaces the orphan rather than fighting it.
+
+  **Multi-instance limitation:** two CG effects on one layer -> `ResolveLiveEffect` matches the
+  *first* by installed key (no per-instance id available from the idle hook); acceptable and
+  non-crashing; revisit if per-instance targeting is needed.
 
 ## AE verification checklist (captain-assisted)
 
@@ -280,3 +378,12 @@ and the build is loaded:
    AE / closing the project leaves no orphan window.
 6. **Undo:** an editor edit is undoable; document how it groups (one step per gesture
    once the companion-AEGP undo group lands).
+7. **Live preview (Phase 4):** the window shows the actual clip frame, centered +
+   letterboxed. Scrubbing the timeline updates it; changing any grade param (in the
+   window or Effect Controls) re-renders it; scrubbing back to a visited time/param
+   state serves instantly from the cache. On a V-Log clip in any LUT Source mode the
+   preview is decoded (not washed-out log).
+8. **Deletion lifecycle (Phase 4):** with a window open, deleting the effect closes the
+   window promptly (no modal, no crash); undo restores the effect and re-opening works;
+   deleting the layer or comp, and swapping/removing the source footage, also close the
+   window without a stale-ref modal.

@@ -1,4 +1,4 @@
-# native/ - Color Grade native After Effects effect (Phase 2)
+# native/ - Color Grade native After Effects effect (Phase 4)
 
 The Windows-first native re-platform of Color Grade from a CEP panel to a C++ AE Effect
 SDK plugin.
@@ -13,12 +13,18 @@ SDK plugin.
   (`buildTransform` -> `bakeLut` natively), and a **cross-engine golden harness** proving the
   C++ core matches the TS oracle to ~1e-4 (achieved: grade/decode/recipe bit-exact, stats 2e-13).
 
-- **Phase 3** (in progress): the **editor window** - a native ImGui/Win32/D3D11 window
+- **Phase 3** (landed): the **editor window** - a native ImGui/Win32/D3D11 window
   opened from an **Open Editor…** button, with Correct/Grade controls wired to the effect's
   params through a pure effect<->window bridge. The **toolkit decision** (native ImGui vs an
   embedded webview reusing Preact) and its rationale live in `docs/adr-editor-ui.md`.
 
-Later phases add the live preview and in-effect analysis
+- **Phase 4** (this milestone): a **live clip preview** inside the editor window - the actual
+  decode+graded clip frame, centered + letterboxed, refreshing on timeline scrub and any
+  effect-param change. The idle hook checks the frame out downstream of the effect, a bounded
+  per-instance LRU cache keeps scrubbing interactive, and the risky logic is isolated in the
+  pure `editor/PreviewCache.h` (see `docs/adr-editor-ui.md`, "Phase 4" section).
+
+Later phases add scopes + before/after and in-effect analysis
 (see `firstmate:native-scope-m2/report.md`).
 
 ## Layout
@@ -43,23 +49,26 @@ native/
       Recipe.h                        POD arb-data recipe + <-> Theme/stats + bakeFromRecipe
     lut/CubeLut.h                   ported parseCube + sampleLut (mirrors src/core/lut/cube.ts)
     embedded/EmbeddedLut.h          GENERATED default LUT (teal-orange grade, 17^3)
-    editor/                         Phase 3 editor window (see docs/adr-editor-ui.md)
+    editor/                         Phase 3-4 editor window (see docs/adr-editor-ui.md)
       EditorBridge.h                  pure effect<->window seam (edit queue + mapping); headless-tested
-      EditorWindow.h / .cpp           Win32/D3D11/ImGui host (no-op stubs off Windows)
+      PreviewCache.h                  Phase 4 pure live-preview core (cache/keying/fit/checkin); headless-tested
+      EditorWindow.h / .cpp           Win32/D3D11/ImGui host + preview texture (no-op stubs off Windows)
     Win/ColorGradeFX.vcxproj/.sln   MSBuild project (CPU default; /p:CG_GPU=true builds DirectX + CUDA)
   third_party/imgui/                vendored Dear ImGui v1.91.5 (MIT) + Win32/D3D11 backends
-  docs/adr-editor-ui.md             Phase 3 toolkit decision (ImGui vs webview) + bridge design
+  docs/adr-editor-ui.md             Phase 3 toolkit decision (ImGui vs webview) + bridge design + Phase 4 preview
   tests/parity/
     parity_test.cpp                 Phase 1: sampleLut vs TS oracle
     core_parity.cpp                 Phase 2: computeStats / bakeGradeLut / bakeDecodeLut / recipe replay
   tests/editor/
     bridge_test.cpp                 Phase 3: editor<->effect bridge logic (headless, self-asserting)
+    preview_test.cpp                Phase 4: live-preview core (cache/keying/fit/checkin; headless, self-asserting)
   scripts/
     build.sh                        WSL -> NTFS mirror -> MSBuild interop build
     gen-embedded-lut.ts             bake the embedded LUT header from the TS engine
     parity-test.ts                  Phase 1 parity gate (local, not in CI)
     core-parity-test.ts             Phase 2 cross-engine golden harness (local, not in CI)
     editor-bridge-test.ts           Phase 3 bridge-logic test (local, not in CI)
+    preview-test.ts                 Phase 4 live-preview core test (local, not in CI)
 ```
 
 ## Commands
@@ -69,6 +78,7 @@ npm run native:gen-lut       # regenerate embedded/EmbeddedLut.h from the TS eng
 npm run native:parity        # Phase 1 LUT-apply parity gate (needs g++/clang; not in CI)
 npm run native:core-parity   # Phase 2 full-core cross-engine golden harness (g++/clang; not in CI)
 npm run native:editor-test   # Phase 3 headless editor<->effect bridge logic (g++/clang; not in CI)
+npm run native:preview-test  # Phase 4 headless live-preview core (g++/clang; not in CI)
 native/scripts/build.sh Debug          # CPU-only build
 native/scripts/build.sh Release --gpu  # CPU + GPU (DirectX + CUDA) build
 ```
