@@ -92,6 +92,23 @@ static void parseManual(const char* csv, ManualGrade& m, double& lookMix) {
     lookMix = v[11];
 }
 
+// Parse an LGG CSV "liftR,liftG,liftB,gammaR,gammaG,gammaB,gainR,gainG,gainB" into a
+// LiftGammaGain (mirrors the TS harness lggCsv order).
+static void parseLgg(const char* csv, LiftGammaGain& lg) {
+    double v[9] = {0, 0, 0, 1, 1, 1, 1, 1, 1};
+    const char* p = csv;
+    for (int i = 0; i < 9 && p && *p; i++) {
+        v[i] = std::atof(p);
+        const char* c = std::strchr(p, ',');
+        p = c ? c + 1 : nullptr;
+    }
+    for (int c = 0; c < 3; c++) {
+        lg.lift[c] = v[c];
+        lg.gamma[c] = v[3 + c];
+        lg.gain[c] = v[6 + c];
+    }
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) { std::fprintf(stderr, "usage: core_parity <stats|grade|decode> ...\n"); return 2; }
     const std::string cmd = argv[1];
@@ -355,6 +372,59 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    if (cmd == "gradelgg" && argc == 12) {
+        // Exercise the Phase 6c Lift/Gamma/Gain wheels directly in buildTransform
+        // (bakeGradeLut), against the TS oracle's same lgg opts.
+        const size_t n = static_cast<size_t>(std::strtoull(argv[3], nullptr, 10));
+        std::vector<float> px = readF32(argv[2], n);
+        Theme theme;
+        if (!getTheme(argv[4], theme)) {
+            std::fprintf(stderr, "core_parity: unknown theme %s\n", argv[4]);
+            return 2;
+        }
+        EngineOptions opts;
+        if (std::atoi(argv[5])) opts.strength = std::atof(argv[6]);
+        if (std::atoi(argv[7])) opts.skinProtection = std::atof(argv[8]);
+        const int size = std::atoi(argv[9]);
+        LiftGammaGain lg;
+        parseLgg(argv[10], lg);
+        opts.lgg = lg;
+        FootageStats stats = computeStats(px.data(), px.size());
+        cg::Lut3D lut = bakeGradeLut(stats, theme, opts, size);
+        writeF32(argv[11], lut.data);
+        return 0;
+    }
+
+    if (cmd == "recipelgg" && argc == 12) {
+        // Exercise the LGG wheels carried THROUGH the arb-data recipe: seed a recipe from
+        // the theme, stamp the lift/gamma/gain triples into it, and bakeFromRecipe (no lgg
+        // in opts, so it is taken from the recipe). Must match the plain gradelgg/oracle
+        // result - proving the POD recipe carries the wheels.
+        const size_t n = static_cast<size_t>(std::strtoull(argv[3], nullptr, 10));
+        std::vector<float> px = readF32(argv[2], n);
+        Theme theme;
+        if (!getTheme(argv[4], theme)) {
+            std::fprintf(stderr, "core_parity: unknown theme %s\n", argv[4]);
+            return 2;
+        }
+        EngineOptions opts;
+        if (std::atoi(argv[5])) opts.strength = std::atof(argv[6]);
+        if (std::atoi(argv[7])) opts.skinProtection = std::atof(argv[8]);
+        const int size = std::atoi(argv[9]);
+        LiftGammaGain lg;
+        parseLgg(argv[10], lg);
+        FootageStats stats = computeStats(px.data(), px.size());
+        RecipeData recipe = recipeFromTheme(theme, stats);
+        for (int c = 0; c < 3; c++) {
+            recipe.lift[c] = lg.lift[c];
+            recipe.gamma[c] = lg.gamma[c];
+            recipe.gain[c] = lg.gain[c];
+        }
+        cg::Lut3D lut = bakeFromRecipe(recipe, opts, size);
+        writeF32(argv[11], lut.data);
+        return 0;
+    }
+
     if (cmd == "migrate" && argc == 2) {
         // Self-checking versioned arb-data migration test (the Phase 6a landmine): a v2
         // blob migrates forward with its fields intact and the new fields defaulted; a
@@ -362,33 +432,70 @@ int main(int argc, char** argv) {
         // failure so the harness (stdio inherit) surfaces it.
         int fail = 0;
         RecipeData fallback = recipeFromTheme(tealOrangeTheme(), tealOrangeTheme().targetStats);
-        // Build a distinctive "v2" blob (v3 recipe truncated to the v2 prefix, version=2).
-        RecipeData v3 = recipeFromTheme(coolNoirTheme(), coolNoirTheme().targetStats);
-        v3.chromaGain = 0.777;
-        v3.hasChromaGain = 1;
-        v3.strengthDefault = 0.66;
-        v3.skinProtectionDefault = 0.44;
-        std::vector<char> buf(RECIPE_V2_SIZE);
-        std::memcpy(buf.data(), &v3, RECIPE_V2_SIZE);
+        // Base recipe with distinctive values in the shared (v2) prefix.
+        RecipeData base = recipeFromTheme(coolNoirTheme(), coolNoirTheme().targetStats);
+        base.chromaGain = 0.777;
+        base.hasChromaGain = 1;
+        base.strengthDefault = 0.66;
+        base.skinProtectionDefault = 0.44;
+
+        // --- v2 blob (truncated to the v2 prefix, version=2) migrates to current. ---
+        std::vector<char> bufv2(RECIPE_V2_SIZE);
+        std::memcpy(bufv2.data(), &base, RECIPE_V2_SIZE);
         uint32_t two = 2;
-        std::memcpy(buf.data() + sizeof(uint32_t), &two, sizeof(uint32_t));
+        std::memcpy(bufv2.data() + sizeof(uint32_t), &two, sizeof(uint32_t));
         RecipeData out;
-        migrateRecipeInto(&out, buf.data(), buf.size(), fallback);
-        if (out.version != RECIPE_VERSION) { std::fprintf(stderr, "migrate: version\n"); fail = 1; }
-        if (out.magic != RECIPE_MAGIC) { std::fprintf(stderr, "migrate: magic\n"); fail = 1; }
-        if (out.chromaGain != 0.777) { std::fprintf(stderr, "migrate: chromaGain\n"); fail = 1; }
-        if (out.strengthDefault != 0.66) { std::fprintf(stderr, "migrate: strength\n"); fail = 1; }
-        if (out.skinProtectionDefault != 0.44) { std::fprintf(stderr, "migrate: skin\n"); fail = 1; }
-        if (out.matchStats != 1) { std::fprintf(stderr, "migrate: matchStats default\n"); fail = 1; }
-        if (out.manualSaturation != 1.0) { std::fprintf(stderr, "migrate: sat default\n"); fail = 1; }
-        if (out.manualExposure != 0.0) { std::fprintf(stderr, "migrate: exp default\n"); fail = 1; }
-        if (out.manualPivot != 0.435) { std::fprintf(stderr, "migrate: pivot default\n"); fail = 1; }
-        if (out.lookMix != 1.0) { std::fprintf(stderr, "migrate: lookMix default\n"); fail = 1; }
-        // Current-version blob copies verbatim.
+        migrateRecipeInto(&out, bufv2.data(), bufv2.size(), fallback);
+        if (out.version != RECIPE_VERSION) { std::fprintf(stderr, "migrate: v2 version\n"); fail = 1; }
+        if (out.magic != RECIPE_MAGIC) { std::fprintf(stderr, "migrate: v2 magic\n"); fail = 1; }
+        if (out.chromaGain != 0.777) { std::fprintf(stderr, "migrate: v2 chromaGain\n"); fail = 1; }
+        if (out.strengthDefault != 0.66) { std::fprintf(stderr, "migrate: v2 strength\n"); fail = 1; }
+        if (out.skinProtectionDefault != 0.44) { std::fprintf(stderr, "migrate: v2 skin\n"); fail = 1; }
+        if (out.matchStats != 1) { std::fprintf(stderr, "migrate: v2 matchStats default\n"); fail = 1; }
+        if (out.manualSaturation != 1.0) { std::fprintf(stderr, "migrate: v2 sat default\n"); fail = 1; }
+        if (out.manualExposure != 0.0) { std::fprintf(stderr, "migrate: v2 exp default\n"); fail = 1; }
+        if (out.manualPivot != 0.435) { std::fprintf(stderr, "migrate: v2 pivot default\n"); fail = 1; }
+        if (out.lookMix != 1.0) { std::fprintf(stderr, "migrate: v2 lookMix default\n"); fail = 1; }
+        // v4 (Phase 6c) fields default to neutral LGG on a v2 migration.
+        if (out.lift[0] != 0.0 || out.gamma[0] != 1.0 || out.gain[0] != 1.0) {
+            std::fprintf(stderr, "migrate: v2 lgg default\n"); fail = 1;
+        }
+        if (out.wheelsMode != 0) { std::fprintf(stderr, "migrate: v2 wheelsMode default\n"); fail = 1; }
+
+        // --- v3 blob (truncated to the v3 prefix, version=3) migrates to current: the
+        //     v3 manual block survives, only the v4 LGG fields default. ---
+        RecipeData v3src = base;
+        v3src.manualExposure = 1.2;
+        v3src.manualSaturation = 1.3;
+        v3src.lookMix = 0.5;
+        v3src.matchStats = 0;
+        std::vector<char> bufv3(RECIPE_V3_SIZE);
+        std::memcpy(bufv3.data(), &v3src, RECIPE_V3_SIZE);
+        uint32_t three = 3;
+        std::memcpy(bufv3.data() + sizeof(uint32_t), &three, sizeof(uint32_t));
+        RecipeData outv3;
+        migrateRecipeInto(&outv3, bufv3.data(), bufv3.size(), fallback);
+        if (outv3.version != RECIPE_VERSION) { std::fprintf(stderr, "migrate: v3 version\n"); fail = 1; }
+        if (outv3.chromaGain != 0.777) { std::fprintf(stderr, "migrate: v3 chromaGain\n"); fail = 1; }
+        if (outv3.manualExposure != 1.2) { std::fprintf(stderr, "migrate: v3 exposure\n"); fail = 1; }
+        if (outv3.manualSaturation != 1.3) { std::fprintf(stderr, "migrate: v3 sat\n"); fail = 1; }
+        if (outv3.lookMix != 0.5) { std::fprintf(stderr, "migrate: v3 lookMix\n"); fail = 1; }
+        if (outv3.matchStats != 0) { std::fprintf(stderr, "migrate: v3 matchStats\n"); fail = 1; }
+        if (outv3.lift[0] != 0.0 || outv3.gamma[1] != 1.0 || outv3.gain[2] != 1.0) {
+            std::fprintf(stderr, "migrate: v3 lgg default\n"); fail = 1;
+        }
+        if (outv3.wheelsMode != 0) { std::fprintf(stderr, "migrate: v3 wheelsMode default\n"); fail = 1; }
+
+        // --- Current-version blob copies verbatim (incl. non-neutral LGG). ---
+        RecipeData current = base;
+        current.version = RECIPE_VERSION;
+        current.lift[0] = 0.05;
+        current.gamma[1] = 1.2;
+        current.gain[2] = 0.9;
+        current.wheelsMode = 1;
         RecipeData out2;
-        v3.version = RECIPE_VERSION;
-        migrateRecipeInto(&out2, &v3, sizeof(RecipeData), fallback);
-        if (std::memcmp(&out2, &v3, sizeof(RecipeData)) != 0) {
+        migrateRecipeInto(&out2, &current, sizeof(RecipeData), fallback);
+        if (std::memcmp(&out2, &current, sizeof(RecipeData)) != 0) {
             std::fprintf(stderr, "migrate: verbatim\n");
             fail = 1;
         }
@@ -400,7 +507,8 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "migrate: reseed\n");
             fail = 1;
         }
-        std::printf(fail ? "  migrate  FAIL\n" : "  migrate  PASS (v2->v3 forward, verbatim, reseed)\n");
+        std::printf(fail ? "  migrate  FAIL\n"
+                         : "  migrate  PASS (v2->v4, v3->v4 forward, verbatim, reseed)\n");
         return fail;
     }
 

@@ -33,6 +33,7 @@
 #include "../../third_party/imgui/backends/imgui_impl_dx11.h"
 
 #include "Scopes.h"  // Phase 5: waveform / histogram / vectorscope image synthesis
+#include "../core/MonotoneCurve.h"  // Phase 6b: shape-preserving PCHIP for the curve preview
 
 // Forward-decl of the backend's Win32 message handler (defined in imgui_impl_win32.cpp).
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
@@ -122,6 +123,9 @@ struct WindowImpl {
     std::atomic<bool> showScopes{true};
     std::atomic<bool> analyzeRequested{false};  // one-shot: "Analyze" button clicked
     float             splitFraction = 0.5f;      // UI-thread only: split divider position
+    // Curve editor (Phase 6b), UI-thread only: which control point (if any) is mid-drag
+    // per curve [master, R, G, B]; -1 = none. Persists across frames during a drag.
+    int               curveDrag[4] = {-1, -1, -1, -1};
 
     ParamSnapshot readSnapshot() {
         std::lock_guard<std::mutex> lk(snapMutex);
@@ -483,6 +487,294 @@ void DrawScopesStrip(WindowImpl* w) {
     ImGui::Dummy(ImVec2(avail.x, h));
 }
 
+// --- Curves widget (Phase 6b) -----------------------------------------------
+//
+// An interactive monotone-curve editor: a square plot with draggable control points.
+// Points live in gamma-Rec.709 [0,1]x[0,1] (the recipe's CurveData); the drawn line is
+// the SAME shape-preserving PCHIP the engine evaluates, so what the user sees is what
+// bakes. Left-drag a point to move it; left-click empty space to add one (up to 16);
+// right-click a point to remove it (endpoints excluded). Returns true if the state
+// changed this frame (the caller pushes one coalesced Curves edit).
+
+// Seed the two fixed endpoints so an "absent" (count 0) curve becomes editable. count<2
+// bakes as identity, so the endpoints are also how the engine reads a neutral curve.
+inline void CurveEnsureEndpoints(cg::editor::CurveState& c) {
+    if (c.count >= 2) return;
+    c.count = 2;
+    c.x[0] = 0.0; c.y[0] = 0.0;
+    c.x[1] = 1.0; c.y[1] = 1.0;
+}
+
+// Insert (x,y) keeping x-ascending order; returns the new index, or -1 if full.
+inline int CurveInsertPoint(cg::editor::CurveState& c, double x, double y) {
+    if (c.count >= cg::editor::CG_EDIT_MAX_CURVE_POINTS) return -1;
+    int i = c.count;
+    while (i > 0 && c.x[i - 1] > x) {
+        c.x[i] = c.x[i - 1];
+        c.y[i] = c.y[i - 1];
+        --i;
+    }
+    c.x[i] = x;
+    c.y[i] = y;
+    ++c.count;
+    return i;
+}
+
+inline void CurveRemovePoint(cg::editor::CurveState& c, int idx) {
+    if (idx <= 0 || idx >= c.count - 1) return;  // never remove the two endpoints
+    for (int i = idx; i < c.count - 1; ++i) {
+        c.x[i] = c.x[i + 1];
+        c.y[i] = c.y[i + 1];
+    }
+    --c.count;
+}
+
+bool DrawCurveWidget(const char* id, cg::editor::CurveState& c, int& dragIdx, ImU32 lineColor,
+                     float size) {
+    ImGuiIO& io = ImGui::GetIO();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImVec2 p0 = ImGui::GetCursorScreenPos();
+    ImGui::InvisibleButton(id, ImVec2(size, size));
+    const bool active = ImGui::IsItemActive();
+    const bool hovered = ImGui::IsItemHovered();
+
+    // background + grid
+    const ImVec2 p1(p0.x + size, p0.y + size);
+    dl->AddRectFilled(p0, p1, IM_COL32(18, 18, 22, 255));
+    dl->AddRect(p0, p1, IM_COL32(70, 70, 80, 255));
+    for (int i = 1; i < 4; ++i) {
+        const float t = static_cast<float>(i) / 4.0f;
+        dl->AddLine(ImVec2(p0.x + t * size, p0.y), ImVec2(p0.x + t * size, p1.y),
+                    IM_COL32(40, 40, 48, 255));
+        dl->AddLine(ImVec2(p0.x, p0.y + t * size), ImVec2(p1.x, p0.y + t * size),
+                    IM_COL32(40, 40, 48, 255));
+    }
+
+    auto toScreen = [&](double nx, double ny) {
+        return ImVec2(p0.x + static_cast<float>(nx) * size,
+                      p0.y + static_cast<float>(1.0 - ny) * size);
+    };
+    auto toNorm = [&](ImVec2 s) {
+        double nx = (s.x - p0.x) / size;
+        double ny = 1.0 - (s.y - p0.y) / size;
+        nx = nx < 0 ? 0 : (nx > 1 ? 1 : nx);
+        ny = ny < 0 ? 0 : (ny > 1 ? 1 : ny);
+        return ImVec2(static_cast<float>(nx), static_cast<float>(ny));
+    };
+
+    bool changed = false;
+
+    // Find the point nearest the mouse (for hit-testing add/drag/remove).
+    const float hitR = 9.0f;
+    int nearest = -1;
+    float nearestD2 = hitR * hitR;
+    for (int i = 0; i < c.count; ++i) {
+        ImVec2 sp = toScreen(c.x[i], c.y[i]);
+        const float dx = sp.x - io.MousePos.x, dy = sp.y - io.MousePos.y;
+        const float d2 = dx * dx + dy * dy;
+        if (d2 <= nearestD2) { nearestD2 = d2; nearest = i; }
+    }
+
+    // Right-click removes an interior point.
+    if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Right) && nearest > 0 &&
+        nearest < c.count - 1) {
+        CurveRemovePoint(c, nearest);
+        changed = true;
+        nearest = -1;
+    }
+
+    // Left press: start dragging the nearest point, or add a new one at the cursor.
+    if (ImGui::IsItemActivated()) {
+        CurveEnsureEndpoints(c);
+        if (nearest >= 0) {
+            dragIdx = nearest;
+        } else {
+            ImVec2 n = toNorm(io.MousePos);
+            // don't add on top of the fixed-x endpoints
+            double nx = n.x < 0.001 ? 0.001 : (n.x > 0.999 ? 0.999 : n.x);
+            int ins = CurveInsertPoint(c, nx, n.y);
+            dragIdx = ins;
+            changed = true;
+        }
+    }
+
+    // Drag: move the held point. Endpoints move in y only; interior points move in x
+    // (clamped strictly between neighbors so the curve stays a function) and y.
+    if (active && dragIdx >= 0 && dragIdx < c.count) {
+        ImVec2 n = toNorm(io.MousePos);
+        double ny = n.y;
+        if (dragIdx == 0 || dragIdx == c.count - 1) {
+            c.y[dragIdx] = ny;
+        } else {
+            const double lo = c.x[dragIdx - 1] + 1e-3;
+            const double hi = c.x[dragIdx + 1] - 1e-3;
+            double nx = n.x < lo ? lo : (n.x > hi ? hi : n.x);
+            c.x[dragIdx] = nx;
+            c.y[dragIdx] = ny;
+        }
+        changed = true;
+    }
+    if (!active) dragIdx = -1;
+
+    // Draw the curve as the actual PCHIP the engine will bake (identity if <2 points).
+    const int kSeg = 48;
+    ImVec2 prev;
+    if (c.count >= 2) {
+        std::vector<double> xs(c.x, c.x + c.count), ys(c.y, c.y + c.count);
+        cg::core::MonotoneCurve mc = cg::core::MonotoneCurve::make(xs, ys, /*forceMonotoneY=*/true);
+        for (int i = 0; i <= kSeg; ++i) {
+            const double xx = static_cast<double>(i) / kSeg;
+            double yy = mc(xx);
+            yy = yy < 0 ? 0 : (yy > 1 ? 1 : yy);
+            ImVec2 sp = toScreen(xx, yy);
+            if (i > 0) dl->AddLine(prev, sp, lineColor, 2.0f);
+            prev = sp;
+        }
+    } else {
+        dl->AddLine(toScreen(0, 0), toScreen(1, 1), lineColor, 2.0f);
+    }
+
+    // Draw the control points.
+    for (int i = 0; i < c.count; ++i) {
+        ImVec2 sp = toScreen(c.x[i], c.y[i]);
+        const bool hot = (i == nearest) || (i == dragIdx);
+        dl->AddCircleFilled(sp, hot ? 5.5f : 4.0f, hot ? IM_COL32(255, 255, 255, 255)
+                                                        : IM_COL32(210, 210, 220, 255));
+        dl->AddCircle(sp, hot ? 5.5f : 4.0f, IM_COL32(20, 20, 24, 255));
+    }
+    return changed;
+}
+
+// --- Wheels widget (Phase 6c) -----------------------------------------------
+//
+// A color disc + draggable dot + master slider per wheel. Three unit-vector "primary"
+// directions 120deg apart (R top, G lower-left, B lower-right) form a tight frame, so a
+// disc position maps LINEARLY to a zero-sum per-channel color offset and inverts exactly
+// (needed to place the dot from a stored triple). The master carries the luminance /
+// uniform component; the disc carries color balance. Used for BOTH the DaVinci LGG wheels
+// (offset applied to lift/gamma/gain) and, for the 3-way secondary mode, the band tints.
+
+struct DiscDir { float x, y; };
+inline const DiscDir* WheelPrimaries() {
+    // R at 90deg, G at 210deg, B at 330deg (unit vectors), y up.
+    static const DiscDir d[3] = {
+        {0.0f, 1.0f},
+        {-0.8660254f, -0.5f},
+        {0.8660254f, -0.5f},
+    };
+    return d;
+}
+
+// Map a disc position v=(vx,vy) in the unit circle to a zero-sum per-channel offset.
+inline void DiscToOffset(float vx, float vy, double k, double out[3]) {
+    const DiscDir* d = WheelPrimaries();
+    for (int c = 0; c < 3; ++c) out[c] = k * (vx * d[c].x + vy * d[c].y);
+}
+// Invert: recover the disc position from a per-channel offset (tight-frame pseudo-inverse:
+// v = (2/3) * sum_c (offset_c/k) * dir_c). Robust for any offset (uses only its color part).
+inline void OffsetToDisc(const double off[3], double k, float& vx, float& vy) {
+    const DiscDir* d = WheelPrimaries();
+    double sx = 0, sy = 0;
+    for (int c = 0; c < 3; ++c) {
+        sx += (off[c] / k) * d[c].x;
+        sy += (off[c] / k) * d[c].y;
+    }
+    vx = static_cast<float>((2.0 / 3.0) * sx);
+    vy = static_cast<float>((2.0 / 3.0) * sy);
+    const float r = std::sqrt(vx * vx + vy * vy);
+    if (r > 1.0f) { vx /= r; vy /= r; }
+}
+
+// Draw a color-balance disc. `triple` is a per-channel value about its mean (the master
+// luminance). `k` scales the disc's color swing. On drag, the disc's zero-sum color offset
+// is combined with the CURRENT master so luminance set by the slider is preserved. Returns
+// true if `triple` changed. `radius` is the disc radius in px.
+bool DrawWheelDisc(const char* id, double triple[3], double k, float radius) {
+    ImGuiIO& io = ImGui::GetIO();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImVec2 p0 = ImGui::GetCursorScreenPos();
+    const float sz = radius * 2.0f;
+    ImGui::InvisibleButton(id, ImVec2(sz, sz));
+    const bool active = ImGui::IsItemActive();
+    const ImVec2 center(p0.x + radius, p0.y + radius);
+
+    // disc face + hue ring hint
+    dl->AddCircleFilled(center, radius, IM_COL32(30, 30, 36, 255), 48);
+    dl->AddCircle(center, radius, IM_COL32(90, 90, 100, 255), 48, 1.5f);
+    dl->AddLine(ImVec2(center.x - radius, center.y), ImVec2(center.x + radius, center.y),
+                IM_COL32(55, 55, 62, 255));
+    dl->AddLine(ImVec2(center.x, center.y - radius), ImVec2(center.x, center.y + radius),
+                IM_COL32(55, 55, 62, 255));
+
+    const double master = (triple[0] + triple[1] + triple[2]) / 3.0;
+    double off[3] = {triple[0] - master, triple[1] - master, triple[2] - master};
+
+    bool changed = false;
+    if (active) {
+        float vx = (io.MousePos.x - center.x) / radius;
+        float vy = -(io.MousePos.y - center.y) / radius;  // y up
+        const float r = std::sqrt(vx * vx + vy * vy);
+        if (r > 1.0f) { vx /= r; vy /= r; }
+        DiscToOffset(vx, vy, k, off);
+        for (int c = 0; c < 3; ++c) triple[c] = master + off[c];
+        changed = true;
+    }
+
+    // draw the dot at the current color offset
+    float vx, vy;
+    OffsetToDisc(off, k, vx, vy);
+    const ImVec2 dot(center.x + vx * radius, center.y - vy * radius);
+    dl->AddCircleFilled(dot, 5.0f, IM_COL32(255, 255, 255, 255));
+    dl->AddCircle(dot, 5.0f, IM_COL32(20, 20, 24, 255));
+    return changed;
+}
+
+// Set the uniform (luminance) component of a triple to `master`, preserving the per-channel
+// color offset the disc set. Used by the LGG master sliders and the 3-way luminance sliders.
+inline void WheelSetMaster(double triple[3], double master) {
+    const double cur = (triple[0] + triple[1] + triple[2]) / 3.0;
+    for (int c = 0; c < 3; ++c) triple[c] = master + (triple[c] - cur);
+}
+inline double WheelMaster(const double triple[3]) {
+    return (triple[0] + triple[1] + triple[2]) / 3.0;
+}
+
+// Draw a LAB-tint disc for the Adobe 3-way secondary mode: the disc position maps directly
+// to a band's LAB [a,b] offset (x = a green<->magenta, y = b blue<->amber), `scale` LAB
+// units at the disc edge. Returns true if `ab` changed. Distinct from DrawWheelDisc (which
+// carries a per-channel luminance-preserving color offset); a band tint is a plain 2D value.
+bool DrawTintDisc(const char* id, double ab[2], double scale, float radius) {
+    ImGuiIO& io = ImGui::GetIO();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImVec2 p0 = ImGui::GetCursorScreenPos();
+    const float sz = radius * 2.0f;
+    ImGui::InvisibleButton(id, ImVec2(sz, sz));
+    const bool active = ImGui::IsItemActive();
+    const ImVec2 center(p0.x + radius, p0.y + radius);
+    dl->AddCircleFilled(center, radius, IM_COL32(30, 30, 36, 255), 48);
+    dl->AddCircle(center, radius, IM_COL32(90, 90, 100, 255), 48, 1.5f);
+    dl->AddLine(ImVec2(center.x - radius, center.y), ImVec2(center.x + radius, center.y),
+                IM_COL32(55, 55, 62, 255));
+    dl->AddLine(ImVec2(center.x, center.y - radius), ImVec2(center.x, center.y + radius),
+                IM_COL32(55, 55, 62, 255));
+    bool changed = false;
+    if (active) {
+        float vx = (io.MousePos.x - center.x) / radius;
+        float vy = -(io.MousePos.y - center.y) / radius;  // y up
+        const float r = std::sqrt(vx * vx + vy * vy);
+        if (r > 1.0f) { vx /= r; vy /= r; }
+        ab[0] = static_cast<double>(vx) * scale;
+        ab[1] = static_cast<double>(vy) * scale;
+        changed = true;
+    }
+    float vx = static_cast<float>(ab[0] / scale);
+    float vy = static_cast<float>(ab[1] / scale);
+    const ImVec2 dot(center.x + vx * radius, center.y - vy * radius);
+    dl->AddCircleFilled(dot, 5.0f, IM_COL32(255, 255, 255, 255));
+    dl->AddCircle(dot, 5.0f, IM_COL32(20, 20, 24, 255));
+    return changed;
+}
+
 // --- the per-window UI content (the editor's controls) ----------------------
 
 const char* const kFootageNames[] = {"Rec.709 (standard)", "V-Log"};
@@ -663,6 +955,168 @@ void DrawEditorUI(WindowImpl* w, ParamSnapshot& ui) {
             if (ImGui::Combo("LUT Source", &srcIdx, kLutSourceNames, 3)) {
                 ui.lutSource = srcIdx + 1;
                 w->edits.push({EditField::LutSource, static_cast<double>(ui.lutSource)});
+            }
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Curves")) {
+            // Master + per-channel monotone tone curves (Phase 6b), recipe-backed and
+            // baked with the theme look. Wired into the existing engine curve fields;
+            // no engine math is added. Requires LUT Source = Auto.
+            ImGui::TextWrapped("Tone curves. Left-drag a point to move, left-click to add, "
+                               "right-click to remove. Reset clears the curve. Uses LUT "
+                               "Source = Auto.");
+            ImGui::Spacing();
+            const float plot = 148.0f;
+            struct CurveEntry {
+                const char* label;
+                cg::editor::CurveState* c;
+                int idx;
+                ImU32 col;
+            };
+            const CurveEntry curves[4] = {
+                {"Master", &ui.curves.master, 0, IM_COL32(235, 235, 240, 255)},
+                {"Red", &ui.curves.r, 1, IM_COL32(235, 90, 90, 255)},
+                {"Green", &ui.curves.g, 2, IM_COL32(90, 210, 110, 255)},
+                {"Blue", &ui.curves.b, 3, IM_COL32(105, 150, 240, 255)},
+            };
+            bool curvesChanged = false;
+            for (int i = 0; i < 4; ++i) {
+                ImGui::BeginGroup();
+                ImGui::TextUnformatted(curves[i].label);
+                std::string plotId = std::string("##curve") + std::to_string(i);
+                if (DrawCurveWidget(plotId.c_str(), *curves[i].c, w->curveDrag[curves[i].idx],
+                                    curves[i].col, plot)) {
+                    curvesChanged = true;
+                }
+                std::string resetId = std::string("Reset##curve") + std::to_string(i);
+                if (ImGui::SmallButton(resetId.c_str())) {
+                    *curves[i].c = cg::editor::CurveState{};
+                    w->curveDrag[curves[i].idx] = -1;
+                    curvesChanged = true;
+                }
+                ImGui::EndGroup();
+                if (i % 2 == 0) ImGui::SameLine();
+            }
+            if (curvesChanged) {
+                ParamEdit e;
+                e.field = EditField::Curves;
+                e.curves = ui.curves;
+                w->edits.push(e);
+            }
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Wheels")) {
+            // DaVinci Lift/Gamma/Gain wheels (primary) + Adobe-style 3-way (secondary).
+            // LGG is a new engine stage; the 3-way reuses the LGG masters for luminance
+            // and the band LAB tint fields for color - no extra engine math. Uses Auto.
+            bool wheelsChanged = false;
+            int mode = ui.wheels.mode;
+            ImGui::TextUnformatted("Wheels:");
+            ImGui::SameLine();
+            if (ImGui::RadioButton("Lift/Gamma/Gain", mode == 0)) mode = 0;
+            ImGui::SameLine();
+            if (ImGui::RadioButton("3-Way", mode == 1)) mode = 1;
+            if (mode != ui.wheels.mode) {
+                ui.wheels.mode = mode;
+                wheelsChanged = true;
+            }
+            ImGui::Separator();
+
+            const float radius = 46.0f;
+            if (mode == 0) {
+                ImGui::TextWrapped("Lift moves blacks, Gain moves whites, Gamma bends mids. "
+                                   "Drag the disc for color balance; the slider is luminance.");
+                ImGui::Spacing();
+                struct LggWheel {
+                    const char* name;
+                    double* triple;
+                    double neutral;
+                    double colorK;
+                    float mMin, mMax;
+                    const char* fmt;
+                };
+                const LggWheel wheels[3] = {
+                    {"Lift", ui.wheels.lift, 0.0, 0.20, -0.5f, 0.5f, "%.3f"},
+                    {"Gamma", ui.wheels.gamma, 1.0, 0.60, 0.2f, 3.0f, "%.2f"},
+                    {"Gain", ui.wheels.gain, 1.0, 0.40, 0.0f, 2.0f, "%.2f"},
+                };
+                for (int i = 0; i < 3; ++i) {
+                    const LggWheel& wl = wheels[i];
+                    ImGui::BeginGroup();
+                    ImGui::TextUnformatted(wl.name);
+                    std::string discId = std::string("##lgg") + std::to_string(i);
+                    if (DrawWheelDisc(discId.c_str(), wl.triple, wl.colorK, radius))
+                        wheelsChanged = true;
+                    ImGui::SetNextItemWidth(radius * 2.0f);
+                    float m = static_cast<float>(WheelMaster(wl.triple));
+                    std::string mId = std::string("##lggm") + std::to_string(i);
+                    if (ImGui::SliderFloat(mId.c_str(), &m, wl.mMin, wl.mMax, wl.fmt)) {
+                        WheelSetMaster(wl.triple, m);
+                        wheelsChanged = true;
+                    }
+                    std::string rId = std::string("Reset##lgg") + std::to_string(i);
+                    if (ImGui::SmallButton(rId.c_str())) {
+                        wl.triple[0] = wl.triple[1] = wl.triple[2] = wl.neutral;
+                        wheelsChanged = true;
+                    }
+                    ImGui::EndGroup();
+                    if (i < 2) ImGui::SameLine();
+                }
+            } else {
+                ImGui::TextWrapped("Adobe-style 3-way: the disc tints each tonal band; the "
+                                   "slider pushes that band's luminance. Reuses the band tints "
+                                   "and the Lift/Gamma/Gain luminance.");
+                ImGui::Spacing();
+                // Each band: color disc -> LAB tint field; luminance slider -> LGG master.
+                struct ThreeWay {
+                    const char* name;
+                    double* ab;         // the band tint [a,b]
+                    bool* has;          // the tint presence flag
+                    double* triple;     // the LGG triple carrying this band's luminance
+                    double neutral;     // luminance neutral for that triple
+                    float mMin, mMax;
+                    const char* fmt;
+                };
+                ThreeWay bands[3] = {
+                    {"Shadows", ui.wheels.shadowTint, &ui.wheels.hasShadowTint, ui.wheels.lift,
+                     0.0, -0.5f, 0.5f, "%.3f"},
+                    {"Midtones", ui.wheels.midTint, &ui.wheels.hasMidTint, ui.wheels.gamma,
+                     1.0, 0.2f, 3.0f, "%.2f"},
+                    {"Highlights", ui.wheels.highTint, &ui.wheels.hasHighTint, ui.wheels.gain,
+                     1.0, 0.0f, 2.0f, "%.2f"},
+                };
+                for (int i = 0; i < 3; ++i) {
+                    ThreeWay& bd = bands[i];
+                    ImGui::BeginGroup();
+                    ImGui::TextUnformatted(bd.name);
+                    std::string discId = std::string("##tw") + std::to_string(i);
+                    if (DrawTintDisc(discId.c_str(), bd.ab, 25.0, radius)) {
+                        *bd.has = (bd.ab[0] != 0.0 || bd.ab[1] != 0.0);
+                        wheelsChanged = true;
+                    }
+                    ImGui::SetNextItemWidth(radius * 2.0f);
+                    float m = static_cast<float>(WheelMaster(bd.triple));
+                    std::string mId = std::string("##twm") + std::to_string(i);
+                    if (ImGui::SliderFloat(mId.c_str(), &m, bd.mMin, bd.mMax, bd.fmt)) {
+                        WheelSetMaster(bd.triple, m);
+                        wheelsChanged = true;
+                    }
+                    std::string rId = std::string("Reset##tw") + std::to_string(i);
+                    if (ImGui::SmallButton(rId.c_str())) {
+                        bd.ab[0] = bd.ab[1] = 0.0;
+                        *bd.has = false;
+                        bd.triple[0] = bd.triple[1] = bd.triple[2] = bd.neutral;
+                        wheelsChanged = true;
+                    }
+                    ImGui::EndGroup();
+                    if (i < 2) ImGui::SameLine();
+                }
+            }
+            if (wheelsChanged) {
+                ParamEdit e;
+                e.field = EditField::Wheels;
+                e.wheels = ui.wheels;
+                w->edits.push(e);
             }
             ImGui::EndTabItem();
         }

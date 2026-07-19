@@ -35,10 +35,11 @@ namespace core {
 
 constexpr uint32_t RECIPE_MAGIC = 0x43475244;  // 'CGRD'
 // v2 added midtoneTint (PR #24). v3 (Phase 6a) added the matchStats flag + the
-// manual primary-correction block + lookMix. The unflatten handler MIGRATES older
-// versions forward (copy the shared prefix, default the new fields) rather than
-// reseeding, so grades saved by an earlier build survive - see ColorGrade.cpp.
-constexpr uint32_t RECIPE_VERSION = 3;
+// manual primary-correction block + lookMix. v4 (Phase 6c) added the DaVinci
+// Lift/Gamma/Gain wheels + the editor wheels-mode flag. The unflatten handler
+// MIGRATES older versions forward (copy the shared prefix, default the new fields)
+// rather than reseeding, so grades saved by an earlier build survive - see ColorGrade.cpp.
+constexpr uint32_t RECIPE_VERSION = 4;
 constexpr int RECIPE_MAX_POINTS = 16;
 constexpr int STATS_FIELDS = 21;
 
@@ -102,6 +103,20 @@ struct RecipeData {
     double manualSaturation = 1.0;
     double manualVibrance = 0.0;
     double lookMix = 1.0;
+
+    // --- v4 (Phase 6c) additions. Kept AFTER all v3 fields so a v3 blob's bytes
+    //     land identically and the migration only defaults these. ---
+    // DaVinci Lift/Gamma/Gain wheels (editor state). Neutral (lift 0, gamma 1,
+    // gain 1) = exact identity. The Adobe 3-way secondary mode reuses these (its
+    // luminance masters map to a uniform lift/gamma/gain) and the existing per-band
+    // tint fields (its color discs), so it needs no new engine math.
+    double lift[3] = {0.0, 0.0, 0.0};
+    double gamma[3] = {1.0, 1.0, 1.0};
+    double gain[3] = {1.0, 1.0, 1.0};
+    // Which wheels face the editor last showed (0 = Lift/Gamma/Gain, 1 = Adobe
+    // 3-way). Pure UI state; the engine ignores it. Kept last so the v3->v4 prefix
+    // copy lands the doubles first.
+    uint32_t wheelsMode = 0;
 };
 
 // --- canonical FootageStats <-> flat 21-double vector ---------------------
@@ -202,8 +217,9 @@ inline RecipeData recipeFromTheme(const Theme& theme, const FootageStats& source
     r.strengthDefault = theme.knobs.strengthDefault;
     r.skinProtectionDefault = theme.knobs.skinProtectionDefault;
     r.matchStats = theme.matchStats ? 1u : 0u;
-    // Manual block + lookMix keep their neutral defaults: manual grading is editor
-    // state, not theme data, so a freshly-seeded recipe carries a neutral manual grade.
+    // Manual block + lookMix + LGG wheels keep their neutral defaults: manual grading
+    // and the wheels are editor state, not theme data, so a freshly-seeded recipe
+    // carries a neutral manual grade and neutral wheels.
     return r;
 }
 
@@ -254,31 +270,46 @@ inline ManualGrade manualFromRecipe(const RecipeData& r) {
     return m;
 }
 
+// Reconstruct the Lift/Gamma/Gain wheels (EngineOptions.lgg) from a recipe (Phase 6c).
+inline LiftGammaGain lggFromRecipe(const RecipeData& r) {
+    LiftGammaGain lg;
+    for (int c = 0; c < 3; ++c) {
+        lg.lift[c] = r.lift[c];
+        lg.gamma[c] = r.gamma[c];
+        lg.gain[c] = r.gain[c];
+    }
+    return lg;
+}
+
 // In-effect bake: build the grade LUT the effect applies, straight from arb-data.
 // opts overrides (strength / skinProtection sliders, and the live PF manual/lookMix)
-// win over the recipe. When the caller leaves manual / lookMix unset, they are taken
-// from the recipe, so the bake carries the persisted manual grade (Phase 6a).
+// win over the recipe. When the caller leaves manual / lgg / lookMix unset, they are
+// taken from the recipe, so the bake carries the persisted manual grade + wheels.
 inline cg::Lut3D bakeFromRecipe(const RecipeData& r, const EngineOptions& opts = {}, int size = 33) {
     EngineOptions merged = opts;
     if (!merged.manual) merged.manual = manualFromRecipe(r);
+    if (!merged.lgg) merged.lgg = lggFromRecipe(r);
     if (!merged.lookMix) merged.lookMix = r.lookMix;
     return bakeGradeLut(statsFromData(r.sourceStats), themeFromRecipe(r), merged, size);
 }
 
 // --- versioned arb-data migration (the Phase 6a landmine) ------------------
 //
-// Byte size of the v2 RecipeData layout: every v3 (Phase 6a) field was appended
-// AFTER the v2 fields, so the first v3 field's offset is exactly the v2 struct
-// size and a v2 blob's bytes are a clean prefix of the v3 struct.
+// Byte size of the v2 / v3 RecipeData layouts: every later field was appended AFTER
+// the earlier fields, so an older field's offset is exactly the older struct size and
+// an older blob's bytes are a clean prefix of the current struct. v2 ended before
+// matchStats (first v3 field); v3 ended before lift (first v4 field).
 constexpr std::size_t RECIPE_V2_SIZE = offsetof(RecipeData, matchStats);
+constexpr std::size_t RECIPE_V3_SIZE = offsetof(RecipeData, lift);
 
 // Migrate a persisted (flattened) recipe blob into a current RecipeData. Old grades
-// must survive a version bump: a same-version blob copies verbatim; a v2 blob copies
-// its shared prefix over v3 defaults (new fields default to neutral: matchStats 1,
-// manual neutral, lookMix 1) and is re-stamped to the current version; anything
-// foreign/corrupt/unknown falls back to `fallback` (the caller supplies the default
-// recipe, keeping this header free of a Themes.h dependency). Single source of truth
-// for the AE arb-data UNFLATTEN handler and the parity harness.
+// must survive a version bump: a same-version blob copies verbatim; an older (v2/v3)
+// blob copies its shared prefix over current defaults (new fields default to neutral:
+// matchStats 1, manual neutral, lookMix 1, LGG lift 0 / gamma 1 / gain 1, wheelsMode 0)
+// and is re-stamped to the current version; anything foreign/corrupt/unknown falls back
+// to `fallback` (the caller supplies the default recipe, keeping this header free of a
+// Themes.h dependency). Single source of truth for the AE arb-data UNFLATTEN handler and
+// the parity harness.
 inline void migrateRecipeInto(RecipeData* dst, const void* flat, std::size_t flatSize,
                               const RecipeData& fallback) {
     RecipeData result = fallback;  // used verbatim only on the foreign/corrupt path
@@ -289,6 +320,10 @@ inline void migrateRecipeInto(RecipeData* dst, const void* flat, std::size_t fla
     }
     if (magic == RECIPE_MAGIC && ver == RECIPE_VERSION && flatSize == sizeof(RecipeData)) {
         std::memcpy(&result, flat, sizeof(RecipeData));  // current version: verbatim
+    } else if (magic == RECIPE_MAGIC && ver == 3 && flatSize == RECIPE_V3_SIZE) {
+        result = RecipeData{};                       // start from current-version defaults
+        std::memcpy(&result, flat, RECIPE_V3_SIZE);  // v3 prefix over those defaults
+        result.version = RECIPE_VERSION;             // stamp forward; new fields defaulted
     } else if (magic == RECIPE_MAGIC && ver == 2 && flatSize == RECIPE_V2_SIZE) {
         result = RecipeData{};                       // start from current-version defaults
         std::memcpy(&result, flat, RECIPE_V2_SIZE);  // v2 prefix over those defaults

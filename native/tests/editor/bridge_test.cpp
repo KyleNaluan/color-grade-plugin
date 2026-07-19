@@ -187,12 +187,74 @@ static void test_phase6a_manual() {
     CHECK(m1 != m2, "differing ManualState unequal");
 }
 
+// --- Phase 6b/6c: curves + wheels round-trip through the recipe-backed edit path ----
+static void test_phase6bc_curves_wheels() {
+    // isRecipeBackedField classifies the three arb-backed fields, and only those.
+    CHECK(isRecipeBackedField(EditField::Manual), "Manual is recipe-backed");
+    CHECK(isRecipeBackedField(EditField::Curves), "Curves is recipe-backed");
+    CHECK(isRecipeBackedField(EditField::Wheels), "Wheels is recipe-backed");
+    CHECK(!isRecipeBackedField(EditField::Strength), "Strength is not recipe-backed");
+    CHECK(!isRecipeBackedField(EditField::Exposure), "Exposure is not recipe-backed");
+
+    // A Curves edit round-trips the whole four-curve state into the snapshot.
+    ParamSnapshot s;
+    ParamEdit ce;
+    ce.field = EditField::Curves;
+    ce.curves.master.count = 3;
+    ce.curves.master.x[0] = 0.0; ce.curves.master.y[0] = 0.0;
+    ce.curves.master.x[1] = 0.5; ce.curves.master.y[1] = 0.6;
+    ce.curves.master.x[2] = 1.0; ce.curves.master.y[2] = 1.0;
+    ce.curves.r.count = 2;
+    ce.curves.r.x[0] = 0.0; ce.curves.r.y[0] = 0.1;
+    ce.curves.r.x[1] = 1.0; ce.curves.r.y[1] = 0.9;
+    applyEdit(s, ce);
+    CHECK(s.curves.master.count == 3 && approx(s.curves.master.y[1], 0.6), "curve master applied");
+    CHECK(s.curves.r.count == 2 && approx(s.curves.r.y[0], 0.1), "curve red applied");
+    CHECK(s.curves == ce.curves, "curves state equal after apply");
+
+    // A Wheels edit round-trips the LGG triples + 3-way band tints + mode.
+    ParamEdit we;
+    we.field = EditField::Wheels;
+    we.wheels.lift[0] = 0.05; we.wheels.gamma[1] = 1.2; we.wheels.gain[2] = 0.9;
+    we.wheels.hasShadowTint = true; we.wheels.shadowTint[0] = 6; we.wheels.shadowTint[1] = -8;
+    we.wheels.mode = 1;
+    applyEdit(s, we);
+    CHECK(approx(s.wheels.lift[0], 0.05) && approx(s.wheels.gamma[1], 1.2) &&
+              approx(s.wheels.gain[2], 0.9), "wheels LGG applied");
+    CHECK(s.wheels.hasShadowTint && approx(s.wheels.shadowTint[0], 6), "wheels shadow tint applied");
+    CHECK(s.wheels.mode == 1, "wheels mode applied");
+    CHECK(s.wheels == we.wheels, "wheels state equal after apply");
+
+    // Curves / Wheels coalesce per field (latest wins), like Manual.
+    EditQueue q;
+    ParamEdit a; a.field = EditField::Curves; a.curves.master.count = 2;
+    ParamEdit b; b.field = EditField::Curves; b.curves.master.count = 5;
+    q.push(a);
+    q.push(b);
+    CHECK(q.size() == 1, "curve edits coalesce to one field");
+    auto drained = q.drain();
+    CHECK(drained.size() == 1 && drained[0].curves.master.count == 5, "latest curve wins");
+
+    // CurveState / WheelsState equality (used by SnapshotChanged on the effect side).
+    CurveState c1, c2;
+    CHECK(c1 == c2, "default CurveState equal");
+    c2.count = 1;
+    CHECK(c1 != c2, "differing CurveState unequal");
+    WheelsState w1, w2;
+    CHECK(w1 == w2, "default WheelsState equal (neutral: lift 0, gamma 1, gain 1)");
+    CHECK(approx(w1.gamma[0], 1.0) && approx(w1.gain[2], 1.0) && approx(w1.lift[1], 0.0),
+          "default WheelsState is neutral LGG");
+    w2.gain[0] = 1.3;
+    CHECK(w1 != w2, "differing WheelsState unequal");
+}
+
 int main() {
     test_queue_basic();
     test_queue_threaded();
     test_mapping();
     test_apply_roundtrip();
     test_phase6a_manual();
+    test_phase6bc_curves_wheels();
 
     if (g_failures == 0) {
         std::printf("editor-bridge-test: PASS (all bridge-logic checks)\n");

@@ -398,8 +398,59 @@ decisions: `firstmate/data/grade-suite-design/{report.md,decisions.md}`.
   for the keyframeable params that re-bake per animated frame. 33-point banding on extreme
   manual grades (~3% worst case on a smooth ramp) matches the regime the shipping themes
   already bake at. An adaptive grid (65 only for static aggressive grades) is a follow-up.
-- **Out of scope (separately tracked):** curves UI (6b), wheels (6c), secondary hue curves
-  (6d), the AI agent loop, the UI-polish overhaul.
+- **Out of scope (separately tracked):** secondary hue curves (6d), the AI agent loop, the
+  UI-polish overhaul. (Curves (6b) and wheels (6c) landed - see below.)
+
+## Phase 6b/6c: curves + wheels (built on this toolkit)
+
+Phase 6b/6c add the **Curves** and **Wheels** tabs and the DaVinci Lift/Gamma/Gain engine
+stage. Design proposal + decisions: `firstmate/data/grade-suite-design/{report.md,decisions.md}`
+(sections 1c/1d/4/5; D2 = LGG primary, Adobe 3-way secondary). Everything is recipe-backed
+(no new keyframeable PF params); the V-Log decode invariant holds by construction (curves and
+wheels operate on the decoded signal, ahead of / within the theme stages).
+
+- **6b Curves (UI only):** the engine already evaluated `toneCurve` + per-channel R/G/B
+  curves, so 6b adds no engine math - just an interactive widget (`DrawCurveWidget`,
+  `EditorWindow.cpp`) that writes the recipe's existing curve fields. One `InvisibleButton`
+  per plot + manual nearest-point hit-testing: left-drag moves a point, left-click adds (up
+  to 16), right-click removes an interior point, per-curve **Reset** clears it. The drawn line
+  is the actual `MonotoneCurve` PCHIP the engine bakes, so what the colorist sees is what
+  bakes. Endpoints (x=0, x=1) move in y only; interior points are clamped strictly between
+  neighbors so the curve stays a function.
+- **6c Wheels - DaVinci LGG (primary, NEW engine stage):** per-channel printer-lights
+  `out_c = clamp01((gain_c*x + lift_c*(1-x))^(1/gamma_c))`, applied in the manual-primaries
+  slot right after `applyManual`. Neutral (lift 0, gamma 1, gain 1) is exact identity (gated,
+  so the None/Manual identity fast path still holds). Oracle-first (`LiftGammaGain`,
+  `NEUTRAL_LGG`, `EngineOptions.lgg` in `engine.ts`), then bit-exact port in `Engine.h`; gated
+  by `native:core-parity` (`gradelgg`/`recipelgg` cases, ~3e-7). The widget is a color disc
+  (`DrawWheelDisc`) + a master luminance slider per wheel: the disc maps to a zero-sum
+  per-channel color offset via three unit "primary" directions 120deg apart (a tight frame
+  that inverts exactly, so a stored triple always places the dot); the master carries the
+  uniform luminance component.
+- **6c Wheels - Adobe 3-way (secondary, NO new engine math):** a radio toggle within the
+  Wheels tab. Its three color discs (`DrawTintDisc`) map **directly** to the existing
+  `shadow/mid/highlight` LAB tint fields; its per-band luminance sliders reuse the LGG masters
+  (shadow->lift, mid->gamma, high->gain), setting only the uniform component so any LGG color
+  offset is preserved. **Documented behavior for the captain:** (i) the 3-way color discs
+  overwrite a theme's authored band tints - fine for the None/Manual all-in-one path; on a
+  real theme the authored tint shows as the disc's starting position and the user adjusts from
+  there; (ii) LGG and 3-way share the lift/gamma/gain luminance state (two faces of the same
+  wheels). A dedicated mid-band luminance push distinct from gamma is a possible follow-up (it
+  would need a new engine field + stage, deliberately out of scope tonight).
+- **Recipe migration (v3 -> v4):** `RecipeData` grew `lift[3]/gamma[3]/gain[3]` + a UI-only
+  `wheelsMode`, all APPENDED after the v3 fields, and `RECIPE_VERSION` bumped 3->4.
+  `migrateRecipeInto` gained a v3->v4 arm (copy the v3 prefix `RECIPE_V3_SIZE =
+  offsetof(RecipeData, lift)` over v4 defaults, re-stamp) alongside the existing v2 arm, so a
+  v2 or v3 saved grade migrates to v4 with neutral wheels; self-tested by the parity `migrate`
+  case (v2->v4 and v3->v4).
+- **Bridge:** `EditorBridge.h` gains `CurveState`/`CurvesState`/`WheelsState`, `Curves`/`Wheels`
+  `EditField`s, and `isRecipeBackedField`; both drain paths (the param-change stand-in and the
+  idle hook) share `ApplyRecipeEditToRecipe` for the CG_RECIPE arb read-modify-write. Curves
+  and wheels bust the preview cache for free via the whole-blob `RecipeHash` already folded
+  into `previewParamFingerprint`. Round-trip is headless-tested by `native:editor-test`; the
+  ImGui widgets + AEGP runtime are captain-verified.
+- **Out of scope (separately tracked):** secondary hue curves (6d), the AI agent loop, the
+  UI-polish overhaul, packaging.
 
 ## Consequences
 
@@ -547,3 +598,31 @@ Theme popup a **None (Manual)** entry.
 18. **V-Log decode invariant:** on a V-Log clip with Footage = V-Log, manual controls act on
     the decoded (corrected) image - e.g. Saturation/Temperature look natural, never like
     they are operating on raw washed-out log.
+
+### Phase 6b/6c (curves + wheels)
+
+Rebuild from THIS worktree with AE closed, then load the fresh `.aex` (all 4 configs build
+clean). The editor gains **Curves** and **Wheels** tabs. No new Effect Controls params
+(curves/wheels are recipe-only). Old projects: a v3 (Phase 6a) recipe migrates to v4 with
+neutral wheels.
+
+19. **Curves - drag / add / remove:** in the Curves tab, on each of Master / Red / Green /
+    Blue: left-drag a point (the preview + comp update live); left-click empty space adds a
+    point; right-click an interior point removes it; **Reset** clears the curve back to the
+    diagonal. The curve line is smooth (PCHIP) and never reverses (monotone).
+20. **Curves bake correctly:** a strong S-curve on Master visibly adds contrast; a lift on the
+    Blue curve's shadows tints the blacks blue. Confirm no banding regression on a smooth ramp.
+21. **LGG wheels - neutral = identity:** in the Wheels tab (Lift/Gamma/Gain mode), with all
+    three wheels neutral (dots centered, masters at lift 0 / gamma 1 / gain 1) on theme None
+    (Manual), the output equals the effect disabled. **Lift** raises the blacks (whites pinned),
+    **Gain** raises the whites (blacks pinned), **Gamma** bends the mids (both ends pinned).
+22. **LGG color push lands in the right band:** drag a wheel's disc toward a hue - Lift tints
+    the shadows, Gamma the mids, Gain the highlights - and the master slider moves that band's
+    luminance without changing the color balance. Reset per wheel returns it to neutral.
+23. **3-way mode - feathered band tints:** switch the Wheels tab to **3-Way**; the three discs
+    tint shadows / midtones / highlights with soft feathering between bands, and each band's
+    luminance slider pushes that band. Toggling back to LGG keeps the shared luminance.
+24. **Regression + invariants:** Basics controls still work; theme None (Manual) with all of
+    Basics + Curves + Wheels neutral is still an identity grade; a project saved with the
+    Phase 6a (v3) build loads with its grade intact and neutral wheels; on a V-Log clip the
+    curves/wheels act on the decoded image (never raw log).
