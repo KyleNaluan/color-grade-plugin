@@ -32,8 +32,12 @@
 #include "../../third_party/imgui/backends/imgui_impl_win32.h"
 #include "../../third_party/imgui/backends/imgui_impl_dx11.h"
 
+#include <cmath>
+
 #include "Scopes.h"  // Phase 5: waveform / histogram / vectorscope image synthesis
 #include "../core/MonotoneCurve.h"  // Phase 6b: shape-preserving PCHIP for the curve preview
+#include "../core/Lab.h"      // Phase 6c: LAB->RGB for the 3-way tint disc color ring
+#include "../core/Rec709.h"   // Phase 6c: encode the tint ring's linear RGB to display
 
 // Forward-decl of the backend's Win32 message handler (defined in imgui_impl_win32.cpp).
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
@@ -496,39 +500,6 @@ void DrawScopesStrip(WindowImpl* w) {
 // right-click a point to remove it (endpoints excluded). Returns true if the state
 // changed this frame (the caller pushes one coalesced Curves edit).
 
-// Seed the two fixed endpoints so an "absent" (count 0) curve becomes editable. count<2
-// bakes as identity, so the endpoints are also how the engine reads a neutral curve.
-inline void CurveEnsureEndpoints(cg::editor::CurveState& c) {
-    if (c.count >= 2) return;
-    c.count = 2;
-    c.x[0] = 0.0; c.y[0] = 0.0;
-    c.x[1] = 1.0; c.y[1] = 1.0;
-}
-
-// Insert (x,y) keeping x-ascending order; returns the new index, or -1 if full.
-inline int CurveInsertPoint(cg::editor::CurveState& c, double x, double y) {
-    if (c.count >= cg::editor::CG_EDIT_MAX_CURVE_POINTS) return -1;
-    int i = c.count;
-    while (i > 0 && c.x[i - 1] > x) {
-        c.x[i] = c.x[i - 1];
-        c.y[i] = c.y[i - 1];
-        --i;
-    }
-    c.x[i] = x;
-    c.y[i] = y;
-    ++c.count;
-    return i;
-}
-
-inline void CurveRemovePoint(cg::editor::CurveState& c, int idx) {
-    if (idx <= 0 || idx >= c.count - 1) return;  // never remove the two endpoints
-    for (int i = idx; i < c.count - 1; ++i) {
-        c.x[i] = c.x[i + 1];
-        c.y[i] = c.y[i + 1];
-    }
-    --c.count;
-}
-
 bool DrawCurveWidget(const char* id, cg::editor::CurveState& c, int& dragIdx, ImU32 lineColor,
                      float size) {
     ImGuiIO& io = ImGui::GetIO();
@@ -578,40 +549,29 @@ bool DrawCurveWidget(const char* id, cg::editor::CurveState& c, int& dragIdx, Im
     // Right-click removes an interior point.
     if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Right) && nearest > 0 &&
         nearest < c.count - 1) {
-        CurveRemovePoint(c, nearest);
+        cg::editor::curveRemovePoint(c, nearest);
         changed = true;
         nearest = -1;
     }
 
     // Left press: start dragging the nearest point, or add a new one at the cursor.
     if (ImGui::IsItemActivated()) {
-        CurveEnsureEndpoints(c);
+        cg::editor::curveEnsureEndpoints(c);
         if (nearest >= 0) {
             dragIdx = nearest;
         } else {
             ImVec2 n = toNorm(io.MousePos);
-            // don't add on top of the fixed-x endpoints
-            double nx = n.x < 0.001 ? 0.001 : (n.x > 0.999 ? 0.999 : n.x);
-            int ins = CurveInsertPoint(c, nx, n.y);
-            dragIdx = ins;
+            dragIdx = cg::editor::curveInsertPoint(c, n.x, n.y);
             changed = true;
         }
     }
 
-    // Drag: move the held point. Endpoints move in y only; interior points move in x
-    // (clamped strictly between neighbors so the curve stays a function) and y.
+    // Drag: move the held point via the pure monotone clamp (y stays within [prev.y, next.y],
+    // interior x between neighbors, endpoints x-fixed) so the drawn PCHIP always passes
+    // through the dots - no detach even on a far drag.
     if (active && dragIdx >= 0 && dragIdx < c.count) {
         ImVec2 n = toNorm(io.MousePos);
-        double ny = n.y;
-        if (dragIdx == 0 || dragIdx == c.count - 1) {
-            c.y[dragIdx] = ny;
-        } else {
-            const double lo = c.x[dragIdx - 1] + 1e-3;
-            const double hi = c.x[dragIdx + 1] - 1e-3;
-            double nx = n.x < lo ? lo : (n.x > hi ? hi : n.x);
-            c.x[dragIdx] = nx;
-            c.y[dragIdx] = ny;
-        }
+        cg::editor::curveClampPoint(c, dragIdx, n.x, n.y);
         changed = true;
     }
     if (!active) dragIdx = -1;
@@ -685,6 +645,48 @@ inline void OffsetToDisc(const double off[3], double k, float& vx, float& vy) {
     if (r > 1.0f) { vx /= r; vy /= r; }
 }
 
+// Draw a hue/color reference as a fan of solid wedges filling the disc, so a push direction
+// reads as a color choice (the round-1 UX ask - wheels had no color). `colorFn(angle)` gives
+// the wedge color at a screen angle (radians, CCW from +x, y up). Semi-transparent so it
+// tints the dark disc face beneath.
+template <typename ColorFn>
+void DrawColorRing(ImDrawList* dl, ImVec2 center, float radius, ColorFn colorFn) {
+    const int N = 48;
+    const float twoPi = 6.2831853f;
+    for (int i = 0; i < N; ++i) {
+        const float a0 = static_cast<float>(i) / N * twoPi;
+        const float a1 = static_cast<float>(i + 1) / N * twoPi;
+        const float am = 0.5f * (a0 + a1);
+        const ImVec2 p0(center.x + std::cos(a0) * radius, center.y - std::sin(a0) * radius);
+        const ImVec2 p1(center.x + std::cos(a1) * radius, center.y - std::sin(a1) * radius);
+        dl->AddTriangleFilled(center, p0, p1, colorFn(am));
+    }
+}
+
+// Wedge color for the LGG color-balance disc: hue from the disc's primary layout (R at top /
+// 90deg, G at 210deg, B at 330deg), so the ring matches DiscToOffset's push direction.
+inline ImU32 LggRingColor(float angle) {
+    const float hueDeg = std::fmod(angle * 57.29578f - 90.0f + 360.0f, 360.0f);
+    float r, g, b;
+    ImGui::ColorConvertHSVtoRGB(hueDeg / 360.0f, 0.80f, 0.92f, r, g, b);
+    return IM_COL32(static_cast<int>(r * 255), static_cast<int>(g * 255), static_cast<int>(b * 255),
+                    130);
+}
+
+// Wedge color for the 3-way LAB-tint disc: convert the disc direction to a small LAB tint
+// (a = cos, b = sin) and through the core LAB->Rec.709 so the ring shows the ACTUAL tint hue.
+inline ImU32 TintRingColor(float angle) {
+    const double chroma = 42.0;
+    const cg::core::Vec3d lin = cg::core::labToLinearRec709(
+        {70.0, std::cos(angle) * chroma, std::sin(angle) * chroma});
+    auto enc = [](double v) {
+        double e = cg::core::rec709Encode(v < 0 ? 0 : v);
+        e = e < 0 ? 0 : (e > 1 ? 1 : e);
+        return static_cast<int>(e * 255);
+    };
+    return IM_COL32(enc(lin[0]), enc(lin[1]), enc(lin[2]), 150);
+}
+
 // Draw a color-balance disc. `triple` is a per-channel value about its mean (the master
 // luminance). `k` scales the disc's color swing. On drag, the disc's zero-sum color offset
 // is combined with the CURRENT master so luminance set by the slider is preserved. Returns
@@ -698,13 +700,14 @@ bool DrawWheelDisc(const char* id, double triple[3], double k, float radius) {
     const bool active = ImGui::IsItemActive();
     const ImVec2 center(p0.x + radius, p0.y + radius);
 
-    // disc face + hue ring hint
+    // disc face + hue color ring + crosshair
     dl->AddCircleFilled(center, radius, IM_COL32(30, 30, 36, 255), 48);
+    DrawColorRing(dl, center, radius, LggRingColor);
     dl->AddCircle(center, radius, IM_COL32(90, 90, 100, 255), 48, 1.5f);
     dl->AddLine(ImVec2(center.x - radius, center.y), ImVec2(center.x + radius, center.y),
-                IM_COL32(55, 55, 62, 255));
+                IM_COL32(55, 55, 62, 120));
     dl->AddLine(ImVec2(center.x, center.y - radius), ImVec2(center.x, center.y + radius),
-                IM_COL32(55, 55, 62, 255));
+                IM_COL32(55, 55, 62, 120));
 
     const double master = (triple[0] + triple[1] + triple[2]) / 3.0;
     double off[3] = {triple[0] - master, triple[1] - master, triple[2] - master};
@@ -752,11 +755,12 @@ bool DrawTintDisc(const char* id, double ab[2], double scale, float radius) {
     const bool active = ImGui::IsItemActive();
     const ImVec2 center(p0.x + radius, p0.y + radius);
     dl->AddCircleFilled(center, radius, IM_COL32(30, 30, 36, 255), 48);
+    DrawColorRing(dl, center, radius, TintRingColor);
     dl->AddCircle(center, radius, IM_COL32(90, 90, 100, 255), 48, 1.5f);
     dl->AddLine(ImVec2(center.x - radius, center.y), ImVec2(center.x + radius, center.y),
-                IM_COL32(55, 55, 62, 255));
+                IM_COL32(55, 55, 62, 120));
     dl->AddLine(ImVec2(center.x, center.y - radius), ImVec2(center.x, center.y + radius),
-                IM_COL32(55, 55, 62, 255));
+                IM_COL32(55, 55, 62, 120));
     bool changed = false;
     if (active) {
         float vx = (io.MousePos.x - center.x) / radius;

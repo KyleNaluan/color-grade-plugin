@@ -428,21 +428,42 @@ wheels operate on the decoded signal, ahead of / within the theme stages).
   that inverts exactly, so a stored triple always places the dot); the master carries the
   uniform luminance component.
 - **6c Wheels - Adobe 3-way (secondary, NO new engine math):** a radio toggle within the
-  Wheels tab. Its three color discs (`DrawTintDisc`) map **directly** to the existing
-  `shadow/mid/highlight` LAB tint fields; its per-band luminance sliders reuse the LGG masters
-  (shadow->lift, mid->gamma, high->gain), setting only the uniform component so any LGG color
-  offset is preserved. **Documented behavior for the captain:** (i) the 3-way color discs
-  overwrite a theme's authored band tints - fine for the None/Manual all-in-one path; on a
-  real theme the authored tint shows as the disc's starting position and the user adjusts from
-  there; (ii) LGG and 3-way share the lift/gamma/gain luminance state (two faces of the same
-  wheels). A dedicated mid-band luminance push distinct from gamma is a possible follow-up (it
-  would need a new engine field + stage, deliberately out of scope tonight).
-- **Recipe migration (v3 -> v4):** `RecipeData` grew `lift[3]/gamma[3]/gain[3]` + a UI-only
-  `wheelsMode`, all APPENDED after the v3 fields, and `RECIPE_VERSION` bumped 3->4.
-  `migrateRecipeInto` gained a v3->v4 arm (copy the v3 prefix `RECIPE_V3_SIZE =
-  offsetof(RecipeData, lift)` over v4 defaults, re-stamp) alongside the existing v2 arm, so a
-  v2 or v3 saved grade migrates to v4 with neutral wheels; self-tested by the parity `migrate`
-  case (v2->v4 and v3->v4).
+  Wheels tab. Its three color discs (`DrawTintDisc`) are the editor's ADDITIVE user band tints
+  that ADD to the theme's authored `shadow/mid/highlight` tints; its per-band luminance sliders
+  reuse the LGG masters (shadow->lift, mid->gamma, high->gain), setting only the uniform
+  component so any LGG color offset is preserved. LGG and 3-way therefore share the
+  lift/gamma/gain luminance state (two faces of the same wheels). A dedicated mid-band
+  luminance distinct from gamma is a possible follow-up (new engine field + stage, out of scope).
+- **RENDER-PATH SEAM (the round-1 blocker - the critical detail):** the effect's Auto bake
+  (`BakeAutoLut`) builds the theme LOOK from the Theme POPUP (`ThemeFromPopup`), NOT from the
+  recipe - the recipe's `targetStats`/authored overrides are vestigial and never re-seeded on a
+  theme change. So editor edits are carried in DEDICATED user recipe fields (see migration
+  below), SEPARATE from the theme-seeded overrides, and COMPOSED onto the popup theme by
+  `cg::core::applyEditorOverrides(ov, recipe)` - the SINGLE shared helper used by BOTH
+  `BakeAutoLut` and the pure `themeFromRecipe`, so the render path and the golden harness agree.
+  User curves REPLACE the theme's authored curve per slot; user 3-way tints ADD; `opts.lgg =
+  lggFromRecipe(recipe)`. This is old-project-safe (empty user fields -> exact theme look) and
+  theme-switch-safe (no stale override). The Curves tab display seeds each empty slot from the
+  popup theme's authored curve (`CurvesStateForDisplay`) so the user edits from the theme curve.
+  Round-1 root cause: `BakeAutoLut` read only the manual block from the recipe, so curve/LGG/tint
+  edits never reached the LUT - now guarded by the `recipeeditor` parity case.
+- **Recipe migration (v3 -> v4):** `RecipeData` grew the editor-owned fields
+  `lift[3]/gamma[3]/gain[3]`, `userToneCurve`/`userChannelR/G/B`,
+  `userShadowTint/userMidTint/userHighTint`, and a UI-only `wheelsMode`, all APPENDED after the
+  v3 fields (`lift` first), and `RECIPE_VERSION` bumped 3->4. `migrateRecipeInto` gained a v3->v4
+  arm (copy the v3 prefix `RECIPE_V3_SIZE = offsetof(RecipeData, lift)` over v4 defaults, re-stamp)
+  alongside the existing v2 arm, so a v2 or v3 saved grade migrates with neutral wheels + empty
+  user curves/tints; self-tested by the parity `migrate` case.
+- **Curve widget robustness (round-1 fix):** the point-manipulation logic
+  (`curveEnsureEndpoints`/`curveInsertPoint`/`curveClampPoint`/`curveRemovePoint`/`curveIsMonotone`)
+  is PURE in `EditorBridge.h` and headless-tested (`native:editor-test`, far-drag case).
+  `curveClampPoint` keeps points x-ascending AND y-non-decreasing - exactly the forceMonotoneY
+  invariant the engine bakes - so the drawn line always passes through every dot (round-1 bug:
+  no clamp, so forceMonotoneY rewrote the line off the dots on a far drag).
+- **Wheel color (round-1 fix):** the discs draw a `DrawColorRing` reference - `LggRingColor` is a
+  primary-aligned HSV ring (R top / G lower-left / B lower-right, matching `DiscToOffset`);
+  `TintRingColor` runs the disc direction through the core LAB->Rec.709 so the 3-way disc shows
+  the actual tint hue.
 - **Bridge:** `EditorBridge.h` gains `CurveState`/`CurvesState`/`WheelsState`, `Curves`/`Wheels`
   `EditField`s, and `isRecipeBackedField`; both drain paths (the param-change stand-in and the
   idle hook) share `ApplyRecipeEditToRecipe` for the CG_RECIPE arb read-modify-write. Curves

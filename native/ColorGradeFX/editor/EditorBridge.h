@@ -83,6 +83,68 @@ struct CurvesState {
     bool operator!=(const CurvesState& o) const { return !(*this == o); }
 };
 
+// --- Curve point manipulation (Phase 6b), pure so the widget's drag/add/remove logic is
+// headless-tested (native:editor-test). Points are kept x-ascending AND y-non-decreasing,
+// exactly what the engine's forceMonotoneY PCHIP bakes - so the drawn/baked curve always
+// passes through every control point (fixes the round-1 "dots detach from the line" bug:
+// the widget clamped nothing, so forceMonotoneY rewrote the line off the dots).
+
+// Seed the two fixed endpoints when a curve is absent (count<2), making it editable. count<2
+// bakes as identity, so the endpoints are also how the engine reads a neutral curve.
+inline void curveEnsureEndpoints(CurveState& c) {
+    if (c.count >= 2) return;
+    c.count = 2;
+    c.x[0] = 0.0; c.y[0] = 0.0;
+    c.x[1] = 1.0; c.y[1] = 1.0;
+}
+
+// Move control point `idx` to (nx, ny) keeping the curve a monotone function: y is clamped
+// into [prev.y, next.y] (endpoints clamp to the adjacent point / [0,1]); interior x is clamped
+// strictly between neighbors; the two endpoints keep x fixed at 0 and 1.
+inline void curveClampPoint(CurveState& c, int idx, double nx, double ny) {
+    if (idx < 0 || idx >= c.count) return;
+    const double yLo = idx > 0 ? c.y[idx - 1] : 0.0;
+    const double yHi = idx < c.count - 1 ? c.y[idx + 1] : 1.0;
+    ny = ny < yLo ? yLo : (ny > yHi ? yHi : ny);
+    if (idx == 0) { c.x[0] = 0.0; c.y[0] = ny; return; }
+    if (idx == c.count - 1) { c.x[c.count - 1] = 1.0; c.y[c.count - 1] = ny; return; }
+    const double xLo = c.x[idx - 1] + 1e-3;
+    const double xHi = c.x[idx + 1] - 1e-3;
+    nx = nx < xLo ? xLo : (nx > xHi ? xHi : nx);
+    c.x[idx] = nx;
+    c.y[idx] = ny;
+}
+
+// Insert a point at x (kept x-ascending), then clamp it monotone against its neighbors.
+// Returns the new index, or -1 if the curve is full. x is nudged off the fixed endpoints.
+inline int curveInsertPoint(CurveState& c, double x, double y) {
+    if (c.count >= CG_EDIT_MAX_CURVE_POINTS) return -1;
+    x = x < 0.001 ? 0.001 : (x > 0.999 ? 0.999 : x);
+    int i = c.count;
+    while (i > 0 && c.x[i - 1] > x) { c.x[i] = c.x[i - 1]; c.y[i] = c.y[i - 1]; --i; }
+    c.x[i] = x; c.y[i] = y;
+    ++c.count;
+    curveClampPoint(c, i, x, y);
+    return i;
+}
+
+// Remove an interior control point (the two endpoints are fixed and never removed).
+inline void curveRemovePoint(CurveState& c, int idx) {
+    if (idx <= 0 || idx >= c.count - 1) return;
+    for (int i = idx; i < c.count - 1; ++i) { c.x[i] = c.x[i + 1]; c.y[i] = c.y[i + 1]; }
+    --c.count;
+}
+
+// True if the curve is a valid monotone function: x strictly ascending, y non-decreasing.
+// (What forceMonotoneY PCHIP preserves; the invariant that keeps dots on the drawn line.)
+inline bool curveIsMonotone(const CurveState& c) {
+    for (int i = 1; i < c.count; ++i) {
+        if (c.x[i] <= c.x[i - 1]) return false;
+        if (c.y[i] < c.y[i - 1]) return false;
+    }
+    return true;
+}
+
 // Wheels editor state (Phase 6c). The DaVinci Lift/Gamma/Gain triples are the primary
 // face; the Adobe 3-way secondary mode reuses the same lift/gamma/gain masters for its
 // per-band luminance and the recipe's shadow/mid/highlight LAB tint fields for its color

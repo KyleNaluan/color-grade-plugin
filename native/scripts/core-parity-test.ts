@@ -539,6 +539,40 @@ function main(): void {
     }
   }
 
+  // --- Editor-layer composition parity (Phase 6b/6c render-path guard): the effect's Auto
+  //     bake COMPOSES the editor-owned layers (user curves REPLACE the theme's authored curve
+  //     per slot; 3-way user tints ADD to the authored band tints) via `applyEditorOverrides`,
+  //     the SAME core helper themeFromRecipe/bakeFromRecipe use. Seed a recipe from the theme,
+  //     stamp the user curve + user shadow tint into the USER fields, and bake via the recipe
+  //     path; it must match a TS oracle theme built with the composed overrides. This is the
+  //     regression that would have caught "editor curve/tint edits never reach the baked LUT". ---
+  const userMasterCurve: [number, number][] = [[0, 0], [0.3, 0.18], [0.7, 0.82], [1, 1]];
+  const userShadowTint: [number, number] = [10, -6];
+  for (const [themeName, theme] of Object.entries(THEMES)) {
+    for (const f of [frames[0]!, frames[2]!]) {
+      const stats = computeStats(f.pixels);
+      const authored = theme.overrides ?? {};
+      const composed = {
+        ...authored,
+        toneCurve: userMasterCurve, // user curve REPLACES the authored master curve
+        shadowTint: [
+          (authored.shadowTint?.[0] ?? 0) + userShadowTint[0],
+          (authored.shadowTint?.[1] ?? 0) + userShadowTint[1],
+        ] as [number, number],
+      };
+      const oracleTheme = { ...theme, overrides: composed };
+      const ref: Lut3D = bakeGradeLut(stats, oracleTheme, {}, 33);
+      const curveCsv = userMasterCurve.flat().join(',');
+      const outPath = join(tmp, `recipeeditor-${themeName}-${f.name}.f32`);
+      runCpp(ctx, [
+        'recipeeditor', framePaths.get(f.name)!, String(f.pixels.length),
+        themeName, curveCsv, String(userShadowTint[0]), String(userShadowTint[1]), outPath,
+      ]);
+      track(recipeT, ref.data, readF32(outPath, ref.data.length),
+        `recipeeditor:${themeName}/${f.name}`);
+    }
+  }
+
   // --- Versioned arb-data migration self-test (the recipe landmine): old grades must
   //     survive the RECIPE_VERSION bump. Self-checks in C++ (exits nonzero on failure). ---
   runCpp(ctx, ['migrate']);

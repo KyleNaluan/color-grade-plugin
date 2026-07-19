@@ -425,6 +425,45 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    if (cmd == "recipeeditor" && argc == 9) {
+        // Exercise the Phase 6b/6c editor-layer composition through the recipe (the effect's
+        // Auto-bake render path uses the SAME applyEditorOverrides helper): seed a recipe from
+        // the theme, stamp a user master curve (REPLACES authored) + a user shadow tint (ADDS
+        // to authored) into the USER fields, and bakeFromRecipe. Must match the oracle theme
+        // built with the composed overrides - the regression guard for "edits reach the LUT".
+        const size_t n = static_cast<size_t>(std::strtoull(argv[3], nullptr, 10));
+        std::vector<float> px = readF32(argv[2], n);
+        Theme theme;
+        if (!getTheme(argv[4], theme)) {
+            std::fprintf(stderr, "core_parity: unknown theme %s\n", argv[4]);
+            return 2;
+        }
+        FootageStats stats = computeStats(px.data(), px.size());
+        RecipeData recipe = recipeFromTheme(theme, stats);
+        // Parse the user master curve CSV "x0,y0,x1,y1,..." into userToneCurve.
+        {
+            double vals[2 * RECIPE_MAX_POINTS];
+            int cnt = 0;
+            const char* p = argv[5];
+            while (cnt < 2 * RECIPE_MAX_POINTS && p && *p) {
+                vals[cnt++] = std::atof(p);
+                const char* c = std::strchr(p, ',');
+                p = c ? c + 1 : nullptr;
+            }
+            const int pts = cnt / 2;
+            recipe.userToneCurve.count = pts;
+            for (int i = 0; i < pts; i++) {
+                recipe.userToneCurve.pts[i][0] = vals[2 * i];
+                recipe.userToneCurve.pts[i][1] = vals[2 * i + 1];
+            }
+        }
+        recipe.userShadowTint[0] = std::atof(argv[6]);
+        recipe.userShadowTint[1] = std::atof(argv[7]);
+        cg::Lut3D lut = bakeFromRecipe(recipe, {}, 33);
+        writeF32(argv[8], lut.data);
+        return 0;
+    }
+
     if (cmd == "migrate" && argc == 2) {
         // Self-checking versioned arb-data migration test (the Phase 6a landmine): a v2
         // blob migrates forward with its fields intact and the new fields defaulted; a
@@ -456,9 +495,12 @@ int main(int argc, char** argv) {
         if (out.manualExposure != 0.0) { std::fprintf(stderr, "migrate: v2 exp default\n"); fail = 1; }
         if (out.manualPivot != 0.435) { std::fprintf(stderr, "migrate: v2 pivot default\n"); fail = 1; }
         if (out.lookMix != 1.0) { std::fprintf(stderr, "migrate: v2 lookMix default\n"); fail = 1; }
-        // v4 (Phase 6c) fields default to neutral LGG on a v2 migration.
+        // v4 (Phase 6b/6c) fields default to neutral LGG + empty user curves/tints on a v2 migration.
         if (out.lift[0] != 0.0 || out.gamma[0] != 1.0 || out.gain[0] != 1.0) {
             std::fprintf(stderr, "migrate: v2 lgg default\n"); fail = 1;
+        }
+        if (out.userToneCurve.count != 0 || out.userShadowTint[0] != 0.0) {
+            std::fprintf(stderr, "migrate: v2 user-editor default\n"); fail = 1;
         }
         if (out.wheelsMode != 0) { std::fprintf(stderr, "migrate: v2 wheelsMode default\n"); fail = 1; }
 
@@ -484,14 +526,20 @@ int main(int argc, char** argv) {
         if (outv3.lift[0] != 0.0 || outv3.gamma[1] != 1.0 || outv3.gain[2] != 1.0) {
             std::fprintf(stderr, "migrate: v3 lgg default\n"); fail = 1;
         }
+        if (outv3.userToneCurve.count != 0 || outv3.userShadowTint[0] != 0.0) {
+            std::fprintf(stderr, "migrate: v3 user-editor default\n"); fail = 1;
+        }
         if (outv3.wheelsMode != 0) { std::fprintf(stderr, "migrate: v3 wheelsMode default\n"); fail = 1; }
 
-        // --- Current-version blob copies verbatim (incl. non-neutral LGG). ---
+        // --- Current-version blob copies verbatim (incl. non-neutral LGG + user fields). ---
         RecipeData current = base;
         current.version = RECIPE_VERSION;
         current.lift[0] = 0.05;
         current.gamma[1] = 1.2;
         current.gain[2] = 0.9;
+        current.userToneCurve.count = 2;
+        current.userToneCurve.pts[0][0] = 0.1;
+        current.userShadowTint[0] = 7.0;
         current.wheelsMode = 1;
         RecipeData out2;
         migrateRecipeInto(&out2, &current, sizeof(RecipeData), fallback);

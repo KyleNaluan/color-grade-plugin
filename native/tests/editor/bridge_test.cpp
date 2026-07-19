@@ -248,6 +248,54 @@ static void test_phase6bc_curves_wheels() {
     CHECK(w1 != w2, "differing WheelsState unequal");
 }
 
+// --- Phase 6b: curve point manipulation stays a monotone function under far drags -------
+// Regression for the round-1 "dots detach from the line" bug: the widget must keep points
+// x-ascending AND y-non-decreasing so the engine's forceMonotoneY PCHIP (drawn + baked)
+// passes through every dot. curveClampPoint is what enforces it.
+static void test_phase6b_curve_drag() {
+    CurveState c;
+    CHECK(c.count == 0, "curve starts absent");
+    curveEnsureEndpoints(c);
+    CHECK(c.count == 2 && curveIsMonotone(c), "endpoints seeded, monotone");
+
+    int i = curveInsertPoint(c, 0.5, 0.5);
+    CHECK(i == 1 && c.count == 3 && curveIsMonotone(c), "insert mid point, monotone");
+
+    // Far drag DOWN past the shadow endpoint: y clamps to the previous point's y (0), never below.
+    curveClampPoint(c, 1, 0.5, -5.0);
+    CHECK(approx(c.y[1], 0.0) && curveIsMonotone(c), "far-down drag clamps to prev y, monotone");
+    // Far drag UP past the highlight endpoint: y clamps to the next point's y (1).
+    curveClampPoint(c, 1, 0.5, 5.0);
+    CHECK(approx(c.y[1], 1.0) && curveIsMonotone(c), "far-up drag clamps to next y, monotone");
+    // Far drag LEFT/RIGHT: interior x stays strictly between neighbors (never crosses an endpoint).
+    curveClampPoint(c, 1, -5.0, 0.5);
+    CHECK(c.x[1] > c.x[0] && c.x[1] < c.x[2] && curveIsMonotone(c), "far-left drag keeps x ordered");
+    curveClampPoint(c, 1, 5.0, 0.5);
+    CHECK(c.x[1] > c.x[0] && c.x[1] < c.x[2] && curveIsMonotone(c), "far-right drag keeps x ordered");
+
+    // A pile of inserts + wild drags (mimicking Curves2.png) must never break monotonicity.
+    CurveState d;
+    curveEnsureEndpoints(d);
+    const double xs[] = {0.2, 0.8, 0.35, 0.6, 0.15, 0.9, 0.5};
+    for (double x : xs) curveInsertPoint(d, x, 0.5);
+    CHECK(curveIsMonotone(d), "many inserts stay monotone");
+    // Drag every interior point to extreme, alternating y; must stay a monotone function.
+    for (int k = 1; k < d.count - 1; ++k) {
+        curveClampPoint(d, k, d.x[k], (k % 2) ? 9.0 : -9.0);
+        CHECK(curveIsMonotone(d), "extreme alternating drag stays monotone");
+    }
+    // In-range drag stores the value exactly (no clamp when between neighbors).
+    CurveState e;
+    curveEnsureEndpoints(e);
+    curveInsertPoint(e, 0.4, 0.4);
+    curveClampPoint(e, 1, 0.45, 0.6);
+    CHECK(approx(e.x[1], 0.45) && approx(e.y[1], 0.6), "in-range drag stored exactly");
+
+    // Removing the interior point returns to the two fixed endpoints (identity curve).
+    curveRemovePoint(e, 1);
+    CHECK(e.count == 2 && approx(e.y[0], 0.0) && approx(e.y[1], 1.0), "remove interior -> endpoints");
+}
+
 int main() {
     test_queue_basic();
     test_queue_threaded();
@@ -255,6 +303,7 @@ int main() {
     test_apply_roundtrip();
     test_phase6a_manual();
     test_phase6bc_curves_wheels();
+    test_phase6b_curve_drag();
 
     if (g_failures == 0) {
         std::printf("editor-bridge-test: PASS (all bridge-logic checks)\n");

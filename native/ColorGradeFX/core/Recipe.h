@@ -104,20 +104,50 @@ struct RecipeData {
     double manualVibrance = 0.0;
     double lookMix = 1.0;
 
-    // --- v4 (Phase 6c) additions. Kept AFTER all v3 fields so a v3 blob's bytes
-    //     land identically and the migration only defaults these. ---
-    // DaVinci Lift/Gamma/Gain wheels (editor state). Neutral (lift 0, gamma 1,
-    // gain 1) = exact identity. The Adobe 3-way secondary mode reuses these (its
-    // luminance masters map to a uniform lift/gamma/gain) and the existing per-band
-    // tint fields (its color discs), so it needs no new engine math.
+    // --- v4 (Phase 6b/6c) additions. Kept AFTER all v3 fields so a v3 blob's bytes
+    //     land identically and the migration only defaults these. `lift` MUST stay the
+    //     FIRST v4 field (RECIPE_V3_SIZE == offsetof(RecipeData, lift)). ---
+    //
+    // These are EDITOR-OWNED fields, distinct from the theme-seeded overrides above
+    // (toneCurve/shadowTint/... which recipeFromTheme seeds from the picked theme).
+    // The effect's Auto bake takes the theme LOOK from the Theme popup, then COMPOSES
+    // these editor layers on top: user curves REPLACE the theme's authored curve per
+    // slot; user 3-way tints ADD to the theme's authored band tints; LGG is its own
+    // engine stage. All default to neutral/empty, so an old grade (v2/v3) or a
+    // theme with no edits bakes exactly the theme look - and switching themes never
+    // applies a stale editor override.
+    //
+    // DaVinci Lift/Gamma/Gain wheels. Neutral (lift 0, gamma 1, gain 1) = exact identity.
     double lift[3] = {0.0, 0.0, 0.0};
     double gamma[3] = {1.0, 1.0, 1.0};
     double gain[3] = {1.0, 1.0, 1.0};
+    // Curves tab (6b): user master + per-channel curves. count 0 = absent (the theme's
+    // authored curve is used for that slot); present = replaces it.
+    CurveData userToneCurve{};
+    CurveData userChannelR{};
+    CurveData userChannelG{};
+    CurveData userChannelB{};
+    // Adobe 3-way (6c) per-band color discs -> LAB [a,b] tints, ADDED to the theme's
+    // authored band tints. {0,0} = no user tint. Distinct from the theme-seeded
+    // shadowTint/midtoneTint/highlightTint above so a theme switch stays clean.
+    double userShadowTint[2] = {0.0, 0.0};
+    double userMidTint[2] = {0.0, 0.0};
+    double userHighTint[2] = {0.0, 0.0};
     // Which wheels face the editor last showed (0 = Lift/Gamma/Gain, 1 = Adobe
-    // 3-way). Pure UI state; the engine ignores it. Kept last so the v3->v4 prefix
-    // copy lands the doubles first.
+    // 3-way). Pure UI state; the engine ignores it.
     uint32_t wheelsMode = 0;
 };
+
+// Combine a theme-authored band tint (optional) with the editor's additive user tint.
+inline std::optional<std::array<double, 2>> combineBandTint(
+    const std::optional<std::array<double, 2>>& authored, const double user[2]) {
+    const bool hasUser = user[0] != 0.0 || user[1] != 0.0;
+    if (!authored && !hasUser) return std::nullopt;
+    const double a0 = authored ? (*authored)[0] : 0.0;
+    const double a1 = authored ? (*authored)[1] : 0.0;
+    return std::array<double, 2>{a0 + user[0], a1 + user[1]};
+}
+
 
 // --- canonical FootageStats <-> flat 21-double vector ---------------------
 
@@ -166,6 +196,24 @@ inline std::optional<std::vector<CurvePoint>> curveFromData(const CurveData& c) 
     std::vector<CurvePoint> pts(n);
     for (int i = 0; i < n; i++) pts[i] = c.pts[i];
     return pts;
+}
+
+// Compose the editor-owned look layers onto a set of theme overrides: the 6b user curves
+// REPLACE the authored curve per slot; the 6c 3-way user tints ADD to the authored band
+// tints. Shared by the pure themeFromRecipe path AND the effect's Auto bake (BakeAutoLut),
+// so the render path and the golden harness exercise IDENTICAL composition - the regression
+// guard for "editor curve/wheel edits actually reach the baked LUT". (LGG is a separate
+// EngineOptions stage, folded in by the caller via lggFromRecipe.)
+inline void applyEditorOverrides(ThemeOverrides& ov, const RecipeData& r) {
+    ov.shadowTint = combineBandTint(ov.shadowTint, r.userShadowTint);
+    ov.highlightTint = combineBandTint(ov.highlightTint, r.userHighTint);
+    ov.midtoneTint = combineBandTint(ov.midtoneTint, r.userMidTint);
+    if (r.userToneCurve.count > 0) ov.toneCurve = curveFromData(r.userToneCurve);
+    ChannelCurves cc = ov.channelCurves.value_or(ChannelCurves{});
+    if (r.userChannelR.count > 0) cc.r = curveFromData(r.userChannelR);
+    if (r.userChannelG.count > 0) cc.g = curveFromData(r.userChannelG);
+    if (r.userChannelB.count > 0) cc.b = curveFromData(r.userChannelB);
+    if (cc.r || cc.g || cc.b) ov.channelCurves = cc;
 }
 
 // --- Theme <-> RecipeData --------------------------------------------------
@@ -230,6 +278,7 @@ inline Theme themeFromRecipe(const RecipeData& r) {
     t.name = "recipe";
     t.targetStats = statsFromData(r.targetStats);
     ThemeOverrides ov;
+    // Start from the theme-authored overrides (as seeded by recipeFromTheme)...
     if (r.hasShadowTint) ov.shadowTint = std::array<double, 2>{r.shadowTint[0], r.shadowTint[1]};
     if (r.hasHighlightTint)
         ov.highlightTint = std::array<double, 2>{r.highlightTint[0], r.highlightTint[1]};
@@ -237,11 +286,16 @@ inline Theme themeFromRecipe(const RecipeData& r) {
         ov.midtoneTint = std::array<double, 2>{r.midtoneTint[0], r.midtoneTint[1]};
     if (r.hasChromaGain) ov.chromaGain = r.chromaGain;
     ov.toneCurve = curveFromData(r.toneCurve);
-    ChannelCurves cc;
-    cc.r = curveFromData(r.channelR);
-    cc.g = curveFromData(r.channelG);
-    cc.b = curveFromData(r.channelB);
-    if (cc.r || cc.g || cc.b) ov.channelCurves = cc;
+    {
+        ChannelCurves cc;
+        cc.r = curveFromData(r.channelR);
+        cc.g = curveFromData(r.channelG);
+        cc.b = curveFromData(r.channelB);
+        if (cc.r || cc.g || cc.b) ov.channelCurves = cc;
+    }
+    // ...then compose the editor-owned layers on top (the SAME helper the effect's Auto
+    // bake uses, so both agree on how curve/wheel edits reach the LUT).
+    applyEditorOverrides(ov, r);
     ChromaShape cs;
     cs.byLuma = curveFromData(r.chromaByLuma);
     if (r.hasVibrance) cs.vibrance = r.vibrance;
