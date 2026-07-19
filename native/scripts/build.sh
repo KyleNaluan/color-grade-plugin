@@ -11,6 +11,11 @@
 #   Debug (default) | Release   build configuration
 #   --gpu                       build the GPU config (DirectX + CUDA) instead of CPU-only
 #
+# Env override (link-verify without closing AE): set CG_OUT_DIR to a Windows path to relink
+# the .aex there instead of the locked MediaCore dir (e.g. CG_OUT_DIR='C:\dev\cg-verify-out').
+# A WSL `export` does NOT cross to Windows MSBuild, so this is forwarded as an explicit -p:
+# prop. See native/BUILDING.md "LINK-VERIFY WITHOUT CLOSING AE".
+#
 # Requires: VS 2022 MSBuild, the four AE SDK env vars (see native/BUILDING.md).
 set -euo pipefail
 
@@ -62,6 +67,12 @@ rm -f  "$MIRROR_WSL/ColorGradeFX/Win/ColorGradePiPL.rc"
 rm -rf "$MIRROR_WSL/ColorGradeFX/Win/x64/$CONFIG/DirectX_Assets"
 
 # --- build via MSBuild interop ---------------------------------------------
+# Optional scratch output dir (relink without touching a locked MediaCore .aex).
+OUT_PROP=()
+if [ -n "${CG_OUT_DIR:-}" ]; then
+  echo "==> output override: AE_PLUGIN_BUILD_DIR=$CG_OUT_DIR"
+  OUT_PROP=(-p:AE_PLUGIN_BUILD_DIR="$CG_OUT_DIR")
+fi
 echo "==> MSBuild $CONFIG|x64 CG_GPU=$CG_GPU (WindowsTargetPlatformVersion=$WIN_SDK_VER)"
 "$MSBUILD" "$VCXPROJ_WIN" \
   -nologo \
@@ -69,6 +80,7 @@ echo "==> MSBuild $CONFIG|x64 CG_GPU=$CG_GPU (WindowsTargetPlatformVersion=$WIN_
   -p:Platform=x64 \
   -p:WindowsTargetPlatformVersion="$WIN_SDK_VER" \
   -p:CG_GPU="$CG_GPU" \
+  "${OUT_PROP[@]}" \
   -v:minimal \
   -m
 

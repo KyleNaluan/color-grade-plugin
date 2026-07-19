@@ -194,6 +194,38 @@ inline FitRect letterboxFit(float availW, float availH, int frameW, int frameH) 
     return r;
 }
 
+// --- before/after compare view (pure geometry) ------------------------------
+//
+// The editor can compare the ORIGINAL (decoded footage - never raw log, the "before")
+// against the GRADED output (the "after"). Both frames share the clip's dimensions, so
+// they letterbox to the same dst rect; the mode decides what is shown where.
+
+enum class CompareMode {
+    AfterOnly = 0,  // just the graded preview (default)
+    BeforeOnly,     // just the decoded original
+    Split,          // before on the left of the divider, after on the right
+};
+
+// Where to draw the frame(s) inside an availW x availH box, plus the split divider's x.
+// Both before and after use `dst` (identical size -> identical letterbox); in Split mode
+// the caller clips before to [dst.x, splitX] and after to [splitX, dst.x+dst.w].
+struct SplitGeometry {
+    FitRect dst;             // letterboxed frame rect within the box
+    float   splitX = 0.0f;   // absolute x of the divider (box coords), within [dst.x, dst.x+dst.w]
+};
+
+// Compute the compare-view geometry. `splitFraction` (0..1) positions the divider across
+// the letterboxed frame width; it is ignored except in Split mode but always clamped so a
+// caller can pass it unconditionally. Degenerate inputs yield an empty dst at the origin.
+inline SplitGeometry splitViewGeometry(float availW, float availH, int frameW, int frameH,
+                                       float splitFraction) {
+    SplitGeometry g;
+    g.dst = letterboxFit(availW, availH, frameW, frameH);
+    float f = splitFraction < 0.0f ? 0.0f : (splitFraction > 1.0f ? 1.0f : splitFraction);
+    g.splitX = g.dst.x + g.dst.w * f;
+    return g;
+}
+
 // --- checkout/checkin state machine (pure guarantee) ------------------------
 //
 // A frame checked out from AE (AEGP_RenderAndCheckoutLayerFrame) MUST be checked back

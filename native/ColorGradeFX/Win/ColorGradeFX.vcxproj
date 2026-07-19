@@ -132,6 +132,8 @@
     <ClInclude Include="..\editor\EditorBridge.h" />
     <ClInclude Include="..\editor\PreviewCache.h" />
     <ClInclude Include="..\editor\EditorWindow.h" />
+    <ClInclude Include="..\editor\Analysis.h" />
+    <ClInclude Include="..\editor\Scopes.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="..\ColorGrade.cpp" />

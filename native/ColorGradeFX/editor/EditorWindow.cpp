@@ -32,6 +32,8 @@
 #include "../../third_party/imgui/backends/imgui_impl_win32.h"
 #include "../../third_party/imgui/backends/imgui_impl_dx11.h"
 
+#include "Scopes.h"  // Phase 5: waveform / histogram / vectorscope image synthesis
+
 // Forward-decl of the backend's Win32 message handler (defined in imgui_impl_win32.cpp).
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
@@ -55,6 +57,16 @@ HINSTANCE PluginInstance() {
                          reinterpret_cast<LPCWSTR>(&PluginInstance), &hm);
     return reinterpret_cast<HINSTANCE>(hm);
 }
+
+// A GPU RGBA8 texture + its shader-resource view and current size. Owned by the window's
+// UI thread. Reused by the live preview, the before frame, and each scope (Phase 4/5).
+struct GpuTex {
+    ID3D11Texture2D*          tex = nullptr;
+    ID3D11ShaderResourceView* srv = nullptr;
+    int                       w = 0;
+    int                       h = 0;
+    bool ready() const { return srv != nullptr && w > 0 && h > 0; }
+};
 
 // One window instance: its own thread, D3D11 device/swapchain, ImGui context, and
 // the bridge state shared with the effect (snapshot in, edits out).
@@ -86,10 +98,30 @@ struct WindowImpl {
     std::mutex                         previewMutex;
     std::shared_ptr<const PreviewFrame> pendingPreview;   // newest frame awaiting upload
     bool                               previewDirty = false;
-    ID3D11Texture2D*                   previewTex = nullptr;   // UI thread only
-    ID3D11ShaderResourceView*          previewSrv = nullptr;   // UI thread only
-    int                                previewTexW = 0;
-    int                                previewTexH = 0;
+    GpuTex                             previewTex;   // UI thread only
+
+    // Phase 5 before/after: the effect pushes the ORIGINAL decoded frame (pendingBefore);
+    // the UI thread uploads it and draws it against the graded preview per compareMode.
+    std::mutex                         beforeMutex;
+    std::shared_ptr<const PreviewFrame> pendingBefore;
+    bool                               beforeDirty = false;
+    GpuTex                             beforeTex;    // UI thread only
+
+    // Phase 5 scopes: recomputed on the UI thread from the newest graded preview frame
+    // (Scopes.h) and uploaded into these textures. UI thread only.
+    GpuTex waveTex, histTex, vecTex;
+    std::shared_ptr<const PreviewFrame> lastPreviewForScopes;  // source of the current scopes
+
+    // Phase 5 analysis status (effect -> window), shown as an "Analyzing n/N" badge.
+    std::mutex     statusMutex;
+    AnalysisStatus analysisStatus;
+
+    // Phase 5 UI state written by the UI thread, read by the bridge getters (atomics):
+    //   compareMode 0=AfterOnly 1=BeforeOnly 2=Split; wantsBefore = compareMode != 0.
+    std::atomic<int>  compareMode{0};
+    std::atomic<bool> showScopes{true};
+    std::atomic<bool> analyzeRequested{false};  // one-shot: "Analyze" button clicked
+    float             splitFraction = 0.5f;      // UI-thread only: split divider position
 
     ParamSnapshot readSnapshot() {
         std::lock_guard<std::mutex> lk(snapMutex);
@@ -113,6 +145,25 @@ struct WindowImpl {
         previewDirty = false;
         return pendingPreview;  // keep it (harmless) so a resize can re-upload if needed
     }
+    void writeBefore(std::shared_ptr<const PreviewFrame> f) {
+        std::lock_guard<std::mutex> lk(beforeMutex);
+        pendingBefore = std::move(f);
+        beforeDirty = true;
+    }
+    std::shared_ptr<const PreviewFrame> takePendingBefore() {
+        std::lock_guard<std::mutex> lk(beforeMutex);
+        if (!beforeDirty) return nullptr;
+        beforeDirty = false;
+        return pendingBefore;
+    }
+    void writeStatus(const AnalysisStatus& s) {
+        std::lock_guard<std::mutex> lk(statusMutex);
+        analysisStatus = s;
+    }
+    AnalysisStatus readStatus() {
+        std::lock_guard<std::mutex> lk(statusMutex);
+        return analysisStatus;
+    }
 };
 
 // --- D3D11 device / render target helpers (canonical ImGui dx11 example) -----
@@ -129,28 +180,29 @@ void CleanupRenderTarget(WindowImpl* w) {
     if (w->rtv) { w->rtv->Release(); w->rtv = nullptr; }
 }
 
-// --- live-preview texture (UI thread only) ----------------------------------
+// --- RGBA8 GPU textures (UI thread only) ------------------------------------
+// Shared by the live preview, the before frame, and each scope image.
 
-void ReleasePreviewTexture(WindowImpl* w) {
-    if (w->previewSrv) { w->previewSrv->Release(); w->previewSrv = nullptr; }
-    if (w->previewTex) { w->previewTex->Release(); w->previewTex = nullptr; }
-    w->previewTexW = 0;
-    w->previewTexH = 0;
+void ReleaseGpuTex(GpuTex& t) {
+    if (t.srv) { t.srv->Release(); t.srv = nullptr; }
+    if (t.tex) { t.tex->Release(); t.tex = nullptr; }
+    t.w = 0;
+    t.h = 0;
 }
 
-// Upload an RGBA8 preview frame into previewTex, (re)creating the texture + SRV when the
-// frame size changes and updating pixels in place otherwise. Runs on the window's UI
-// thread with its D3D device. Leaves previewSrv null (and returns) on any failure so the
-// draw path falls back to the placeholder rather than showing garbage.
-void UploadPreviewFrame(WindowImpl* w, const PreviewFrame& f) {
-    if (!w->device || !w->context || !f.valid()) return;
-
-    if (!w->previewTex || w->previewTexW != f.width || w->previewTexH != f.height) {
-        ReleasePreviewTexture(w);
+// Upload tightly-packed RGBA8 pixels into `t`, (re)creating the texture + SRV on a size
+// change and updating pixels in place otherwise. Runs on the window's UI thread with its
+// D3D device. Leaves the SRV null (and returns) on any failure so the draw path falls back
+// to the placeholder rather than showing garbage.
+void UploadRGBA(ID3D11Device* dev, ID3D11DeviceContext* ctx, GpuTex& t,
+                const uint8_t* rgba, int width, int height) {
+    if (!dev || !ctx || !rgba || width <= 0 || height <= 0) return;
+    if (!t.tex || t.w != width || t.h != height) {
+        ReleaseGpuTex(t);
         D3D11_TEXTURE2D_DESC td;
         ZeroMemory(&td, sizeof(td));
-        td.Width = static_cast<UINT>(f.width);
-        td.Height = static_cast<UINT>(f.height);
+        td.Width = static_cast<UINT>(width);
+        td.Height = static_cast<UINT>(height);
         td.MipLevels = 1;
         td.ArraySize = 1;
         td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -160,11 +212,11 @@ void UploadPreviewFrame(WindowImpl* w, const PreviewFrame& f) {
 
         D3D11_SUBRESOURCE_DATA sd;
         ZeroMemory(&sd, sizeof(sd));
-        sd.pSysMem = f.rgba.data();
-        sd.SysMemPitch = static_cast<UINT>(f.width) * 4u;
+        sd.pSysMem = rgba;
+        sd.SysMemPitch = static_cast<UINT>(width) * 4u;
 
-        if (FAILED(w->device->CreateTexture2D(&td, &sd, &w->previewTex)) || !w->previewTex) {
-            w->previewTex = nullptr;
+        if (FAILED(dev->CreateTexture2D(&td, &sd, &t.tex)) || !t.tex) {
+            t.tex = nullptr;
             return;
         }
         D3D11_SHADER_RESOURCE_VIEW_DESC srvd;
@@ -172,17 +224,32 @@ void UploadPreviewFrame(WindowImpl* w, const PreviewFrame& f) {
         srvd.Format = td.Format;
         srvd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
         srvd.Texture2D.MipLevels = 1;
-        if (FAILED(w->device->CreateShaderResourceView(w->previewTex, &srvd, &w->previewSrv))) {
-            ReleasePreviewTexture(w);
+        if (FAILED(dev->CreateShaderResourceView(t.tex, &srvd, &t.srv))) {
+            ReleaseGpuTex(t);
             return;
         }
-        w->previewTexW = f.width;
-        w->previewTexH = f.height;
+        t.w = width;
+        t.h = height;
     } else {
-        // Same size: overwrite the pixels in place (cheap, no realloc).
-        w->context->UpdateSubresource(w->previewTex, 0, nullptr, f.rgba.data(),
-                                      static_cast<UINT>(f.width) * 4u, 0);
+        ctx->UpdateSubresource(t.tex, 0, nullptr, rgba, static_cast<UINT>(width) * 4u, 0);
     }
+}
+
+inline void UploadFrame(WindowImpl* w, GpuTex& t, const PreviewFrame& f) {
+    if (f.valid()) UploadRGBA(w->device, w->context, t, f.rgba.data(), f.width, f.height);
+}
+inline void UploadScope(WindowImpl* w, GpuTex& t, const ScopeImage& s) {
+    if (s.valid()) UploadRGBA(w->device, w->context, t, s.rgba.data(), s.width, s.height);
+}
+
+// Recompute the three scopes from the newest graded preview frame and upload them. Runs on
+// the UI thread; cheap because the preview frame is already decimated to <= 960px.
+void UpdateScopes(WindowImpl* w, const PreviewFrame& f) {
+    if (!f.valid()) return;
+    Histogram hist = computeHistogram(f.rgba.data(), f.width, f.height, 256);
+    UploadScope(w, w->histTex, renderHistogram(hist, 256, 128));
+    UploadScope(w, w->waveTex, renderWaveform(f.rgba.data(), f.width, f.height, 256, 128));
+    UploadScope(w, w->vecTex, renderVectorscope(f.rgba.data(), f.width, f.height, 160));
 }
 
 bool CreateDeviceD3D(WindowImpl* w) {
@@ -263,6 +330,130 @@ void EnsureWindowClass() {
     });
 }
 
+// --- viewer: toolbar + preview + scopes (Phase 4/5) -------------------------
+
+// Compare-mode + scopes toolbar above the preview. Writes the window's UI-state atomics
+// (compareMode, showScopes) + the split position; the effect reads wantsBeforeFrame().
+void DrawViewerToolbar(WindowImpl* w) {
+    int mode = w->compareMode.load();
+    ImGui::TextUnformatted("View:");
+    ImGui::SameLine();
+    if (ImGui::RadioButton("After", mode == 0)) mode = 0;
+    ImGui::SameLine();
+    if (ImGui::RadioButton("Before", mode == 1)) mode = 1;
+    ImGui::SameLine();
+    if (ImGui::RadioButton("Split", mode == 2)) mode = 2;
+    w->compareMode.store(mode);
+
+    ImGui::SameLine();
+    ImGui::Dummy(ImVec2(16, 0));
+    ImGui::SameLine();
+    bool scopes = w->showScopes.load();
+    if (ImGui::Checkbox("Scopes", &scopes)) w->showScopes.store(scopes);
+
+    if (mode == 2) {
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(160.0f);
+        ImGui::SliderFloat("Split", &w->splitFraction, 0.0f, 1.0f, "%.2f");
+    }
+}
+
+// Draw a GpuTex letterboxed into [p0,p1], optionally clipped to a horizontal sub-range
+// [clipX0, clipX1] (for split view). Returns the letterbox dst for divider placement.
+FitRect DrawLetterboxed(ImDrawList* dl, const GpuTex& t, ImVec2 p0, ImVec2 p1,
+                        float clipX0, float clipX1, bool clip) {
+    FitRect fit = letterboxFit(p1.x - p0.x, p1.y - p0.y, t.w, t.h);
+    ImVec2 imgMin(p0.x + fit.x, p0.y + fit.y);
+    ImVec2 imgMax(imgMin.x + fit.w, imgMin.y + fit.h);
+    if (clip) dl->PushClipRect(ImVec2(clipX0, p0.y), ImVec2(clipX1, p1.y), true);
+    dl->AddImage(reinterpret_cast<ImTextureID>(t.srv), imgMin, imgMax);
+    if (clip) dl->PopClipRect();
+    return fit;
+}
+
+// The live preview pane, honouring the before/after/split compare mode.
+void DrawPreviewPane(WindowImpl* w) {
+    ImVec2 avail = ImGui::GetContentRegionAvail();
+    const float scopesReserve = w->showScopes.load() ? 156.0f : 0.0f;
+    float paneH = avail.y - scopesReserve;
+    if (paneH < 60.0f) paneH = 60.0f;
+    ImGui::Dummy(ImVec2(avail.x, paneH));
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImVec2 p0 = ImGui::GetItemRectMin();
+    ImVec2 p1 = ImGui::GetItemRectMax();
+    dl->AddRectFilled(p0, p1, IM_COL32(24, 24, 28, 255));
+
+    const int mode = w->compareMode.load();
+    const bool haveAfter = w->previewTex.ready();
+    const bool haveBefore = w->beforeTex.ready();
+
+    if (!haveAfter && !haveBefore) {
+        const char* label = "Live preview - waiting for frame (scrub the timeline)";
+        ImVec2 ts = ImGui::CalcTextSize(label);
+        dl->AddText(ImVec2((p0.x + p1.x - ts.x) * 0.5f, (p0.y + p1.y - ts.y) * 0.5f),
+                    IM_COL32(150, 150, 160, 255), label);
+        return;
+    }
+
+    auto tag = [&](const char* s, float x0, float x1, float y) {
+        ImVec2 ts = ImGui::CalcTextSize(s);
+        dl->AddText(ImVec2((x0 + x1 - ts.x) * 0.5f, y + 4.0f), IM_COL32(210, 210, 220, 255), s);
+    };
+
+    if (mode == 1) {  // BeforeOnly (fall back to after if the before frame isn't in yet)
+        const GpuTex& t = haveBefore ? w->beforeTex : w->previewTex;
+        DrawLetterboxed(dl, t, p0, p1, 0, 0, false);
+        tag(haveBefore ? "Before (original)" : "Before (pending)", p0.x, p1.x, p0.y);
+    } else if (mode == 2 && haveBefore && haveAfter) {  // Split
+        // Both frames share the clip dimensions -> one letterbox rect; the divider splits it.
+        SplitGeometry g = splitViewGeometry(p1.x - p0.x, p1.y - p0.y, w->previewTex.w,
+                                            w->previewTex.h, w->splitFraction);
+        const float dstX0 = p0.x + g.dst.x;
+        const float dstX1 = p0.x + g.dst.x + g.dst.w;
+        const float splitX = p0.x + g.splitX;
+        DrawLetterboxed(dl, w->beforeTex, p0, p1, dstX0, splitX, true);   // before: left
+        DrawLetterboxed(dl, w->previewTex, p0, p1, splitX, dstX1, true);  // after: right
+        dl->AddLine(ImVec2(splitX, p0.y + g.dst.y), ImVec2(splitX, p0.y + g.dst.y + g.dst.h),
+                    IM_COL32(255, 255, 255, 200), 1.5f);
+        tag("Before", dstX0, splitX, p0.y);
+        tag("After", splitX, dstX1, p0.y);
+    } else {  // AfterOnly (default), or Split before the before frame arrives
+        DrawLetterboxed(dl, w->previewTex, p0, p1, 0, 0, false);
+    }
+}
+
+// The scopes strip below the preview: waveform | histogram | vectorscope, each a GPU
+// texture drawn with AddImage (the same GPU path as the preview).
+void DrawScopesStrip(WindowImpl* w) {
+    ImGui::Spacing();
+    ImVec2 avail = ImGui::GetContentRegionAvail();
+    const float h = 140.0f;
+    const float gap = 8.0f;
+    // Vectorscope is square (h x h); the remaining width splits between waveform + histogram.
+    const float squareW = h;
+    float wide = (avail.x - squareW - gap * 2.0f) * 0.5f;
+    if (wide < 40.0f) wide = 40.0f;
+
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImVec2 base = ImGui::GetCursorScreenPos();
+
+    auto panel = [&](const GpuTex& t, const char* label, float x, float wpx) {
+        ImVec2 a(x, base.y), b(x + wpx, base.y + h);
+        dl->AddRectFilled(a, b, IM_COL32(16, 16, 20, 255));
+        dl->AddRect(a, b, IM_COL32(70, 70, 80, 255));
+        if (t.ready()) {
+            FitRect fit = letterboxFit(wpx, h, t.w, t.h);
+            ImVec2 mn(a.x + fit.x, a.y + fit.y), mx(mn.x + fit.w, mn.y + fit.h);
+            dl->AddImage(reinterpret_cast<ImTextureID>(t.srv), mn, mx);
+        }
+        dl->AddText(ImVec2(a.x + 4, a.y + 2), IM_COL32(180, 180, 190, 255), label);
+    };
+    panel(w->waveTex, "Waveform", base.x, wide);
+    panel(w->histTex, "Histogram", base.x + wide + gap, wide);
+    panel(w->vecTex, "Vectorscope", base.x + wide * 2 + gap * 2, squareW);
+    ImGui::Dummy(ImVec2(avail.x, h));
+}
+
 // --- the per-window UI content (the editor's controls) ----------------------
 
 const char* const kFootageNames[] = {"Rec.709 (standard)", "V-Log"};
@@ -305,11 +496,24 @@ void DrawEditorUI(WindowImpl* w, ParamSnapshot& ui) {
                 w->edits.push({EditField::FootageProfile, static_cast<double>(ui.footageProfile)});
             }
             ImGui::Spacing();
-            ImGui::BeginDisabled();
-            ImGui::Button("Analyze frame");  // in-effect analysis: Phase 5
-            ImGui::EndDisabled();
+            // In-effect multi-frame analysis (Phase 5): "Analyze" forces a re-run; the
+            // idle hook also auto-analyses when the footage profile changes. The status
+            // reflects the effect's live analysis driver.
+            if (ImGui::Button("Analyze clip")) w->analyzeRequested.store(true);
             ImGui::SameLine();
-            ImGui::TextDisabled("(analysis: Phase 5)");
+            AnalysisStatus st = w->readStatus();
+            if (st.state == AnalysisStatus::State::Sampling) {
+                ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f), "Analyzing %d/%d...",
+                                   st.sampled, st.total);
+            } else if (st.state == AnalysisStatus::State::Analyzed) {
+                ImGui::TextColored(ImVec4(0.4f, 0.9f, 0.5f, 1.0f),
+                                   st.fromCache ? "Analyzed (cached)" : "Analyzed");
+            } else {
+                ImGui::TextDisabled("Not analyzed");
+            }
+            ImGui::Spacing();
+            ImGui::TextWrapped("Analysis samples several frames across the clip and adapts "
+                               "the Auto grade to the whole shot.");
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem("Grade")) {
@@ -357,29 +561,11 @@ void DrawEditorUI(WindowImpl* w, ParamSnapshot& ui) {
 
     ImGui::SameLine();
 
-    // Live preview (Phase 4): the effect's AEGP idle hook checks out the layer frame
-    // DOWNSTREAM of this effect (decode + grade already applied - the pipeline invariant
-    // holds), copies it into a PreviewFrame, and publishes it here; the UI thread uploads
-    // it to previewTex. Draw it centered + letterboxed inside the preview pane; fall back
-    // to the placeholder until the first frame arrives.
-    ImGui::BeginChild("preview", ImVec2(0, 0), true);
-    ImVec2 avail = ImGui::GetContentRegionAvail();
-    ImGui::Dummy(ImVec2(avail.x, avail.y - 28.0f));
-    ImDrawList* dl = ImGui::GetWindowDrawList();
-    ImVec2 p0 = ImGui::GetItemRectMin();
-    ImVec2 p1 = ImGui::GetItemRectMax();
-    dl->AddRectFilled(p0, p1, IM_COL32(24, 24, 28, 255));
-    if (w->previewSrv && w->previewTexW > 0 && w->previewTexH > 0) {
-        FitRect fit = letterboxFit(p1.x - p0.x, p1.y - p0.y, w->previewTexW, w->previewTexH);
-        ImVec2 imgMin(p0.x + fit.x, p0.y + fit.y);
-        ImVec2 imgMax(imgMin.x + fit.w, imgMin.y + fit.h);
-        dl->AddImage(reinterpret_cast<ImTextureID>(w->previewSrv), imgMin, imgMax);
-    } else {
-        const char* label = "Live preview - waiting for frame (scrub the timeline)";
-        ImVec2 ts = ImGui::CalcTextSize(label);
-        dl->AddText(ImVec2((p0.x + p1.x - ts.x) * 0.5f, (p0.y + p1.y - ts.y) * 0.5f),
-                    IM_COL32(150, 150, 160, 255), label);
-    }
+    // Right pane: a compare-mode + scopes toolbar, then the live preview, then the scopes.
+    ImGui::BeginChild("viewer", ImVec2(0, 0), true);
+    DrawViewerToolbar(w);
+    DrawPreviewPane(w);
+    if (w->showScopes.load()) DrawScopesStrip(w);
     ImGui::EndChild();
 
     ImGui::End();
@@ -444,10 +630,17 @@ void RunWindowThread(WindowImpl* w, ParamSnapshot seed) {
         ParamSnapshot latest = w->readSnapshot();
         if (latest.revision > ui.revision && !ImGui::IsAnyItemActive()) ui = latest;
 
-        // Upload the newest live-preview frame (if the effect published one) into the
-        // GPU texture before drawing. Only touches D3D on this UI thread.
+        // Upload the newest live-preview frame (if the effect published one) into the GPU
+        // texture, and recompute the scopes from it, before drawing. Only touches D3D on
+        // this UI thread. The before frame (Phase 5) uploads the same way.
         if (auto frame = w->takePendingPreview()) {
-            if (frame->valid()) UploadPreviewFrame(w, *frame);
+            if (frame->valid()) {
+                UploadFrame(w, w->previewTex, *frame);
+                UpdateScopes(w, *frame);  // scopes read the graded output (decode invariant)
+            }
+        }
+        if (auto before = w->takePendingBefore()) {
+            if (before->valid()) UploadFrame(w, w->beforeTex, *before);
         }
 
         ImGui_ImplDX11_NewFrame();
@@ -462,7 +655,11 @@ void RunWindowThread(WindowImpl* w, ParamSnapshot seed) {
         w->swapChain->Present(1, 0);  // vsync-paced; ~cheap when idle
     }
 
-    ReleasePreviewTexture(w);
+    ReleaseGpuTex(w->previewTex);
+    ReleaseGpuTex(w->beforeTex);
+    ReleaseGpuTex(w->waveTex);
+    ReleaseGpuTex(w->histTex);
+    ReleaseGpuTex(w->vecTex);
     ImGui_ImplDX11_Shutdown();
     ImGui_ImplWin32_Shutdown();
     ImGui::DestroyContext(w->imguiCtx);
@@ -553,12 +750,38 @@ void EditorHost::publishPreviewFrame(InstanceKey key, std::shared_ptr<const Prev
     if (it != g_windows.end()) it->second->writePreview(std::move(frame));
 }
 
+void EditorHost::publishBeforeFrame(InstanceKey key, std::shared_ptr<const PreviewFrame> frame) {
+    std::lock_guard<std::mutex> lk(g_mapMutex);
+    ReapFinishedLocked();
+    auto it = g_windows.find(key);
+    if (it != g_windows.end()) it->second->writeBefore(std::move(frame));
+}
+
+void EditorHost::publishAnalysisStatus(InstanceKey key, const AnalysisStatus& status) {
+    std::lock_guard<std::mutex> lk(g_mapMutex);
+    ReapFinishedLocked();
+    auto it = g_windows.find(key);
+    if (it != g_windows.end()) it->second->writeStatus(status);
+}
+
 std::vector<ParamEdit> EditorHost::drainEdits(InstanceKey key) {
     std::lock_guard<std::mutex> lk(g_mapMutex);
     ReapFinishedLocked();
     auto it = g_windows.find(key);
     if (it != g_windows.end()) return it->second->edits.drain();
     return {};
+}
+
+bool EditorHost::wantsBeforeFrame(InstanceKey key) {
+    std::lock_guard<std::mutex> lk(g_mapMutex);
+    auto it = g_windows.find(key);
+    return it != g_windows.end() && it->second->compareMode.load() != 0;
+}
+
+bool EditorHost::consumeAnalyzeRequest(InstanceKey key) {
+    std::lock_guard<std::mutex> lk(g_mapMutex);
+    auto it = g_windows.find(key);
+    return it != g_windows.end() && it->second->analyzeRequested.exchange(false);
 }
 
 std::vector<InstanceKey> EditorHost::openKeys() {
@@ -616,7 +839,11 @@ EditorHost::~EditorHost() {}
 void EditorHost::open(InstanceKey, const ParamSnapshot&) {}
 void EditorHost::publishSnapshot(InstanceKey, const ParamSnapshot&) {}
 void EditorHost::publishPreviewFrame(InstanceKey, std::shared_ptr<const PreviewFrame>) {}
+void EditorHost::publishBeforeFrame(InstanceKey, std::shared_ptr<const PreviewFrame>) {}
+void EditorHost::publishAnalysisStatus(InstanceKey, const AnalysisStatus&) {}
 std::vector<ParamEdit> EditorHost::drainEdits(InstanceKey) { return {}; }
+bool EditorHost::wantsBeforeFrame(InstanceKey) { return false; }
+bool EditorHost::consumeAnalyzeRequest(InstanceKey) { return false; }
 std::vector<InstanceKey> EditorHost::openKeys() { return {}; }
 bool EditorHost::hasPendingEdits(InstanceKey) { return false; }
 bool EditorHost::consumeCloseRequest(InstanceKey) { return false; }

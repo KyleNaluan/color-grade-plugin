@@ -30,6 +30,7 @@
 #endif
 
 #include "ColorGrade.h"
+#include "editor/Analysis.h"  // Phase 5: pure multi-frame analysis schedule/job/debounce
 
 #include <algorithm>
 #include <atomic>
@@ -140,6 +141,63 @@ struct PreviewDriver {
     bool                     hasLast = false;
 };
 static std::map<cg::editor::InstanceKey, PreviewDriver> g_previewDrivers;
+
+// --- Phase 5 in-effect analysis + before/after driver state ------------------
+//
+// The idle hook analyses the clip by sampling several frames UPSTREAM of this effect
+// (AEGP_NewFromUpstreamOfEffect - the RAW footage), decoding each to Rec.709 via the
+// footage profile (the SAME decode the Auto bake composes, so measured stats and the
+// applied grade agree; V-Log is never analysed as raw log), and running the ported
+// cg::core::computeStats over the union. Work is spread ONE frame per idle tick so a
+// multi-frame job never stalls AE; a footage-profile change is debounced so a rapid
+// toggle doesn't thrash checkouts. The measured stats are injected over the recipe's
+// sourceStats at render (g_analyzedStats), so the Auto grade adapts to the real clip.
+#define CG_ANALYSIS_FRAMES        8       // frames sampled evenly across the clip's span
+#define CG_ANALYSIS_PIXEL_BUDGET  240000  // total decoded pixels fed to computeStats
+#define CG_ANALYSIS_DEBOUNCE      5       // idle ticks a footage change must be stable
+#define CG_ANALYSIS_DOWNSAMPLE    2       // AE-side downsample for the analysis checkout
+#define CG_ANALYSIS_CACHE_CAP     6       // remembered (fingerprint -> stats) results
+#define CG_BEFORE_CACHE_CAP       8       // before-frame LRU (decoded originals for split view)
+
+// Analyzed source stats for an instance (written by the idle-hook analysis on the main
+// thread, read at render on render threads - hence the mutex). Injected over the recipe's
+// sourceStats when the footage profile still matches what was analysed.
+struct AnalyzedStats {
+    bool                            valid = false;
+    cg::editor::AnalysisFingerprint fp;
+    cg::core::StatsData             stats;
+};
+static std::mutex g_analyzedMutex;
+static std::map<cg::editor::InstanceKey, AnalyzedStats> g_analyzedStats;
+
+// Per-instance analysis runtime (idle hook / main thread only, so no mutex): the debounce
+// gate, the incremental job, and a small results cache so re-selecting a previously
+// analysed footage profile is instant (no re-run).
+struct AnalysisRuntime {
+    cg::editor::AnalysisDebounce debounce{CG_ANALYSIS_DEBOUNCE};
+    cg::editor::AnalysisJob      job;
+    // Tiny fingerprint->stats cache (linear; cap is small). front = most-recently-used.
+    std::vector<std::pair<cg::editor::AnalysisFingerprint, cg::core::StatsData>> cache;
+    // Before/after: LRU of decoded original frames keyed by (time + footage fingerprint).
+    cg::editor::PreviewCache beforeCache{CG_BEFORE_CACHE_CAP};
+    cg::editor::PreviewKey   beforeLastKey;
+    bool                     beforeHasLast = false;
+
+    const cg::core::StatsData* cacheFind(const cg::editor::AnalysisFingerprint& fp) {
+        for (auto& kv : cache)
+            if (kv.first == fp) return &kv.second;
+        return nullptr;
+    }
+    void cachePut(const cg::editor::AnalysisFingerprint& fp, const cg::core::StatsData& s) {
+        for (auto it = cache.begin(); it != cache.end(); ++it) {
+            if (it->first == fp) { it->second = s; return; }
+        }
+        cache.insert(cache.begin(), {fp, s});
+        if (cache.size() > CG_ANALYSIS_CACHE_CAP) cache.pop_back();
+    }
+};
+static std::map<cg::editor::InstanceKey, AnalysisRuntime> g_analysisRuntime;
+static std::atomic<uint64_t> g_idleTick{0};  // monotonic idle-hook tick for the debounce
 
 // Flat POD sequence data: just a stable per-instance uid for the window registry.
 #define CG_SEQ_MAGIC   0x43475351u  // 'CGSQ'
@@ -443,6 +501,22 @@ static RecipeData RecipeFromHandle(PF_InData* in_data, PF_ArbitraryH h) {
     return cg::core::recipeFromTheme(th, th.targetStats);
 }
 
+// Phase 5: override the recipe's placeholder sourceStats with the in-effect analysis for
+// this instance, when it exists AND still matches the current footage decode. This is what
+// makes the Auto grade adapt to the real clip: the idle-hook analysis measures the decoded
+// footage and stores it in g_analyzedStats; render reads it here (mutex-guarded, since the
+// idle hook writes on the main thread and render runs on render threads). A footage-profile
+// change invalidates the match until the (debounced) re-analysis completes, so stale stats
+// from the other decode are never applied.
+static void InjectAnalyzedStats(cg::editor::InstanceKey key, A_long footage, RecipeData& recipe) {
+    std::lock_guard<std::mutex> lk(g_analyzedMutex);
+    auto it = g_analyzedStats.find(key);
+    if (it != g_analyzedStats.end() && it->second.valid &&
+        it->second.fp.footageProfile == static_cast<int>(footage)) {
+        recipe.sourceStats = it->second.stats;
+    }
+}
+
 // Resolve the LUT + post-blend for a frame from the resolved param values. Auto
 // bakes natively (strength baked in); embedded/external keep the Phase 1 blend.
 static void ResolveRenderData(PF_InData* in_data, A_long source, A_long themePopup, A_long footagePopup,
@@ -626,6 +700,14 @@ static void ForgetEffectContextForKey(cg::editor::InstanceKey key) {
     g_effectCtx.erase(key);  // nothing owned to dispose - only stable ids are stored
 }
 
+// Drop all Phase 5 per-instance state for a closed/deleted window (analysis runtime +
+// the cross-thread analyzed stats). Main-thread only, alongside the preview-driver erase.
+static void ForgetAnalysisStateForKey(cg::editor::InstanceKey key) {
+    g_analysisRuntime.erase(key);
+    std::lock_guard<std::mutex> lk(g_analyzedMutex);
+    g_analyzedStats.erase(key);
+}
+
 // Re-resolve the CURRENT comp handle for a stored comp project-item id by walking the live
 // project's item list (AEGP_GetFirstProjItem/AEGP_GetNextProjItem). A deleted comp is not in
 // that list (it zombies in the undo buffer, off the live tree), so this returns null exactly
@@ -679,6 +761,7 @@ static void CloseDuplicateWindowsForEffect(AEGP_SuiteHandler& sh, PF_ProgPtr eff
         g_lastPolled.erase(k);
         g_verifyFailures.erase(k);
         g_previewDrivers.erase(k);
+        ForgetAnalysisStateForKey(k);
     }
 }
 
@@ -946,6 +1029,299 @@ static void DrivePreviewForKey(AEGP_SuiteHandler& sh, cg::editor::InstanceKey ke
     drv.hasLast = true;
 }
 
+/* ============= Phase 5: in-effect analysis + before/after (AEGP) =========== */
+//
+// All of this runs on AE's main thread from the idle hook (AEGP_NewFromUpstreamOfEffect is
+// UI-thread only, exactly like the Phase 4 downstream checkout). It NEVER runs on the
+// editor window's own D3D UI thread, so the editor stays responsive; and each idle tick
+// does at most ONE upstream checkout, so AE stays responsive across a multi-frame job.
+
+// Check out the layer frame UPSTREAM of this effect (the raw footage input) at `atTime`
+// (or the seeded current time when atTime is null), as a 32-bit float world, and hand the
+// pixels to `fn(base, w, h, rowBytes)`. The receipt is checked back in unconditionally via
+// ScopedCheckin (a leaked checkout destabilizes AE - load-bearing). Returns false on any
+// AEGP failure. UI/idle-thread only.
+template <typename Fn>
+static bool WithUpstreamFloatFrame(AEGP_SuiteHandler& sh, AEGP_EffectRefH effectH,
+                                   const cg::editor::SampleTime* atTime, int downsample, Fn&& fn) {
+    AEGP_LayerRenderOptionsSuite2* lro = sh.LayerRenderOptionsSuite2();
+    AEGP_LayerRenderOptionsH optsH = nullptr;
+    if (lro->AEGP_NewFromUpstreamOfEffect(g_aegpId, effectH, &optsH) || !optsH) return false;
+    bool disposed = false;
+    auto dispose = [&] {
+        if (!disposed) { lro->AEGP_Dispose(optsH); disposed = true; }
+    };
+    if (atTime) {
+        A_Time t;
+        AEFX_CLR_STRUCT(t);
+        t.value = static_cast<A_long>(atTime->value);
+        t.scale = static_cast<A_u_long>(atTime->scale ? atTime->scale : 1);
+        if (lro->AEGP_SetTime(optsH, t)) { dispose(); return false; }
+    }
+    lro->AEGP_SetWorldType(optsH, AEGP_WorldType_32);
+    if (downsample > 1) lro->AEGP_SetDownsampleFactor(optsH, downsample, downsample);
+
+    AEGP_FrameReceiptH receiptH = nullptr;
+    if (sh.RenderSuite5()->AEGP_RenderAndCheckoutLayerFrame(optsH, nullptr, nullptr, &receiptH) ||
+        !receiptH) {
+        dispose();
+        return false;
+    }
+    auto checkin = cg::editor::makeScopedCheckin(
+        [&] { sh.RenderSuite5()->AEGP_CheckinFrame(receiptH); });
+
+    AEGP_WorldH worldH = nullptr;
+    if (sh.RenderSuite5()->AEGP_GetReceiptWorld(receiptH, &worldH) || !worldH) { dispose(); return false; }
+    AEGP_WorldSuite3* ws = sh.WorldSuite3();
+    AEGP_WorldType wt = AEGP_WorldType_NONE;
+    if (ws->AEGP_GetType(worldH, &wt) || wt != AEGP_WorldType_32) { dispose(); return false; }
+    A_long w = 0, h = 0;
+    A_u_long rowBytes = 0;
+    PF_PixelFloat* base = nullptr;
+    if (ws->AEGP_GetSize(worldH, &w, &h) || w <= 0 || h <= 0) { dispose(); return false; }
+    if (ws->AEGP_GetRowBytes(worldH, &rowBytes)) { dispose(); return false; }
+    if (ws->AEGP_GetBaseAddr32(worldH, &base) || !base) { dispose(); return false; }
+
+    fn(static_cast<const PF_PixelFloat*>(base), static_cast<int>(w), static_cast<int>(h),
+       static_cast<size_t>(rowBytes));
+    dispose();
+    return true;  // checkin fires as `checkin` unwinds
+}
+
+// Decode one upstream float pixel to Rec.709 via the footage profile - the SAME decode the
+// Auto bake composes (Rec.709 -> identity, V-Log -> log decode), so measured stats match
+// the applied grade and V-Log is never measured as raw log. Values clamped to [0,1].
+static inline cg::core::Vec3d DecodeUpstreamPixel(const PF_PixelFloat& p, const cg::core::LogProfile& profile) {
+    const cg::core::Vec3d x{cg::core::clamp01(p.red), cg::core::clamp01(p.green),
+                            cg::core::clamp01(p.blue)};
+    return cg::core::decodePixelToRec709(x, profile);
+}
+
+// Append one analysis frame's decoded RGB (decimated to <= perFrameBudget pixels) to `out`.
+static void AppendDecodedFrame(const PF_PixelFloat* base, int w, int h, size_t rowBytes,
+                               const cg::core::LogProfile& profile, int perFrameBudget,
+                               std::vector<float>& out) {
+    const int step = cg::editor::decimationStride(w, h, perFrameBudget);
+    for (int y = 0; y < h; y += step) {
+        const PF_PixelFloat* row =
+            reinterpret_cast<const PF_PixelFloat*>(reinterpret_cast<const uint8_t*>(base) + static_cast<size_t>(y) * rowBytes);
+        for (int x = 0; x < w; x += step) {
+            const cg::core::Vec3d d = DecodeUpstreamPixel(row[x], profile);
+            out.push_back(static_cast<float>(d[0]));
+            out.push_back(static_cast<float>(d[1]));
+            out.push_back(static_cast<float>(d[2]));
+        }
+    }
+}
+
+// Publish the analysis status to the window (Idle / Sampling n/N / Analyzed[+cache]).
+static void PublishAnalysisStatus(cg::editor::InstanceKey key, cg::editor::AnalysisStatus::State st,
+                                  int sampled, int total, bool fromCache) {
+    cg::editor::AnalysisStatus s;
+    s.state = st;
+    s.sampled = sampled;
+    s.total = total;
+    s.fromCache = fromCache;
+    cg::editor::EditorHost::instance().publishAnalysisStatus(key, s);
+}
+
+// Store measured stats for `key`+`fp` and force the active comp to re-render so the Auto
+// grade (and the preview) pick them up. Called on the main thread when a job finalizes or a
+// cached result is reused.
+static void CommitAnalyzedStats(AEGP_SuiteHandler& sh, cg::editor::InstanceKey key,
+                                const cg::editor::AnalysisFingerprint& fp,
+                                const cg::core::StatsData& stats) {
+    {
+        std::lock_guard<std::mutex> lk(g_analyzedMutex);
+        AnalyzedStats& a = g_analyzedStats[key];
+        a.valid = true;
+        a.fp = fp;
+        a.stats = stats;
+    }
+    // Re-render the active item so the new source stats flow into the Auto bake at render.
+    try { sh.AdvItemSuite1()->PF_TouchActiveItem(); } catch (...) { /* best-effort */ }
+}
+
+// Resolve the analysis fingerprint (footage profile + the layer's clip span) for `key`. The
+// layer is re-resolved from the stored stable ids (comp item id + layer id) via the live
+// project tree - the same robust path ResolveLiveEffect uses - so no stale handle is touched.
+// Returns false if the context is missing or the layer timing can't be read.
+static bool ResolveAnalysisFingerprint(AEGP_SuiteHandler& sh, cg::editor::InstanceKey key,
+                                       int footageProfile, cg::editor::AnalysisFingerprint& out) {
+    EffectContext ctx;
+    {
+        std::lock_guard<std::mutex> lk(g_effMutex);
+        auto it = g_effectCtx.find(key);
+        if (it == g_effectCtx.end()) return false;
+        ctx = it->second;
+    }
+    if (ctx.compItemID == 0 || ctx.layerID == AEGP_LayerIDVal_NONE) return false;
+    AEGP_CompH compH = ResolveCompByItemID(sh, ctx.compItemID);
+    if (!compH) return false;
+    AEGP_LayerH layerH = nullptr;
+    if (sh.LayerSuite9()->AEGP_GetLayerFromLayerID(compH, ctx.layerID, &layerH) || !layerH) return false;
+    A_Time inPoint, dur;
+    AEFX_CLR_STRUCT(inPoint);
+    AEFX_CLR_STRUCT(dur);
+    if (sh.LayerSuite9()->AEGP_GetLayerInPoint(layerH, AEGP_LTimeMode_LayerTime, &inPoint)) return false;
+    if (sh.LayerSuite9()->AEGP_GetLayerDuration(layerH, AEGP_LTimeMode_LayerTime, &dur)) return false;
+    out.footageProfile = footageProfile;
+    out.inPointValue = static_cast<int64_t>(inPoint.value);
+    out.durationValue = static_cast<int64_t>(dur.value);
+    out.scale = dur.scale ? static_cast<uint32_t>(dur.scale) : 1u;
+    return true;
+}
+
+// Drive the multi-frame analysis for one open window: debounce a footage change, run the
+// incremental job one frame per tick, finalize with computeStats, and cache/commit the
+// result. Best-effort; any AEGP failure just leaves the prior stats in place.
+static void DriveAnalysisForKey(AEGP_SuiteHandler& sh, cg::editor::InstanceKey key,
+                                AEGP_EffectRefH effectH, const cg::editor::ParamSnapshot& ps,
+                                uint64_t tick) {
+    AnalysisRuntime& rt = g_analysisRuntime[key];
+
+    // A running job takes priority: render its next scheduled frame this tick.
+    if (rt.job.state() == cg::editor::AnalysisState::Sampling) {
+        cg::editor::SampleTime st;
+        if (rt.job.nextSample(st)) {
+            const cg::core::LogProfile& profile = ProfileFromFootagePopup(ps.footageProfile);
+            const int budget = cg::editor::perFramePixelBudget(CG_ANALYSIS_PIXEL_BUDGET,
+                                                               static_cast<int>(rt.job.totalFrames()));
+            std::vector<float> frameRgb;
+            bool ok = WithUpstreamFloatFrame(sh, effectH, &st, CG_ANALYSIS_DOWNSAMPLE,
+                [&](const PF_PixelFloat* base, int w, int h, size_t rb) {
+                    AppendDecodedFrame(base, w, h, rb, profile, budget, frameRgb);
+                });
+            if (ok && !frameRgb.empty()) rt.job.addFrame(frameRgb.data(), frameRgb.size());
+            else rt.job.advanceSkip();
+        }
+        if (rt.job.state() == cg::editor::AnalysisState::Sampling) {
+            PublishAnalysisStatus(key, cg::editor::AnalysisStatus::State::Sampling,
+                                  static_cast<int>(rt.job.sampledFrames()),
+                                  static_cast<int>(rt.job.totalFrames()), false);
+            return;
+        }
+        // Job just finished this tick.
+        if (rt.job.state() == cg::editor::AnalysisState::Ready) {
+            try {
+                cg::core::FootageStats fs = cg::core::computeStats(rt.job.pixels().data(),
+                                                                   rt.job.pixels().size());
+                cg::core::StatsData sd = cg::core::statsToData(fs);
+                rt.cachePut(rt.job.fingerprint(), sd);
+                rt.debounce.accept(rt.job.fingerprint());
+                CommitAnalyzedStats(sh, key, rt.job.fingerprint(), sd);
+                PublishAnalysisStatus(key, cg::editor::AnalysisStatus::State::Analyzed,
+                                      static_cast<int>(rt.job.totalFrames()),
+                                      static_cast<int>(rt.job.totalFrames()), false);
+            } catch (...) { /* computeStats threw (empty) - keep prior stats */ }
+        }
+        rt.job.reset();
+        return;
+    }
+
+    // No job running: decide whether to start one.
+    cg::editor::AnalysisFingerprint fp;
+    if (!ResolveAnalysisFingerprint(sh, key, ps.footageProfile, fp)) return;
+
+    const bool forced = cg::editor::EditorHost::instance().consumeAnalyzeRequest(key);
+
+    // A cached result for this exact fingerprint is reused instantly (unless the user forced
+    // a fresh run) - no re-checkout.
+    if (!forced) {
+        if (const cg::core::StatsData* cached = rt.cacheFind(fp)) {
+            if (!rt.debounce.hasAccepted() || rt.debounce.accepted() != fp) {
+                rt.debounce.accept(fp);
+                CommitAnalyzedStats(sh, key, fp, *cached);
+            }
+            PublishAnalysisStatus(key, cg::editor::AnalysisStatus::State::Analyzed,
+                                  CG_ANALYSIS_FRAMES, CG_ANALYSIS_FRAMES, true);
+            return;
+        }
+    }
+
+    // Debounce a genuine change (or start immediately on an explicit Analyze click).
+    const bool start = forced || rt.debounce.observe(fp, tick);
+    if (start) {
+        rt.job.begin(fp, cg::editor::frameSampleSchedule(fp.inPointValue, fp.durationValue,
+                                                         fp.scale, CG_ANALYSIS_FRAMES));
+        PublishAnalysisStatus(key, cg::editor::AnalysisStatus::State::Sampling, 0,
+                              CG_ANALYSIS_FRAMES, false);
+    } else if (!rt.debounce.hasAccepted()) {
+        PublishAnalysisStatus(key, cg::editor::AnalysisStatus::State::Idle, 0, CG_ANALYSIS_FRAMES,
+                              false);
+    }
+}
+
+// Drive the "before" frame (the decoded ORIGINAL) for the split/before compare modes. Only
+// runs when the window's compare mode needs it. Checks out the upstream frame at the current
+// time, decodes it to Rec.709 (V-Log decoded - never raw log), and publishes it, caching by
+// (time + footage) so toggling compare modes is instant. Best-effort.
+static void DriveBeforeFrameForKey(AEGP_SuiteHandler& sh, cg::editor::InstanceKey key,
+                                   AEGP_EffectRefH effectH, const cg::editor::ParamSnapshot& ps) {
+    if (!cg::editor::EditorHost::instance().wantsBeforeFrame(key)) return;
+
+    // Read the current (seeded) upstream time for the cache key without rendering yet.
+    AEGP_LayerRenderOptionsSuite2* lro = sh.LayerRenderOptionsSuite2();
+    AEGP_LayerRenderOptionsH optsH = nullptr;
+    if (lro->AEGP_NewFromUpstreamOfEffect(g_aegpId, effectH, &optsH) || !optsH) return;
+    A_Time t;
+    AEFX_CLR_STRUCT(t);
+    t.scale = 1;
+    A_Err te = lro->AEGP_GetTime(optsH, &t);
+    lro->AEGP_Dispose(optsH);
+    if (te) return;
+
+    AnalysisRuntime& rt = g_analysisRuntime[key];
+    cg::editor::PreviewKey bk;
+    bk.timeValue = static_cast<int64_t>(t.value);
+    bk.timeScale = t.scale ? static_cast<uint32_t>(t.scale) : 1u;
+    // The before frame depends only on the footage decode, not the grade knobs.
+    bk.paramFingerprint = cg::editor::previewParamFingerprint(ps.footageProfile, 0, 0, 0, 0, 0);
+
+    if (rt.beforeHasLast && rt.beforeLastKey == bk) return;  // already showing this before frame
+    if (auto cached = rt.beforeCache.get(bk)) {
+        cg::editor::EditorHost::instance().publishBeforeFrame(key, cached);
+        rt.beforeLastKey = bk;
+        rt.beforeHasLast = true;
+        return;
+    }
+
+    const cg::core::LogProfile& profile = ProfileFromFootagePopup(ps.footageProfile);
+    auto frame = std::make_shared<cg::editor::PreviewFrame>();
+    bool ok = WithUpstreamFloatFrame(sh, effectH, nullptr, CG_PREVIEW_DOWNSAMPLE,
+        [&](const PF_PixelFloat* base, int w, int h, size_t rb) {
+            const int longSide = w > h ? w : h;
+            int stepd = 1;
+            if (longSide > CG_PREVIEW_MAX_DIM)
+                stepd = (longSide + CG_PREVIEW_MAX_DIM - 1) / CG_PREVIEW_MAX_DIM;
+            const int outW = (w + stepd - 1) / stepd;
+            const int outH = (h + stepd - 1) / stepd;
+            frame->width = outW;
+            frame->height = outH;
+            frame->rgba.assign(static_cast<size_t>(outW) * outH * 4u, 255);
+            for (int y = 0; y < outH; ++y) {
+                const PF_PixelFloat* srcRow = reinterpret_cast<const PF_PixelFloat*>(
+                    reinterpret_cast<const uint8_t*>(base) + static_cast<size_t>(y * stepd) * rb);
+                uint8_t* dstRow = frame->rgba.data() + static_cast<size_t>(y) * outW * 4u;
+                for (int x = 0; x < outW; ++x) {
+                    const cg::core::Vec3d d = DecodeUpstreamPixel(srcRow[x * stepd], profile);
+                    uint8_t* px = dstRow + static_cast<size_t>(x) * 4u;
+                    px[0] = static_cast<uint8_t>(d[0] * 255.0 + 0.5);
+                    px[1] = static_cast<uint8_t>(d[1] * 255.0 + 0.5);
+                    px[2] = static_cast<uint8_t>(d[2] * 255.0 + 0.5);
+                    px[3] = 255;
+                }
+            }
+        });
+    if (ok && frame->valid()) {
+        std::shared_ptr<const cg::editor::PreviewFrame> cf = frame;
+        rt.beforeCache.put(bk, cf);
+        cg::editor::EditorHost::instance().publishBeforeFrame(key, cf);
+        rt.beforeLastKey = bk;
+        rt.beforeHasLast = true;
+    }
+}
+
 // The AEGP idle hook: main thread, fires while AE is idle. Cheap-noops unless a window
 // has pending edits, so it never burdens AE. Applies drained edits inside one undo
 // group per tick, polls Effect Controls -> window on change, and reaps effect refs
@@ -953,6 +1329,7 @@ static void DrivePreviewForKey(AEGP_SuiteHandler& sh, cg::editor::InstanceKey ke
 static A_Err CG_IdleHook(AEGP_GlobalRefcon, AEGP_IdleRefcon, A_long* max_sleepPL) {
     auto& host = cg::editor::EditorHost::instance();
     std::vector<cg::editor::InstanceKey> keys = host.openKeys();
+    const uint64_t tick = g_idleTick.fetch_add(1);  // monotonic tick for the analysis debounce
 
     // Forget captured context whose window is gone (user closed it). No AEGP handle to
     // dispose (layerH is not owned); this just frees the map slot.
@@ -969,6 +1346,7 @@ static A_Err CG_IdleHook(AEGP_GlobalRefcon, AEGP_IdleRefcon, A_long* max_sleepPL
             g_lastPolled.erase(k);
             g_verifyFailures.erase(k);
             g_previewDrivers.erase(k);  // free the closed window's cached preview frames
+            ForgetAnalysisStateForKey(k);
         }
     }
 
@@ -995,6 +1373,7 @@ static A_Err CG_IdleHook(AEGP_GlobalRefcon, AEGP_IdleRefcon, A_long* max_sleepPL
                 g_lastPolled.erase(k);
                 g_verifyFailures.erase(k);
                 g_previewDrivers.erase(k);
+                ForgetAnalysisStateForKey(k);
             };
             AEGP_EffectRefH effectH = nullptr;
             EffectResolution res = EffectResolution::CannotVerify;
@@ -1073,6 +1452,28 @@ static A_Err CG_IdleHook(AEGP_GlobalRefcon, AEGP_IdleRefcon, A_long* max_sleepPL
                 AEGP_SuiteHandler sh(g_spbasic);
                 DrivePreviewForKey(sh, key, effectH);
             } catch (...) { /* swallow: preview must never destabilize AE */ }
+
+            // The current params for the analysis / before-frame drivers (the poll above
+            // keeps g_lastPolled[key] up to date; default snapshot if not yet polled).
+            cg::editor::ParamSnapshot cur;
+            {
+                auto it = g_lastPolled.find(key);
+                if (it != g_lastPolled.end()) cur = it->second;
+            }
+
+            // In-effect analysis (Phase 5): debounced multi-frame source-stats measurement,
+            // one upstream checkout per tick. Guarded independently.
+            try {
+                AEGP_SuiteHandler sh(g_spbasic);
+                DriveAnalysisForKey(sh, key, effectH, cur, tick);
+            } catch (...) { /* swallow: analysis must never destabilize AE */ }
+
+            // Before/after (Phase 5): keep the decoded ORIGINAL frame current for the
+            // split/before compare modes (only when the window asks for it).
+            try {
+                AEGP_SuiteHandler sh(g_spbasic);
+                DriveBeforeFrameForKey(sh, key, effectH, cur);
+            } catch (...) { /* swallow: before frame must never destabilize AE */ }
         }
     }
     // With a window open, poll promptly (sub-second) so EC edits track; otherwise let
@@ -1174,6 +1575,7 @@ static PF_Err SequenceSetdown(PF_InData* in_data, PF_OutData* out_data, PF_Param
     cg::editor::EditorHost::instance().close(key);
     ForgetEffectContextForKey(key);
     g_verifyFailures.erase(key);
+    ForgetAnalysisStateForKey(key);
     if (in_data->sequence_data) {
         PF_DISPOSE_HANDLE(in_data->sequence_data);
         out_data->sequence_data = NULL;
@@ -1380,7 +1782,8 @@ static PF_Err LegacyRender(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef
     const A_long theme = params[CG_THEME]->u.pd.value;
     const A_long footage = params[CG_FOOTAGE_PROFILE]->u.pd.value;
     const A_long source = params[CG_LUT_SOURCE]->u.pd.value;
-    const RecipeData recipe = RecipeFromHandle(in_data, params[CG_RECIPE]->u.arb_d.value);
+    RecipeData recipe = RecipeFromHandle(in_data, params[CG_RECIPE]->u.arb_d.value);
+    InjectAnalyzedStats(SeqKey(in_data), footage, recipe);  // Phase 5: adapt to the analysed clip
     ResolveRenderData(in_data, source, theme, footage, strength01, skin01, chromaGain, recipe, data);
 
     PF_EffectWorld* input = &params[CG_INPUT]->u.ld;
@@ -1440,9 +1843,10 @@ static PF_Err PreRender(PF_InData* in_data, PF_OutData* out_data, PF_PreRenderEx
     // only valid while checked out).
     AEFX_CLR_STRUCT(p);
     ERR(PF_CHECKOUT_PARAM(in_data, CG_RECIPE, in_data->current_time, in_data->time_step, in_data->time_scale, &p));
-    const RecipeData recipe = RecipeFromHandle(in_data, p.u.arb_d.value);
+    RecipeData recipe = RecipeFromHandle(in_data, p.u.arb_d.value);
     ERR2(PF_CHECKIN_PARAM(in_data, &p));
 
+    InjectAnalyzedStats(SeqKey(in_data), footage, recipe);  // Phase 5: adapt to the analysed clip
     ResolveRenderData(in_data, source, theme, footage, strength01, skin01, chromaGain, recipe, *d);
 
     // Mirror the current params into the editor window (if one is open for this

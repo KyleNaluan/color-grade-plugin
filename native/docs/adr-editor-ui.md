@@ -287,6 +287,65 @@ in-flight request. (b) The cache fingerprint keys on time + *our* params; an unr
 change (another effect, a source swap without a time change) can leave the preview stale
 until the next scrub/param nudge. (c) Scopes + before/after are Phase 5.
 
+## Phase 5: in-effect analysis + live scopes + before/after (built on this toolkit)
+
+Phase 5 moves clip **analysis into the effect** (no panel-era plumbing) and adds two pro
+feedback surfaces to the editor window - **live scopes** and a **before/after** compare.
+
+**In-effect multi-frame analysis.** The Auto grade adapts to the real clip by measuring
+its source stats in-effect. The idle hook (main thread - `AEGP_NewFromUpstreamOfEffect` is
+UI-thread-only, exactly like the Phase 4 downstream checkout) samples several frames evenly
+across the layer's duration UPSTREAM of this effect (the RAW footage), decodes each to
+Rec.709 via the footage profile - the **same** `decodePixelToRec709` the Auto bake composes,
+so measured stats and applied grade agree and **V-Log is never analysed as raw log** - and
+runs the ported `cg::core::computeStats` over the union. Work is **incremental: one upstream
+checkout per idle tick**, so a multi-frame job never stalls AE and never runs on the editor
+window's D3D thread. Every checkout is checked back in via `ScopedCheckin` (Phase 4's leak
+discipline). The measured stats live in a process-global keyed by instance
+(`g_analyzedStats`, mutex-guarded: idle hook writes, render threads read) and are injected
+over the recipe's `sourceStats` at render (`InjectAnalyzedStats`), only while the footage
+profile still matches what was analysed. Completion calls **`PF_TouchActiveItem`** (PF
+AdvItemSuite) to force the active comp to re-render so the new grade + preview appear.
+Persisting the analysed stats into the arb-data (project save/reload) is deferred with the
+rest of grade-recipe persistence (issues #11/#12) - re-analysis re-runs cheaply on open.
+
+**Rebake on knob change / debounce.** Analysis re-runs only when an *analysis-relevant*
+input changes - the footage profile or the clip span (the grade knobs change the LUT, not
+the measured source, so a slider drag never triggers a checkout). A change is **debounced**
+(`AnalysisDebounce`, N stable idle ticks) so toggling the footage popup mid-interaction
+doesn't thrash multi-frame checkouts, and a small per-instance **results cache** (fingerprint
+-> stats) makes re-selecting a previously-analysed profile instant. An explicit **Analyze**
+button forces a fresh run.
+
+**Live scopes.** Waveform, histogram, and (cheap) vectorscope are computed on the window's
+UI thread from the **same graded preview frame** the editor already shows (downstream =
+decoded+graded, so the decode invariant holds for scopes too), synthesised into small RGBA8
+images (`Scopes.h`) and drawn as GPU textures with `ImDrawList::AddImage` - the same GPU path
+as the preview, so "GPU-drawn" falls out for free. They refresh whenever a new preview frame
+arrives.
+
+**Before/after.** A toolbar toggles **After / Before / Split**. "Before" is the decoded
+ORIGINAL (the upstream frame decoded to Rec.709 - **never raw log** when Footage=V-Log),
+checked out + decoded on the idle hook only when the compare mode needs it
+(`wantsBeforeFrame`), cached by (time + footage). Split view draws the before frame clipped
+left of a draggable divider and the after frame right of it, both letterboxed to the shared
+clip rect (`splitViewGeometry`); the divider position is a UI slider.
+
+**Testable seams.** All the risky pure logic - the frame-sampling schedule, the incremental
+job state machine, the analysis fingerprint + debounce (`editor/Analysis.h`), the scope
+binning + image synthesis (`editor/Scopes.h`), and the split-view geometry
+(`editor/PreviewCache.h`) - is host-agnostic and proven headlessly by
+`npm run native:analysis-test` and `npm run native:scopes-test` (g++/clang, NOT in CI), plus
+the existing preview/bridge tests. The AEGP checkout + `PF_TouchActiveItem` + D3D uploads are
+captain-verified in AE. All four build configs (Debug/Release x CPU/`--gpu`) compile clean.
+
+**Known limitations / deferred.** (a) `PF_TouchActiveItem` re-renders the *active* item, so
+analysis-completion refresh assumes the analysed comp is frontmost (the normal grading flow);
+(b) analysed stats are not yet persisted to the project (deferred with grade-recipe
+persistence); (c) the multi-instance limitation from Phase 4 (two CG effects on one layer)
+carries over; (d) sync upstream checkout, like the Phase 4 preview, could move to the async
+render variant if analysis latency ever needs it.
+
 ## Consequences
 
 - **Positive:** single-file signed `.aex` stays intact; one UI codebase Win+Mac; the
@@ -387,3 +446,18 @@ and the build is loaded:
    window promptly (no modal, no crash); undo restores the effect and re-opening works;
    deleting the layer or comp, and swapping/removing the source footage, also close the
    window without a stale-ref modal.
+9. **In-effect analysis (Phase 5):** on an ungraded clip in Auto LUT-Source, the Correct
+   tab shows "Analyzing n/N..." then "Analyzed" shortly after opening; the graded look
+   visibly shifts to adapt to the clip (vs the neutral placeholder). Clicking **Analyze**
+   re-runs it. Switching Footage Rec.709 <-> V-Log re-analyses (debounced, no thrash on a
+   fast toggle); switching back shows "Analyzed (cached)" instantly. AE stays responsive
+   throughout (no multi-second stall) - analysis is one checkout per idle tick.
+10. **Analysis is post-decode (Phase 5):** on a V-Log clip, the analysed/adapted grade is
+    sensible (measured on decoded Rec.709), never driven by raw-log stats.
+11. **Live scopes (Phase 5):** waveform / histogram / vectorscope appear below the preview
+    and update as you scrub or change a grade param; toggling **Scopes** hides/shows them.
+    A neutral clip centres the vectorscope; pushing chroma spreads it outward.
+12. **Before/after (Phase 5):** the **After / Before / Split** toggle works; Before shows
+    the decoded original (on V-Log, decoded - not washed-out log), After the graded result,
+    Split shows both across a draggable divider, all correctly letterboxed. The comp/preview
+    updates after analysis completes (active comp re-renders).

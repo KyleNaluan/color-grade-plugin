@@ -33,6 +33,13 @@ linker drops the `.aex` (and, for `--gpu`, the `DirectX_Assets/` folder) into
 **After Effects must be closed before (re)building** - it holds the loaded `.aex` and the
 linker cannot overwrite it (LNK1104).
 
+**Link-verify WITHOUT closing AE** - to compile-verify a change while AE stays open, set
+`CG_OUT_DIR` to a scratch Windows path so the linker drops the `.aex` there instead of the
+locked MediaCore copy: `CG_OUT_DIR='C:\dev\cg-verify-out' native/scripts/build.sh Debug`
+(a WSL `export` does NOT cross to Windows MSBuild, so `build.sh` forwards it as an explicit
+`-p:AE_PLUGIN_BUILD_DIR=`). This only proves compile/link - the scratch `.aex` is not loaded
+by AE; runtime still needs a real MediaCore build + AE relaunch.
+
 **Pre-validation: build all four configs** - `Debug` and `Release`, each with and without
 `--gpu`. A config-gated break (e.g. an `ERR2`/`err2` use whose declaration only exists in one
 config) compiles in one and fails in another, so a single-config build is not proof. When
