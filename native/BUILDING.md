@@ -263,7 +263,9 @@ is ready, verify in AE 2025:
 
 1. **Registers & drags:** AE launched, the effect appears under **Effects & Presets ->
    Color Grade -> "CG Color Grade"**, and drags onto a layer. Effect Controls shows:
-   **Footage** (Rec.709 / V-Log - Correct), **Theme** (25 entries: None (Manual) /
+   **Footage** (a flat 12-entry grouped popup - Standard (Rec.709) first, then cameras
+   alphabetical: "ARRI - LogC3 (EI800)" ... "Sony - S-Log3"; ADR 0004 - Correct),
+   **Theme** (25 entries: None (Manual) /
    Teal-Orange / Warm-Film / Cool-Noir / Reference Match, then the 20-look PR #36
    library), **Strength**, **Skin Protection**, **Chroma Gain**,
    **LUT Source** (Auto / Embedded / External), **Open Editor…** (Phase 3 button), and
@@ -289,9 +291,10 @@ is ready, verify in AE 2025:
    (RTX 3090 + AMD) AE offers only CUDA, so expect the CUDA tracer lines; DirectX would
    engage only on a host that offers it. If it falls back to CPU, adapter/framework
    selection is the suspect - check the `GPUDeviceSetup` trace for which framework AE offered.
-6. **Correct (Footage):** on a V-Log clip, set **Footage** = "V-Log" with LUT Source =
+6. **Correct (Footage):** on a V-Log clip, set **Footage** = "Panasonic - V-Log" (or the
+   matching camera profile for other log footage) with LUT Source =
    "Auto"; the clip is decoded to Rec.709 then graded (looks corrected, not washed-out
-   log). "Rec.709 (standard)" leaves the decode out. (The decode applies in every LUT
+   log). "Standard (Rec.709)" leaves the decode out. (The decode applies in every LUT
    Source mode - Embedded/External resample their raw LUT through it - so V-Log is never
    left undecoded; repeat with LUT Source = "Embedded"/"External" to confirm.)
 7. **Editor window (Phase 3-6c):** click **Open Editor…**; the native editor window opens and

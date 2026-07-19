@@ -178,10 +178,13 @@ continuous write driver (below).
 
 After the captain approved ImGui, the full control set landed on it:
 
-- **Correct tab:** a **Footage** profile popup (Rec.709 / V-Log) - a real, persisted
-  effect param (`CG_FOOTAGE_PROFILE`). It drives a native **decode stage** that applies
-  in **every** LUT Source mode (captain directive - never leave V-Log footage
-  undecoded): pipeline order is always decode-then-LUT. Auto composes `grade(decode(x))`
+- **Correct tab:** a **Footage** profile selector backed by a real, persisted effect
+  param (`CG_FOOTAGE_PROFILE`). Originally a two-entry Rec.709/V-Log popup; multi-camera
+  support (ADR 0004) turned it into a Camera -> Profile cascade in the editor window
+  (never-empty, picking a camera auto-selects its Standard) mirroring the AE flat
+  grouped popup, both derived from the shared `FootageCatalog.h` catalog. It drives a
+  native **decode stage** that applies in **every** LUT Source mode (captain directive -
+  never leave log footage undecoded): pipeline order is always decode-then-LUT. Auto composes `grade(decode(x))`
   into one LUT (continuous, no resample); Embedded/External resample their raw LUT
   through the decode (`rawLut(decode(x))`) - both keep the per-pixel apply a single
   trilinear sample so CPU and GPU stay identical. Rec.709 decodes to itself (no-op).

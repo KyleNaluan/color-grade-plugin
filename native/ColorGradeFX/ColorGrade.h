@@ -47,6 +47,7 @@
 #include "embedded/EmbeddedLut.h"
 #include "core/Recipe.h"   // POD grade recipe (arb-data) + in-effect bake
 #include "core/Themes.h"   // ported shipping themes (getTheme by name)
+#include "core/FootageCatalog.h"  // multi-camera footage-profile catalog (flat popup + cascade)
 #include "editor/EditorWindow.h"  // Phase 3 editor-window host (ImGui spike) + bridge
 
 #define DESCRIPTION "\nApplies a Color Grade (theme + analysis, baked natively). Phase 2 native re-platform."
@@ -79,13 +80,19 @@ enum {
     CG_NUM_PARAMS
 };
 
-// Footage-profile popup order (1-based in AE); maps to cg::core::getProfile keys.
-// Rec.709 = standard (no decode); V-Log decodes to Rec.709 before the grade.
+// Footage-profile popup order (1-based in AE). The canonical camera+log-profile
+// list is data in core/FootageCatalog.h (the mirror of FOOTAGE_PROFILES in
+// src/core/color/index.ts): Standard first, then cameras alphabetical. The popup
+// CHOICES string and num-choices are built from that catalog at ParamsSetup, and
+// ProfileFromFootagePopup / FootageIndexIsLog resolve an index through it, so this
+// enum only names the two indices referenced by name elsewhere. Standard = index
+// 1 = no decode (fresh-apply default). Reordering the catalog is free pre-release
+// (AE keys by index but this param has no project-compat constraint - see the
+// decision doc); the editor Camera->Profile cascade derives from the same catalog.
 enum {
-    CG_FOOT_REC709 = 1,
-    CG_FOOT_VLOG
+    CG_FOOT_REC709 = 1,  // Standard (Rec.709) - always index 1
+    CG_FOOT_VLOG = 11    // Panasonic V-Log - named for the parity/decode default only
 };
-#define CG_FOOTAGE_CHOICES "Rec.709 (standard)|V-Log"
 
 // Theme popup order (1-based in AE); maps to cg::core::getTheme keys. None (Manual)
 // leads the list (captain decision [key=none-first]): a bare AE popup stores its

@@ -34,7 +34,10 @@
 
 #include <cmath>
 
+#include <vector>
+
 #include "Scopes.h"  // Phase 5: waveform / histogram / vectorscope image synthesis
+#include "../core/FootageCatalog.h"  // multi-camera footage-profile catalog (Camera->Profile cascade)
 #include "../core/MonotoneCurve.h"  // Phase 6b: shape-preserving PCHIP for the curve preview
 #include "../core/Lab.h"      // Phase 6c: LAB->RGB for the 3-way tint disc color ring
 #include "../core/Rec709.h"   // Phase 6c: encode the tint ring's linear RGB to display
@@ -781,7 +784,6 @@ bool DrawTintDisc(const char* id, double ab[2], double scale, float radius) {
 
 // --- the per-window UI content (the editor's controls) ----------------------
 
-const char* const kFootageNames[] = {"Rec.709 (standard)", "V-Log"};
 // "Reference Match" (Phase 7) bakes a Theme from a reference-stats sidecar file (no
 // image codec in native/ - see ColorGrade.cpp's LoadReferenceStats / ThemeFromPopup and
 // data/cg-agents-study/report.md sec 1d); falls back to identity (None/Manual) with no
@@ -821,16 +823,41 @@ void DrawEditorUI(WindowImpl* w, ParamSnapshot& ui) {
 
     if (ImGui::BeginTabBar("tabs")) {
         if (ImGui::BeginTabItem("Correct")) {
-            ImGui::TextWrapped("Footage log format. V-Log decodes to Rec.709 before the "
-                               "grade - applied live (this is an effect; no separate "
-                               "Apply step).");
+            ImGui::TextWrapped("Camera log format. A log profile decodes to Rec.709 before "
+                               "the grade - applied live (this is an effect; no separate "
+                               "Apply step). Standard (Rec.709) = no decode.");
             ImGui::Spacing();
-            // --- Footage profile: writes EditField::FootageProfile (1-based, CG_FOOT_*) ---
-            int footIdx = ui.footageProfile - 1;
-            if (footIdx < 0) footIdx = 0;
-            if (footIdx > 1) footIdx = 1;
-            if (ImGui::Combo("Footage", &footIdx, kFootageNames, 2)) {
-                ui.footageProfile = footIdx + 1;
+            // --- Footage profile as a Camera->Profile cascade (decision doc): both combos
+            //     derive from core/FootageCatalog.h and resolve to the flat 1-based popup
+            //     index the effect stores. Picking a camera auto-selects its Standard so the
+            //     Profile dropdown is never empty; the whole cascade writes the same
+            //     EditField::FootageProfile the AE flat popup does. ---
+            cg::core::FootageCascadePos pos = cg::core::footageCascadePosForFlat(ui.footageProfile);
+            std::vector<std::string> cams = cg::core::footageCameras();
+            std::vector<const char*> camPtrs;
+            camPtrs.reserve(cams.size());
+            for (const auto& c : cams) camPtrs.push_back(c.c_str());
+            int camIdx = pos.cameraIndex;
+            if (ImGui::Combo("Camera", &camIdx, camPtrs.data(), static_cast<int>(camPtrs.size()))) {
+                // New camera -> auto-select that camera's Standard (Rec.709) profile.
+                cg::core::FootageCameraProfiles p = cg::core::footageProfilesForCamera(cams[camIdx]);
+                ui.footageProfile = p.flatIndices.front();
+                w->edits.push({EditField::FootageProfile, static_cast<double>(ui.footageProfile)});
+            }
+            // Profile dropdown, filtered to the selected camera (Standard first).
+            cg::core::FootageCameraProfiles profs = cg::core::footageProfilesForCamera(cams[camIdx]);
+            std::vector<const char*> profPtrs;
+            profPtrs.reserve(profs.labels.size());
+            for (const auto& l : profs.labels) profPtrs.push_back(l.c_str());
+            int optIdx = 0;
+            for (size_t i = 0; i < profs.flatIndices.size(); ++i) {
+                if (profs.flatIndices[i] == ui.footageProfile) {
+                    optIdx = static_cast<int>(i);
+                    break;
+                }
+            }
+            if (ImGui::Combo("Profile", &optIdx, profPtrs.data(), static_cast<int>(profPtrs.size()))) {
+                ui.footageProfile = profs.flatIndices[static_cast<size_t>(optIdx)];
                 w->edits.push({EditField::FootageProfile, static_cast<double>(ui.footageProfile)});
             }
             ImGui::Spacing();

@@ -66,7 +66,12 @@ native/
     core/                           C++ port of src/core (the oracle); header-only, dependency-free,
                                     all math in double, narrows to float only where the TS does:
       Mat3.h Rec709.h Vlog.h Lab.h    color math + matrices + LAB
-      LogProfile.h Decode.h           profiles (V-Log/Rec.709) + decode-to-Rec.709
+      LogProfile.h Decode.h           LogProfile seam + decode-to-Rec.709 (getProfile registry)
+      Slog3.h CanonLog.h ArriLogC.h   camera log-profile modules (published curve + gamut primaries),
+      DjiDlog.h BmdFilmGen5.h           mirrored bit-exact from src/core/color/*.ts (ADR 0004)
+      FLog.h NLog.h
+      FootageCatalog.h                ordered UI catalog (Standard first, cameras alphabetical);
+                                        mirrors FOOTAGE_PROFILES, feeds the AE flat popup + editor cascade
       MonotoneCurve.h                 PCHIP tone/shape curves
       Stats.h                         FootageStats + computeStats
       Theme.h Themes.h                Theme type + all 24 registry looks (getTheme-by-name builders, data, transcribed)

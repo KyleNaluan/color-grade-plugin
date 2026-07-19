@@ -72,7 +72,7 @@ The marker makes panel ownership visible in AE's timeline and serves as the reco
 ## Log profile
 
 A pluggable object describing a camera log format: name, decode transfer function, and gamut.
-V-Log (V-Gamut) and standard/Rec.709 are the only implemented profiles for now.
+The registry ships standard/Rec.709 plus 11 camera log profiles - Panasonic V-Log (V-Gamut), Sony S-Log3, Canon C-Log2/C-Log3, ARRI LogC3 (EI800)/LogC4, DJI D-Log, Blackmagic Film Gen5, Fujifilm F-Log/F-Log2, and Nikon N-Log (see ADR 0004).
 The profile's decode function is the single source of truth for log math, consumed both by the analysis engine and by Decode LUT generation.
 
 ## Decode LUT
