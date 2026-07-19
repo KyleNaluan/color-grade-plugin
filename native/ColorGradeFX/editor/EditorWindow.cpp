@@ -33,6 +33,8 @@
 #include "../../third_party/imgui/backends/imgui_impl_dx11.h"
 
 #include <cmath>
+#include <cfloat>
+#include <cstdio>
 
 #include <vector>
 
@@ -133,6 +135,14 @@ struct WindowImpl {
     // Curve editor (Phase 6b), UI-thread only: which control point (if any) is mid-drag
     // per curve [master, R, G, B]; -1 = none. Persists across frames during a drag.
     int               curveDrag[4] = {-1, -1, -1, -1};
+    // cg-ui-polish, all UI-thread only: Curves-tab active channel (0=M,1=R,2=G,3=B); the
+    // collapsible confined-indigo agent dock's expand + BYOK-key state (session-local); and
+    // the agent dock's inner tab. The agent dock is the single Pro/BYOK seam (kAgentDockEnabled).
+    int               curveChannel = 0;
+    bool              agentOpen = false;      // agent dock expanded (default: out of the way)
+    bool              agentKeySet = false;    // a Gemini key was entered this session (BYOK)
+    char              agentKeyBuf[160] = {0}; // key entry buffer (never persisted here)
+    int               agentTab = 0;           // 0 = Critique, 1 = Reference, 2 = Batch
 
     ParamSnapshot readSnapshot() {
         std::lock_guard<std::mutex> lk(snapMutex);
@@ -341,13 +351,255 @@ void EnsureWindowClass() {
     });
 }
 
+// ============================================================================
+// cg-ui-polish - "Darkroom" visual language, ported from the captain-approved
+// mockup (firstmate/data/cg-ui-mockup-final/mockup-final.html). Warm near-black
+// grading world with ONE disciplined brass "safelight" accent; the agent dock is a
+// confined cooler-indigo world (its palette lives in the agent draw code). This is a
+// presentation-layer overhaul: the bridge/edit-push seam and the engine are untouched.
+// ============================================================================
+
+// Warm grading-world palette (mockup :root). ImU32 for ImDrawList; ImVec4 where a style
+// slot or a widget colour is needed.
+constexpr ImU32 COL_BG       = IM_COL32(0x10, 0x0f, 0x0e, 255);
+constexpr ImU32 COL_BG2      = IM_COL32(0x15, 0x13, 0x12, 255);
+constexpr ImU32 COL_PANEL    = IM_COL32(0x19, 0x17, 0x16, 255);
+constexpr ImU32 COL_RAISE    = IM_COL32(0x21, 0x1e, 0x1c, 255);
+constexpr ImU32 COL_RAISE2   = IM_COL32(0x26, 0x22, 0x20, 255);
+constexpr ImU32 COL_LINE     = IM_COL32(0x2b, 0x27, 0x24, 255);
+constexpr ImU32 COL_LINESOFT = IM_COL32(0x22, 0x1f, 0x1d, 255);
+constexpr ImU32 COL_HAIR     = IM_COL32(0x0a, 0x09, 0x08, 255);
+constexpr ImU32 COL_INK      = IM_COL32(0xef, 0xe9, 0xe2, 255);
+constexpr ImU32 COL_INK2     = IM_COL32(0xa4, 0x9c, 0x92, 255);
+constexpr ImU32 COL_INK3     = IM_COL32(0x6f, 0x67, 0x5e, 255);
+constexpr ImU32 COL_INK4     = IM_COL32(0x4a, 0x44, 0x3d, 255);
+constexpr ImU32 COL_BRASS    = IM_COL32(0xc7, 0x9a, 0x5a, 255);
+constexpr ImU32 COL_BRASS2   = IM_COL32(0xe0, 0xbd, 0x7f, 255);
+constexpr ImU32 COL_BRASSDIM = IM_COL32(0x7a, 0x5f, 0x38, 255);
+constexpr ImU32 COL_OK       = IM_COL32(0x5a, 0xa0, 0x66, 255);
+// Confined agent-world palette (indigo signal; never touches a grading surface).
+constexpr ImU32 COL_IRIS     = IM_COL32(0x81, 0x80, 0xf2, 255);
+constexpr ImU32 COL_IRIS2    = IM_COL32(0xb7, 0xb6, 0xfb, 255);
+constexpr ImU32 COL_IRISDIM  = IM_COL32(0x4a, 0x4a, 0x86, 255);
+constexpr ImU32 COL_IRISBG   = IM_COL32(0x14, 0x14, 0x25, 255);
+constexpr ImU32 COL_IRISPANEL= IM_COL32(0x17, 0x17, 0x30, 255);
+constexpr ImU32 COL_IRISRAISE= IM_COL32(0x1f, 0x1f, 0x3a, 255);
+constexpr ImU32 COL_IRISLINE = IM_COL32(0x2d, 0x2d, 0x4c, 255);
+
+inline ImVec4 V4(ImU32 c) {
+    return ImVec4(((c >> IM_COL32_R_SHIFT) & 0xff) / 255.0f, ((c >> IM_COL32_G_SHIFT) & 0xff) / 255.0f,
+                  ((c >> IM_COL32_B_SHIFT) & 0xff) / 255.0f, ((c >> IM_COL32_A_SHIFT) & 0xff) / 255.0f);
+}
+inline ImU32 WithAlpha(ImU32 c, int a) { return (c & 0x00ffffff) | (static_cast<ImU32>(a) << IM_COL32_A_SHIFT); }
+
+// The single Pro/BYOK seam: the entire agent dock (critique / auto-grade / reference /
+// batch) integrates behind this one capability check, per data/cg-monetization-decision.md.
+// Free core (decode/Correct/Basics/curves/wheels/preview/scopes) never depends on it; a
+// later license/entitlement gate flips this flag alone, no refactor. See AGENTS.md.
+constexpr bool kAgentDockEnabled = true;
+
+// Apply the Darkroom style (replaces StyleColorsDark). Rounded, airy, warm; brass is the
+// only accent, reserved for the active/hover grading state.
+void ApplyColorGradeStyle() {
+    ImGuiStyle& s = ImGui::GetStyle();
+    s.WindowRounding = 0.0f;
+    s.ChildRounding = 9.0f;
+    s.FrameRounding = 8.0f;
+    s.GrabRounding = 8.0f;
+    s.PopupRounding = 8.0f;
+    s.TabRounding = 8.0f;
+    s.ScrollbarRounding = 8.0f;
+    s.WindowBorderSize = 0.0f;
+    s.ChildBorderSize = 1.0f;
+    s.FrameBorderSize = 1.0f;
+    s.WindowPadding = ImVec2(12, 12);
+    s.FramePadding = ImVec2(9, 5);
+    s.ItemSpacing = ImVec2(8, 8);
+    s.ItemInnerSpacing = ImVec2(7, 5);
+    s.ScrollbarSize = 11.0f;
+    s.GrabMinSize = 11.0f;
+
+    ImVec4* c = s.Colors;
+    c[ImGuiCol_WindowBg]           = V4(COL_BG);
+    c[ImGuiCol_ChildBg]            = V4(COL_PANEL);
+    c[ImGuiCol_PopupBg]            = V4(COL_RAISE);
+    c[ImGuiCol_Border]             = V4(COL_LINE);
+    c[ImGuiCol_FrameBg]            = V4(COL_RAISE);
+    c[ImGuiCol_FrameBgHovered]     = V4(COL_RAISE2);
+    c[ImGuiCol_FrameBgActive]      = V4(COL_RAISE2);
+    c[ImGuiCol_Text]               = V4(COL_INK);
+    c[ImGuiCol_TextDisabled]       = V4(COL_INK3);
+    c[ImGuiCol_Button]             = V4(COL_RAISE);
+    c[ImGuiCol_ButtonHovered]      = V4(COL_RAISE2);
+    c[ImGuiCol_ButtonActive]       = V4(COL_BRASSDIM);
+    c[ImGuiCol_Header]             = V4(COL_RAISE2);
+    c[ImGuiCol_HeaderHovered]      = V4(COL_RAISE2);
+    c[ImGuiCol_HeaderActive]       = V4(COL_BRASSDIM);
+    c[ImGuiCol_CheckMark]          = V4(COL_BRASS2);
+    c[ImGuiCol_SliderGrab]         = V4(COL_INK2);
+    c[ImGuiCol_SliderGrabActive]   = V4(COL_BRASS);
+    c[ImGuiCol_Tab]                = V4(COL_PANEL);
+    c[ImGuiCol_TabHovered]         = V4(COL_RAISE2);
+    c[ImGuiCol_TabActive]          = V4(COL_BG2);
+    c[ImGuiCol_TabUnfocused]       = V4(COL_PANEL);
+    c[ImGuiCol_TabUnfocusedActive] = V4(COL_BG2);
+    c[ImGuiCol_TitleBg]            = V4(COL_BG);
+    c[ImGuiCol_TitleBgActive]      = V4(COL_BG);
+    c[ImGuiCol_ScrollbarBg]        = V4(COL_BG2);
+    c[ImGuiCol_ScrollbarGrab]      = V4(COL_RAISE);
+    c[ImGuiCol_ScrollbarGrabHovered] = V4(COL_RAISE2);
+    c[ImGuiCol_Separator]          = V4(COL_LINE);
+    c[ImGuiCol_NavHighlight]       = V4(COL_BRASSDIM);
+}
+
+// A small "reset to default" circular-arrow glyph, drawn with the draw list so it renders
+// regardless of the loaded font (the default ImGui font has no such glyph). Used by the
+// per-control hover reset affordance.
+void DrawResetGlyph(ImDrawList* dl, ImVec2 c, float r, ImU32 col) {
+    dl->PathClear();
+    dl->PathArcTo(c, r, 0.6f, 6.05f, 20);  // ~open ring leaving a gap at the top-right
+    dl->PathStroke(col, 0, 1.4f);
+    // arrowhead at the ring's opening
+    const float a = 0.6f;
+    ImVec2 tip(c.x + std::cos(a) * r, c.y + std::sin(a) * r);
+    dl->AddTriangleFilled(ImVec2(tip.x + 2.6f, tip.y - 1.0f), ImVec2(tip.x - 2.0f, tip.y - 2.8f),
+                          ImVec2(tip.x - 1.2f, tip.y + 2.6f), col);
+}
+
+// The Lumetri/DaVinci-style control row (cg-ui-polish core deliverable): a LINE with a
+// draggable KNOB, a hover-reveal reset arrow, double-click-to-reset (on the track or the
+// value), and a typed value box with legal-range validation. `v` is edited in place; returns
+// true if it changed this frame. `bipolar` draws a centre origin tick and fills from it.
+// `fmt` is a printf format for the value box (may carry a unit / sign, e.g. "%+.2f EV").
+bool SliderRow(const char* label, float* v, float vmin, float vmax, float def,
+               const char* fmt, bool bipolar) {
+    ImGui::PushID(label);
+    ImGuiIO& io = ImGui::GetIO();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const float labelW = 84.0f, valueW = 66.0f, resetW = 16.0f, pad = 8.0f;
+    const float rowH = 22.0f;
+    const float rowW = ImGui::GetContentRegionAvail().x;
+    float trackW = rowW - labelW - valueW - resetW - pad * 3.0f;
+    if (trackW < 32.0f) trackW = 32.0f;
+    const ImVec2 c0 = ImGui::GetCursorScreenPos();
+    const float cy = c0.y + rowH * 0.5f;
+    bool changed = false;
+
+    // label (vertically centred, clipped to its column)
+    dl->PushClipRect(ImVec2(c0.x, c0.y), ImVec2(c0.x + labelW - 4.0f, c0.y + rowH), true);
+    dl->AddText(ImVec2(c0.x, cy - ImGui::GetTextLineHeight() * 0.5f), COL_INK2, label);
+    dl->PopClipRect();
+
+    // track drag region
+    const float tx0 = c0.x + labelW + pad;
+    ImGui::SetCursorScreenPos(ImVec2(tx0, c0.y));
+    ImGui::InvisibleButton("##trk", ImVec2(trackW, rowH));
+    const bool active = ImGui::IsItemActive();
+    const bool trkHovered = ImGui::IsItemHovered();
+    if (active) {
+        float p = (io.MousePos.x - tx0) / trackW;
+        p = p < 0 ? 0 : (p > 1 ? 1 : p);
+        *v = vmin + p * (vmax - vmin);
+        changed = true;
+    }
+    if (trkHovered && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) { *v = def; changed = true; }
+
+    // draw rail / fill / bipolar tick / knob
+    const float span = (vmax - vmin) != 0.0f ? (vmax - vmin) : 1.0f;
+    float p = (*v - vmin) / span;
+    p = p < 0 ? 0 : (p > 1 ? 1 : p);
+    const float origin = bipolar ? (0.0f - vmin) / span : 0.0f;
+    dl->AddLine(ImVec2(tx0, cy), ImVec2(tx0 + trackW, cy), COL_LINE, 1.5f);
+    const float fx0 = tx0 + std::min(origin, p) * trackW;
+    const float fx1 = tx0 + std::max(origin, p) * trackW;
+    dl->AddLine(ImVec2(fx0, cy), ImVec2(fx1, cy), active ? COL_BRASS : COL_BRASSDIM, 2.0f);
+    if (bipolar)
+        dl->AddLine(ImVec2(tx0 + origin * trackW, cy - 4.0f), ImVec2(tx0 + origin * trackW, cy + 4.0f),
+                    COL_INK4, 1.0f);
+    const float kx = tx0 + p * trackW;
+    dl->AddCircleFilled(ImVec2(kx, cy), 6.5f, COL_PANEL);
+    dl->AddCircle(ImVec2(kx, cy), 6.5f, active ? COL_BRASS : (trkHovered ? COL_INK : COL_INK2), 20, 1.8f);
+    if (active) dl->AddCircle(ImVec2(kx, cy), 9.5f, WithAlpha(COL_BRASS, 60), 20, 2.0f);
+
+    // hover-reveal reset arrow (double-click also resets; this is the discoverable affordance)
+    const bool rowHovered = ImGui::IsMouseHoveringRect(c0, ImVec2(c0.x + rowW, c0.y + rowH));
+    const float rstCx = tx0 + trackW + pad + resetW * 0.5f;
+    ImGui::SetCursorScreenPos(ImVec2(rstCx - resetW * 0.5f, cy - resetW * 0.5f));
+    ImGui::InvisibleButton("##rst", ImVec2(resetW, resetW));
+    const bool rstHovered = ImGui::IsItemHovered();
+    if (ImGui::IsItemActivated()) { *v = def; changed = true; }
+    if (rowHovered || rstHovered)
+        DrawResetGlyph(dl, ImVec2(rstCx, cy), 5.5f, rstHovered ? COL_BRASS : WithAlpha(COL_INK2, 210));
+
+    // typed value box with legal-range validation (accepts a number, clamps to [min,max])
+    const float frameH = ImGui::GetFrameHeight();
+    ImGui::SetCursorScreenPos(ImVec2(c0.x + rowW - valueW, c0.y + (rowH - frameH) * 0.5f));
+    ImGui::SetNextItemWidth(valueW);
+    float typed = *v;
+    if (ImGui::InputFloat("##val", &typed, 0.0f, 0.0f, fmt,
+                          ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_AutoSelectAll)) {
+        *v = static_cast<float>(clampRange(typed, vmin, vmax));
+        changed = true;
+    }
+
+    // advance to the next row (InputFloat left the cursor after its frame)
+    ImGui::SetCursorScreenPos(ImVec2(c0.x, c0.y + rowH + 6.0f));
+    ImGui::PopID();
+    return changed;
+}
+
+// A full-width luminance slider with the value centred BENEATH it (captain refinement for the
+// wheels' master control). Same track + knob + typed-entry behaviour as SliderRow, laid out
+// vertically to sit under a colour disc.
+bool WheelLumSlider(const char* id, float* v, float vmin, float vmax, float def,
+                    const char* fmt, float width) {
+    ImGui::PushID(id);
+    ImGuiIO& io = ImGui::GetIO();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const float rowH = 16.0f;
+    const ImVec2 c0 = ImGui::GetCursorScreenPos();
+    const float cy = c0.y + rowH * 0.5f;
+    bool changed = false;
+
+    ImGui::SetCursorScreenPos(c0);
+    ImGui::InvisibleButton("##wtrk", ImVec2(width, rowH));
+    const bool active = ImGui::IsItemActive();
+    const bool hovered = ImGui::IsItemHovered();
+    if (active) {
+        float p = (io.MousePos.x - c0.x) / width;
+        p = p < 0 ? 0 : (p > 1 ? 1 : p);
+        *v = vmin + p * (vmax - vmin);
+        changed = true;
+    }
+    if (hovered && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) { *v = def; changed = true; }
+
+    const float span = (vmax - vmin) != 0.0f ? (vmax - vmin) : 1.0f;
+    float p = (*v - vmin) / span;
+    p = p < 0 ? 0 : (p > 1 ? 1 : p);
+    dl->AddLine(ImVec2(c0.x, cy), ImVec2(c0.x + width, cy), COL_LINE, 1.5f);
+    dl->AddLine(ImVec2(c0.x, cy), ImVec2(c0.x + p * width, cy), active ? COL_BRASS : COL_BRASSDIM, 2.0f);
+    const float kx = c0.x + p * width;
+    dl->AddCircleFilled(ImVec2(kx, cy), 5.5f, COL_PANEL);
+    dl->AddCircle(ImVec2(kx, cy), 5.5f, active ? COL_BRASS : (hovered ? COL_INK : COL_INK2), 18, 1.6f);
+
+    // value centred beneath
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), fmt, *v);
+    const ImVec2 ts = ImGui::CalcTextSize(buf);
+    dl->AddText(ImVec2(c0.x + (width - ts.x) * 0.5f, c0.y + rowH + 1.0f), COL_INK2, buf);
+    ImGui::SetCursorScreenPos(ImVec2(c0.x, c0.y + rowH + ImGui::GetTextLineHeight() + 4.0f));
+    ImGui::PopID();
+    return changed;
+}
+
 // --- viewer: toolbar + preview + scopes (Phase 4/5) -------------------------
 
 // Compare-mode + scopes toolbar above the preview. Writes the window's UI-state atomics
-// (compareMode, showScopes) + the split position; the effect reads wantsBeforeFrame().
+// (compareMode, showScopes). The split position is now set by DIRECTLY dragging the divider
+// in the preview (DrawPreviewPane), matching the mockup - no separate position slider.
 void DrawViewerToolbar(WindowImpl* w) {
     int mode = w->compareMode.load();
-    ImGui::TextUnformatted("View:");
+    ImGui::TextUnformatted("View");
     ImGui::SameLine();
     if (ImGui::RadioButton("After", mode == 0)) mode = 0;
     ImGui::SameLine();
@@ -361,17 +613,9 @@ void DrawViewerToolbar(WindowImpl* w) {
     ImGui::SameLine();
     bool scopes = w->showScopes.load();
     if (ImGui::Checkbox("Scopes", &scopes)) w->showScopes.store(scopes);
-
     if (mode == 2) {
         ImGui::SameLine();
-        ImGui::SetNextItemWidth(160.0f);
-        // Unique ID: the label must differ from the "Split" radio above, or ImGui flags an
-        // ID conflict. "##splitpos" hides the label text (the adjacent radio names it) while
-        // giving the slider its own id. The leading text keeps context visible.
-        ImGui::TextUnformatted("pos");
-        ImGui::SameLine();
-        ImGui::SetNextItemWidth(140.0f);
-        ImGui::SliderFloat("##splitpos", &w->splitFraction, 0.0f, 1.0f, "%.2f");
+        ImGui::TextDisabled("drag the divider to compare");
     }
 }
 
@@ -427,11 +671,35 @@ void DrawPreviewPane(WindowImpl* w) {
                                             w->previewTex.h, w->splitFraction);
         const float dstX0 = p0.x + g.dst.x;
         const float dstX1 = p0.x + g.dst.x + g.dst.w;
+        const float dstY0 = p0.y + g.dst.y;
         const float splitX = p0.x + g.splitX;
         DrawLetterboxed(dl, w->beforeTex, p0, p1, dstX0, splitX, true);   // before: left
         DrawLetterboxed(dl, w->previewTex, p0, p1, splitX, dstX1, true);  // after: right
-        dl->AddLine(ImVec2(splitX, p0.y + g.dst.y), ImVec2(splitX, p0.y + g.dst.y + g.dst.h),
-                    IM_COL32(255, 255, 255, 200), 1.5f);
+
+        // Directly draggable divider (cg-ui-polish): a hit-strip over the split line updates
+        // splitFraction, so the user drags the divider in the preview - not just a slider.
+        const ImVec2 cursorSave = ImGui::GetCursorScreenPos();
+        const float handleW = 24.0f;
+        ImGui::SetCursorScreenPos(ImVec2(splitX - handleW * 0.5f, dstY0));
+        ImGui::InvisibleButton("##splitdrag", ImVec2(handleW, g.dst.h));
+        if (ImGui::IsItemActive() && g.dst.w > 1.0f) {
+            float px = (ImGui::GetIO().MousePos.x - dstX0) / g.dst.w;
+            w->splitFraction = px < 0.0f ? 0.0f : (px > 1.0f ? 1.0f : px);
+        }
+        if (ImGui::IsItemHovered() || ImGui::IsItemActive())
+            ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+        ImGui::SetCursorScreenPos(cursorSave);
+
+        dl->AddLine(ImVec2(splitX, dstY0), ImVec2(splitX, dstY0 + g.dst.h),
+                    IM_COL32(255, 255, 255, 210), 1.5f);
+        // knob on the split line with left/right chevrons
+        const float ky = dstY0 + g.dst.h * 0.5f;
+        dl->AddCircleFilled(ImVec2(splitX, ky), 11.0f, IM_COL32(20, 17, 15, 190), 24);
+        dl->AddCircle(ImVec2(splitX, ky), 11.0f, IM_COL32(255, 255, 255, 220), 24, 1.6f);
+        dl->AddTriangleFilled(ImVec2(splitX - 5.0f, ky), ImVec2(splitX - 1.5f, ky - 3.5f),
+                              ImVec2(splitX - 1.5f, ky + 3.5f), IM_COL32(255, 255, 255, 230));
+        dl->AddTriangleFilled(ImVec2(splitX + 5.0f, ky), ImVec2(splitX + 1.5f, ky - 3.5f),
+                              ImVec2(splitX + 1.5f, ky + 3.5f), IM_COL32(255, 255, 255, 230));
         tag("Before", dstX0, splitX, p0.y);
         tag("After", splitX, dstX1, p0.y);
     } else {  // AfterOnly (default), or Split before the before frame arrives
@@ -798,10 +1066,581 @@ const char* const kThemeNames[] = {
     "Autumn", "Summer Blockbuster", "Muted Teal-Orange", "Monochrome B&W", "Sepia",
     "Cinematic Green", "Desaturated Doc", "Punchy Social", "Cross Process", "Rose Romance"};
 constexpr int kThemeCount = 25;
+constexpr int kThemeReferenceIndex = 5;  // 1-based CG_THEME_REFERENCE (kThemeNames[4])
+// LUT-Source choices are data-driven from this array (count = size), so the in-flight
+// External-cube+Correct/Basics mode (fm/cg-lut-correct-stack, PR #39) can extend/relabel
+// this list on rebase with no layout change. External mode reads a .cube next to the .aex
+// (or env CG_LUT_PATH); the note under the control documents it.
 const char* const kLutSourceNames[] = {"Auto (Theme + Analysis)", "Embedded (Teal-Orange)",
                                        "External .cube file",
                                        "External .cube + Correct/Basics"};
 constexpr int kLutSourceCount = static_cast<int>(sizeof(kLutSourceNames) / sizeof(kLutSourceNames[0]));
+
+// A small uppercase "eyebrow" section label with a trailing hairline (mockup .group>.eyebrow).
+void Eyebrow(const char* text) {
+    ImGui::Dummy(ImVec2(0, 2));
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImVec2 c = ImGui::GetCursorScreenPos();
+    dl->AddText(c, COL_INK3, text);
+    const float tw = ImGui::CalcTextSize(text).x;
+    const float availW = ImGui::GetContentRegionAvail().x;
+    const float ly = c.y + ImGui::GetTextLineHeight() * 0.5f;
+    dl->AddLine(ImVec2(c.x + tw + 9.0f, ly), ImVec2(c.x + availW, ly), COL_LINESOFT, 1.0f);
+    ImGui::Dummy(ImVec2(availW, ImGui::GetTextLineHeight() + 6.0f));
+}
+
+// A soft "note" box (mockup .note) for the explanatory captions under each control group.
+void NoteBox(const char* text) {
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const float wrap = ImGui::GetContentRegionAvail().x;
+    const ImVec2 c = ImGui::GetCursorScreenPos();
+    const float pad = 8.0f;
+    const ImVec2 sz = ImGui::CalcTextSize(text, nullptr, false, wrap - pad * 2.0f);
+    const ImVec2 boxMax(c.x + wrap, c.y + sz.y + pad * 2.0f);
+    dl->AddRectFilled(c, boxMax, COL_HAIR, 7.0f);
+    dl->AddRect(c, boxMax, COL_LINESOFT, 7.0f);
+    dl->AddText(nullptr, 0.0f, ImVec2(c.x + pad, c.y + pad), COL_INK3, text, nullptr, wrap - pad * 2.0f);
+    ImGui::Dummy(ImVec2(wrap, sz.y + pad * 2.0f + 4.0f));
+}
+
+// --- inspector tabs (the Correct / Basics / Grade / Curves / Wheels control set) --------
+
+void DrawCorrectTab(WindowImpl* w, ParamSnapshot& ui) {
+    Eyebrow("FOOTAGE");
+    // Camera -> Profile cascade (both combos derive from core/FootageCatalog.h and resolve to
+    // the flat 1-based popup index the effect stores). Unchanged plumbing; restyled surface.
+    cg::core::FootageCascadePos pos = cg::core::footageCascadePosForFlat(ui.footageProfile);
+    std::vector<std::string> cams = cg::core::footageCameras();
+    std::vector<const char*> camPtrs;
+    camPtrs.reserve(cams.size());
+    for (const auto& c : cams) camPtrs.push_back(c.c_str());
+    int camIdx = pos.cameraIndex;
+    ImGui::TextColored(V4(COL_INK2), "Camera");
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    if (ImGui::Combo("##camera", &camIdx, camPtrs.data(), static_cast<int>(camPtrs.size()))) {
+        cg::core::FootageCameraProfiles p = cg::core::footageProfilesForCamera(cams[camIdx]);
+        ui.footageProfile = p.flatIndices.front();
+        w->edits.push({EditField::FootageProfile, static_cast<double>(ui.footageProfile)});
+    }
+    cg::core::FootageCameraProfiles profs = cg::core::footageProfilesForCamera(cams[camIdx]);
+    std::vector<const char*> profPtrs;
+    profPtrs.reserve(profs.labels.size());
+    for (const auto& l : profs.labels) profPtrs.push_back(l.c_str());
+    int optIdx = 0;
+    for (size_t i = 0; i < profs.flatIndices.size(); ++i)
+        if (profs.flatIndices[i] == ui.footageProfile) { optIdx = static_cast<int>(i); break; }
+    ImGui::TextColored(V4(COL_INK2), "Log / gamma profile");
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    if (ImGui::Combo("##profile", &optIdx, profPtrs.data(), static_cast<int>(profPtrs.size()))) {
+        ui.footageProfile = profs.flatIndices[static_cast<size_t>(optIdx)];
+        w->edits.push({EditField::FootageProfile, static_cast<double>(ui.footageProfile)});
+    }
+    NoteBox("Decode-then-grade. The profile decodes the clip before any grade, so V-Log is "
+            "never handled as raw log. Analysis re-runs on change.");
+
+    ImGui::Dummy(ImVec2(0, 4));
+    if (ImGui::Button("Analyze clip")) w->analyzeRequested.store(true);
+    ImGui::SameLine();
+    AnalysisStatus st = w->readStatus();
+    if (st.state == AnalysisStatus::State::Sampling)
+        ImGui::TextColored(V4(COL_BRASS2), "Analyzing %d/%d...", st.sampled, st.total);
+    else if (st.state == AnalysisStatus::State::Analyzed)
+        ImGui::TextColored(V4(COL_OK), st.fromCache ? "Analyzed (cached)" : "Analyzed");
+    else
+        ImGui::TextDisabled("Not analyzed");
+
+    Eyebrow("REFERENCE MATCH");
+    NoteBox("Match this clip to a still - pure stat transfer, no agent needed. Native reads a "
+            "precomputed .stats sidecar (env CG_REF_STATS_PATH, or ColorGrade_Reference.stats "
+            "next to the plug-in); the image is measured on the TS side.");
+    if (ImGui::Button("Use Reference Match", ImVec2(-FLT_MIN, 0))) {
+        ui.theme = kThemeReferenceIndex;
+        w->edits.push({EditField::Theme, static_cast<double>(ui.theme)});
+    }
+    NoteBox("Sets Theme -> Reference and rides your Basics / Curves / Wheels edits on top. "
+            "The agent's only role here is an optional post-match critique.");
+}
+
+void DrawBasicsTab(WindowImpl* w, ParamSnapshot& ui) {
+    ImGui::PushStyleColor(ImGuiCol_Text, V4(COL_INK3));
+    ImGui::TextWrapped("Manual primary correction, applied before the theme look. Exposure, "
+                       "Look Mix and Temperature are keyframeable in Effect Controls. Uses LUT "
+                       "Source = Auto.");
+    ImGui::PopStyleColor();
+    auto pushManual = [w](ParamSnapshot& s) {
+        ParamEdit e;
+        e.field = EditField::Manual;
+        e.manual = s.manual;
+        w->edits.push(e);
+    };
+
+    Eyebrow("TONE");
+    float exposure = static_cast<float>(ui.exposure);
+    if (SliderRow("Exposure", &exposure, -5.0f, 5.0f, 0.0f, "%+.2f EV", true)) {
+        ui.exposure = exposure;
+        w->edits.push({EditField::Exposure, ui.exposure});
+    }
+    float contrast = static_cast<float>(ui.manual.contrast);
+    if (SliderRow("Contrast", &contrast, -100.0f, 100.0f, 0.0f, "%+.0f", true)) {
+        ui.manual.contrast = contrast; pushManual(ui);
+    }
+    float pivot = static_cast<float>(ui.manual.pivot);
+    if (SliderRow("Pivot", &pivot, 0.05f, 0.95f, 0.435f, "%.3f", false)) {
+        ui.manual.pivot = pivot; pushManual(ui);
+    }
+    float highlights = static_cast<float>(ui.manual.highlights);
+    if (SliderRow("Highlights", &highlights, -100.0f, 100.0f, 0.0f, "%+.0f", true)) {
+        ui.manual.highlights = highlights; pushManual(ui);
+    }
+    float shadows = static_cast<float>(ui.manual.shadows);
+    if (SliderRow("Shadows", &shadows, -100.0f, 100.0f, 0.0f, "%+.0f", true)) {
+        ui.manual.shadows = shadows; pushManual(ui);
+    }
+    float whites = static_cast<float>(ui.manual.whites);
+    if (SliderRow("Whites", &whites, -100.0f, 100.0f, 0.0f, "%+.0f", true)) {
+        ui.manual.whites = whites; pushManual(ui);
+    }
+    float blacks = static_cast<float>(ui.manual.blacks);
+    if (SliderRow("Blacks", &blacks, -100.0f, 100.0f, 0.0f, "%+.0f", true)) {
+        ui.manual.blacks = blacks; pushManual(ui);
+    }
+
+    Eyebrow("COLOR");
+    float temperature = static_cast<float>(ui.temperature);
+    if (SliderRow("Temperature", &temperature, -100.0f, 100.0f, 0.0f, "%+.0f", true)) {
+        ui.temperature = temperature;
+        w->edits.push({EditField::Temperature, ui.temperature});
+    }
+    float tint = static_cast<float>(ui.manual.tint);
+    if (SliderRow("Tint", &tint, -100.0f, 100.0f, 0.0f, "%+.0f", true)) {
+        ui.manual.tint = tint; pushManual(ui);
+    }
+    float satPct = static_cast<float>(ui.manual.saturation * 100.0);
+    if (SliderRow("Saturation", &satPct, 0.0f, 200.0f, 100.0f, "%.0f%%", false)) {
+        ui.manual.saturation = satPct / 100.0; pushManual(ui);
+    }
+    float vibrance = static_cast<float>(ui.manual.vibrance);
+    if (SliderRow("Vibrance", &vibrance, -100.0f, 100.0f, 0.0f, "%+.0f", true)) {
+        ui.manual.vibrance = vibrance; pushManual(ui);
+    }
+
+    Eyebrow("BLEND");
+    float lookMixPct = static_cast<float>(ui.lookMix * 100.0);
+    if (SliderRow("Look Mix", &lookMixPct, 0.0f, 100.0f, 100.0f, "%.0f%%", false)) {
+        ui.lookMix = clamp01(lookMixPct / 100.0);
+        w->edits.push({EditField::LookMix, ui.lookMix});
+    }
+}
+
+void DrawGradeTab(WindowImpl* w, ParamSnapshot& ui) {
+    Eyebrow("LOOK");
+    int themeIdx = ui.theme - 1;
+    if (themeIdx < 0) themeIdx = 0;
+    if (themeIdx > kThemeCount - 1) themeIdx = kThemeCount - 1;
+    ImGui::TextColored(V4(COL_INK2), "Theme");
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    if (ImGui::Combo("##theme", &themeIdx, kThemeNames, kThemeCount)) {
+        ui.theme = themeIdx + 1;
+        w->edits.push({EditField::Theme, static_cast<double>(ui.theme)});
+    }
+    ImGui::Dummy(ImVec2(0, 4));
+
+    float strengthPct = static_cast<float>(fractionToPercent(ui.strength));
+    if (SliderRow("Strength", &strengthPct, 0.0f, 100.0f, 100.0f, "%.0f%%", false)) {
+        ui.strength = clamp01(percentToFraction(strengthPct));
+        w->edits.push({EditField::Strength, ui.strength});
+    }
+    float skinPct = static_cast<float>(fractionToPercent(ui.skinProtection));
+    if (SliderRow("Skin protect", &skinPct, 0.0f, 100.0f, 65.0f, "%.0f%%", false)) {
+        ui.skinProtection = clamp01(percentToFraction(skinPct));
+        w->edits.push({EditField::SkinProtection, ui.skinProtection});
+    }
+    float chromaPct = static_cast<float>(fractionToPercent(ui.chromaGain));
+    if (SliderRow("Chroma gain", &chromaPct, 0.0f, 200.0f, 100.0f, "%.0f%%", false)) {
+        ui.chromaGain = clampChromaFraction(percentToFraction(chromaPct));
+        w->edits.push({EditField::ChromaGain, ui.chromaGain});
+    }
+
+    Eyebrow("OUTPUT");
+    int srcIdx = ui.lutSource - 1;
+    if (srcIdx < 0) srcIdx = 0;
+    if (srcIdx > kLutSourceCount - 1) srcIdx = kLutSourceCount - 1;
+    ImGui::TextColored(V4(COL_INK2), "LUT source");
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    if (ImGui::Combo("##lutsource", &srcIdx, kLutSourceNames, kLutSourceCount)) {
+        ui.lutSource = srcIdx + 1;
+        w->edits.push({EditField::LutSource, static_cast<double>(ui.lutSource)});
+    }
+    if (ui.theme == 1)
+        NoteBox("None (Manual). Resting state - exact identity, no imposed look. Build the grade "
+                "by hand in Basics / Curves / Wheels, or pick a theme.");
+    else
+        NoteBox("Stat-matched look baked in-effect. Strength dilutes it toward your manual base; "
+                "Skin protect guards memory tones. External .cube uses a file next to the plug-in.");
+}
+
+void DrawCurvesTab(WindowImpl* w, ParamSnapshot& ui) {
+    Eyebrow("TONE CURVES");
+    // Channel selector (Master / R / G / B) - one big plot for the active channel, so per-slot
+    // dirty tracking is natural: editing a channel marks only that slot user-owned.
+    struct Ch { const char* label; cg::editor::CurveState* c; int idx; ImU32 col; ImU32 tab; };
+    const Ch chans[4] = {
+        {"Master", &ui.curves.master, 0, IM_COL32(0xe8, 0xe0, 0xd6, 255), IM_COL32(0x4b, 0x46, 0x3f, 255)},
+        {"R",      &ui.curves.r,      1, IM_COL32(0xe0, 0x60, 0x60, 255), IM_COL32(0x7d, 0x3a, 0x35, 255)},
+        {"G",      &ui.curves.g,      2, IM_COL32(0x60, 0xc0, 0x70, 255), IM_COL32(0x38, 0x66, 0x3d, 255)},
+        {"B",      &ui.curves.b,      3, IM_COL32(0x70, 0x98, 0xe8, 255), IM_COL32(0x35, 0x50, 0x7d, 255)},
+    };
+    const float availW = ImGui::GetContentRegionAvail().x;
+    const float btnW = (availW - 3.0f * 5.0f) / 4.0f;
+    for (int i = 0; i < 4; ++i) {
+        const bool on = w->curveChannel == i;
+        if (on) { ImGui::PushStyleColor(ImGuiCol_Button, V4(chans[i].tab));
+                  ImGui::PushStyleColor(ImGuiCol_Text, V4(IM_COL32(255, 255, 255, 255))); }
+        if (ImGui::Button(chans[i].label, ImVec2(btnW, 26))) w->curveChannel = i;
+        if (on) ImGui::PopStyleColor(2);
+        if (i < 3) ImGui::SameLine(0, 5);
+    }
+    ImGui::Dummy(ImVec2(0, 4));
+
+    const int ch = w->curveChannel;
+    const float plot = ImGui::GetContentRegionAvail().x;  // square, full width
+    cg::editor::CurveState* cur = chans[ch].c;
+    if (DrawCurveWidget("##curveplot", *cur, w->curveDrag[ch], chans[ch].col,
+                        plot < 260.0f ? plot : 260.0f)) {
+        cg::editor::curveMarkDirty(*cur);  // this slot is now user-owned (persist it)
+        ParamEdit e; e.field = EditField::Curves; e.curves = ui.curves;
+        w->edits.push(e);
+    }
+    ImGui::Dummy(ImVec2(0, 4));
+    ImGui::TextColored(V4(COL_INK3), "Left-drag move  -  click add  -  right-click remove");
+    ImGui::SameLine();
+    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - 92.0f);
+    if (ImGui::Button("Reset curve", ImVec2(92, 0))) {
+        *cur = cg::editor::CurveState{};  // absent + not dirty -> this channel follows the theme
+        w->curveDrag[ch] = -1;
+        ParamEdit e; e.field = EditField::Curves; e.curves = ui.curves;
+        w->edits.push(e);
+    }
+    NoteBox("The drawn line is the exact PCHIP the engine bakes. Editing a channel keeps only "
+            "that channel as your own - unedited channels keep tracking the theme when you switch "
+            "looks. Uses LUT Source = Auto.");
+}
+
+void DrawWheelsTab(WindowImpl* w, ParamSnapshot& ui) {
+    Eyebrow("COLOR WHEELS");
+    bool wheelsChanged = false;
+    int mode = ui.wheels.mode;
+    if (ImGui::RadioButton("Lift / Gamma / Gain", mode == 0)) mode = 0;
+    ImGui::SameLine();
+    if (ImGui::RadioButton("3-Way", mode == 1)) mode = 1;
+    if (mode != ui.wheels.mode) { ui.wheels.mode = mode; wheelsChanged = true; }
+    ImGui::Dummy(ImVec2(0, 4));
+
+    const float availW = ImGui::GetContentRegionAvail().x;
+    const float gap = 10.0f;
+    const float colW = (availW - gap * 2.0f) / 3.0f;
+    const float radius = std::min(46.0f, colW * 0.5f - 4.0f);
+
+    if (mode == 0) {
+        struct LggWheel { const char* name; double* triple; double neutral; double colorK;
+                          float mMin, mMax; const char* fmt; };
+        const LggWheel wheels[3] = {
+            {"Lift", ui.wheels.lift, 0.0, 0.20, -0.5f, 0.5f, "%.3f"},
+            {"Gamma", ui.wheels.gamma, 1.0, 0.60, 0.2f, 3.0f, "%.2f"},
+            {"Gain", ui.wheels.gain, 1.0, 0.40, 0.0f, 2.0f, "%.2f"},
+        };
+        for (int i = 0; i < 3; ++i) {
+            const LggWheel& wl = wheels[i];
+            ImGui::BeginGroup();
+            const float nmW = ImGui::CalcTextSize(wl.name).x;
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (colW - nmW) * 0.5f);
+            ImGui::TextColored(V4(COL_INK2), "%s", wl.name);
+            const float discX = ImGui::GetCursorPosX() + (colW - radius * 2.0f) * 0.5f;
+            ImGui::SetCursorPosX(discX);
+            std::string discId = std::string("##lgg") + std::to_string(i);
+            if (DrawWheelDisc(discId.c_str(), wl.triple, wl.colorK, radius)) wheelsChanged = true;
+            float m = static_cast<float>(WheelMaster(wl.triple));
+            std::string mId = std::string("##lggm") + std::to_string(i);
+            if (WheelLumSlider(mId.c_str(), &m, wl.mMin, wl.mMax, static_cast<float>(wl.neutral),
+                               wl.fmt, colW)) {
+                WheelSetMaster(wl.triple, m); wheelsChanged = true;
+            }
+            std::string rId = std::string("Reset##lgg") + std::to_string(i);
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (colW - 54.0f) * 0.5f);
+            if (ImGui::SmallButton(rId.c_str())) {
+                wl.triple[0] = wl.triple[1] = wl.triple[2] = wl.neutral; wheelsChanged = true;
+            }
+            ImGui::EndGroup();
+            if (i < 2) ImGui::SameLine(0, gap);
+        }
+        NoteBox("A full-saturation hue ring; each disc places a printer-lights colour offset, the "
+                "slider carries luminance. Uses LUT Source = Auto.");
+    } else {
+        struct ThreeWay { const char* name; double* ab; bool* has; double* triple; double neutral;
+                          float mMin, mMax; const char* fmt; };
+        ThreeWay bands[3] = {
+            {"Shadows", ui.wheels.shadowTint, &ui.wheels.hasShadowTint, ui.wheels.lift, 0.0,
+             -0.5f, 0.5f, "%.3f"},
+            {"Midtones", ui.wheels.midTint, &ui.wheels.hasMidTint, ui.wheels.gamma, 1.0,
+             0.2f, 3.0f, "%.2f"},
+            {"Highlights", ui.wheels.highTint, &ui.wheels.hasHighTint, ui.wheels.gain, 1.0,
+             0.0f, 2.0f, "%.2f"},
+        };
+        for (int i = 0; i < 3; ++i) {
+            ThreeWay& bd = bands[i];
+            ImGui::BeginGroup();
+            const float nmW = ImGui::CalcTextSize(bd.name).x;
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (colW - nmW) * 0.5f);
+            ImGui::TextColored(V4(COL_INK2), "%s", bd.name);
+            const float discX = ImGui::GetCursorPosX() + (colW - radius * 2.0f) * 0.5f;
+            ImGui::SetCursorPosX(discX);
+            std::string discId = std::string("##tw") + std::to_string(i);
+            if (DrawTintDisc(discId.c_str(), bd.ab, 25.0, radius)) {
+                *bd.has = (bd.ab[0] != 0.0 || bd.ab[1] != 0.0); wheelsChanged = true;
+            }
+            float m = static_cast<float>(WheelMaster(bd.triple));
+            std::string mId = std::string("##twm") + std::to_string(i);
+            if (WheelLumSlider(mId.c_str(), &m, bd.mMin, bd.mMax, static_cast<float>(bd.neutral),
+                               bd.fmt, colW)) {
+                WheelSetMaster(bd.triple, m); wheelsChanged = true;
+            }
+            std::string rId = std::string("Reset##tw") + std::to_string(i);
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (colW - 54.0f) * 0.5f);
+            if (ImGui::SmallButton(rId.c_str())) {
+                bd.ab[0] = bd.ab[1] = 0.0; *bd.has = false;
+                bd.triple[0] = bd.triple[1] = bd.triple[2] = bd.neutral; wheelsChanged = true;
+            }
+            ImGui::EndGroup();
+            if (i < 2) ImGui::SameLine(0, gap);
+        }
+        NoteBox("Desaturated LAB tint ring over feathered shadow / mid / highlight bands; these "
+                "tints add to the theme, the sliders reuse the Lift/Gamma/Gain luminance.");
+    }
+    if (wheelsChanged) {
+        ParamEdit e; e.field = EditField::Wheels; e.wheels = ui.wheels;
+        w->edits.push(e);
+    }
+}
+
+void DrawInspectorTabs(WindowImpl* w, ParamSnapshot& ui) {
+    if (ImGui::BeginTabBar("tabs", ImGuiTabBarFlags_None)) {
+        if (ImGui::BeginTabItem("Correct")) { DrawCorrectTab(w, ui); ImGui::EndTabItem(); }
+        if (ImGui::BeginTabItem("Basics"))  { DrawBasicsTab(w, ui);  ImGui::EndTabItem(); }
+        if (ImGui::BeginTabItem("Grade"))   { DrawGradeTab(w, ui);   ImGui::EndTabItem(); }
+        if (ImGui::BeginTabItem("Curves"))  { DrawCurvesTab(w, ui);  ImGui::EndTabItem(); }
+        if (ImGui::BeginTabItem("Wheels"))  { DrawWheelsTab(w, ui);  ImGui::EndTabItem(); }
+        ImGui::EndTabBar();
+    }
+}
+
+// --- title strip ------------------------------------------------------------
+
+// Reset the manual grade STACK (Basics / Curves / Wheels + the keyframeable exposure /
+// temperature / look-mix) to neutral and push the edits. Leaves the format choices (footage
+// profile, theme selection, strength/skin/chroma knobs) alone - those are look decisions,
+// not slider values.
+void ResetManualStack(WindowImpl* w, ParamSnapshot& ui) {
+    ui.manual = ManualState{};
+    ui.curves = CurvesState{};
+    ui.wheels = WheelsState{};
+    ui.exposure = 0.0; ui.temperature = 0.0; ui.lookMix = 1.0;
+    for (int i = 0; i < 4; ++i) w->curveDrag[i] = -1;
+    ParamEdit m; m.field = EditField::Manual; m.manual = ui.manual; w->edits.push(m);
+    ParamEdit c; c.field = EditField::Curves; c.curves = ui.curves; w->edits.push(c);
+    ParamEdit wh; wh.field = EditField::Wheels; wh.wheels = ui.wheels; w->edits.push(wh);
+    w->edits.push({EditField::Exposure, 0.0});
+    w->edits.push({EditField::Temperature, 0.0});
+    w->edits.push({EditField::LookMix, 1.0});
+}
+
+void DrawTitleStrip(WindowImpl* w, ParamSnapshot& ui) {
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImVec2 c = ImGui::GetCursorScreenPos();
+    // brass "safelight" dot
+    const float dotR = 7.0f;
+    const ImVec2 dc(c.x + dotR, c.y + ImGui::GetTextLineHeight() * 0.5f + 1.0f);
+    dl->AddCircleFilled(dc, dotR, COL_BRASS, 20);
+    dl->AddCircleFilled(ImVec2(dc.x - 2.0f, dc.y - 2.0f), 2.4f, COL_BRASS2, 12);
+    ImGui::Dummy(ImVec2(dotR * 2.0f + 6.0f, 0));
+    ImGui::SameLine();
+    ImGui::TextUnformatted("ColorGrade");
+    ImGui::SameLine();
+    ImGui::TextColored(V4(COL_INK3), "|");
+    ImGui::SameLine();
+    if (ui.theme == kThemeReferenceIndex)
+        ImGui::TextColored(V4(COL_BRASS2), "Reference match");
+    else
+        ImGui::TextColored(V4(COL_INK2), "%s", kThemeNames[(ui.theme - 1 < 0 ? 0 : ui.theme - 1)]);
+
+    // right-aligned: analysis chip + Reset all
+    ImGuiStyle& style = ImGui::GetStyle();
+    const char* resetLbl = "Reset all";
+    const float resetW = ImGui::CalcTextSize(resetLbl).x + style.FramePadding.x * 2.0f;
+    AnalysisStatus st = w->readStatus();
+    char chip[32];
+    std::snprintf(chip, sizeof(chip), "* %s",
+                  st.state == AnalysisStatus::State::Analyzed ? "analyzed"
+                  : st.state == AnalysisStatus::State::Sampling ? "analyzing" : "not analyzed");
+    const float chipW = ImGui::CalcTextSize(chip).x;
+    float rightX = ImGui::GetWindowWidth() - style.WindowPadding.x - resetW - chipW - 12.0f;
+    if (rightX < ImGui::GetCursorPosX()) rightX = ImGui::GetCursorPosX();
+    ImGui::SameLine();
+    ImGui::SetCursorPosX(rightX);
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextColored(st.state == AnalysisStatus::State::Analyzed ? V4(COL_OK) : V4(COL_INK3),
+                       "%s", chip);
+    ImGui::SameLine();
+    if (ImGui::Button(resetLbl)) ResetManualStack(w, ui);
+    ImGui::Separator();
+}
+
+// --- agent dock (confined indigo world; the single Pro/BYOK seam) -----------
+
+// Draw the collapsed rail: a slim indigo strip with an expand affordance.
+void DrawAgentRail(WindowImpl* w) {
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImGui::Dummy(ImVec2(0, 4));
+    // glyph button
+    ImGui::SetCursorPosX((ImGui::GetWindowWidth() - 26.0f) * 0.5f);
+    ImVec2 gp = ImGui::GetCursorScreenPos();
+    if (ImGui::InvisibleButton("##agentglyph", ImVec2(26, 26))) w->agentOpen = true;
+    dl->AddRectFilled(gp, ImVec2(gp.x + 26, gp.y + 26), COL_IRISRAISE, 8.0f);
+    dl->AddCircleFilled(ImVec2(gp.x + 13, gp.y + 13), 6.0f, COL_IRIS, 16);
+    // vertical "AGENT" label
+    ImGui::Dummy(ImVec2(0, 10));
+    const char* letters = "AGENT";
+    for (const char* p = letters; *p; ++p) {
+        char s[2] = {*p, 0};
+        const float lw = ImGui::CalcTextSize(s).x;
+        ImGui::SetCursorPosX((ImGui::GetWindowWidth() - lw) * 0.5f);
+        ImGui::TextColored(V4(COL_IRIS2), "%s", s);
+    }
+    // expand button at the bottom
+    ImGui::SetCursorPosY(ImGui::GetWindowHeight() - 34.0f);
+    ImGui::SetCursorPosX((ImGui::GetWindowWidth() - 26.0f) * 0.5f);
+    ImGui::PushStyleColor(ImGuiCol_Button, V4(COL_IRISRAISE));
+    ImGui::PushStyleColor(ImGuiCol_Text, V4(COL_IRIS2));
+    if (ImGui::Button("<", ImVec2(26, 26))) w->agentOpen = true;
+    ImGui::PopStyleColor(2);
+}
+
+// Draw the expanded agent panel with its BYOK states (setup / ready). Agent EXECUTION is not
+// wired into the native editor yet (it lives in the offline pipeline, src/agent + npm run
+// auto-grade, per AGENTS.md); this presents the button-triggered surface + key management
+// truthfully rather than fabricating results.
+void DrawAgentPanel(WindowImpl* w) {
+    // Push the confined indigo world onto the button/frame colours for this panel only.
+    ImGui::PushStyleColor(ImGuiCol_Button, V4(COL_IRISRAISE));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, V4(COL_IRISLINE));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, V4(COL_IRISDIM));
+    ImGui::PushStyleColor(ImGuiCol_FrameBg, V4(COL_IRISRAISE));
+    ImGui::PushStyleColor(ImGuiCol_Text, V4(COL_INK));
+
+    // header
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImVec2 hp = ImGui::GetCursorScreenPos();
+    dl->AddCircleFilled(ImVec2(hp.x + 8, hp.y + ImGui::GetTextLineHeight() * 0.5f + 1), 6.0f, COL_IRIS, 16);
+    ImGui::Dummy(ImVec2(20, 0)); ImGui::SameLine();
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextUnformatted("Agent");
+    ImGui::SameLine();
+    ImGui::SetCursorPosX(ImGui::GetWindowWidth() - 32.0f);
+    ImGui::PushStyleColor(ImGuiCol_Text, V4(COL_IRIS2));
+    if (ImGui::Button(">", ImVec2(24, 22))) w->agentOpen = false;
+    ImGui::PopStyleColor();
+    ImGui::Separator();
+
+    if (!w->agentKeySet) {
+        // --- BYOK setup state (no key) ---
+        ImGui::TextColored(V4(COL_IRIS2), "Bring your own Gemini key");
+        ImGui::PushStyleColor(ImGuiCol_Text, V4(COL_INK2));
+        ImGui::TextWrapped("Agent critique and auto-grade run on your own Gemini API key. The free "
+                           "tier works at no cost. Frames are sent to Google only when you press "
+                           "Critique - with this panel unused, nothing leaves your machine.");
+        ImGui::PopStyleColor();
+        ImGui::Dummy(ImVec2(0, 4));
+        ImGui::TextColored(V4(COL_INK2), "API key");
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        ImGui::InputText("##agentkey", w->agentKeyBuf, sizeof(w->agentKeyBuf),
+                         ImGuiInputTextFlags_Password);
+        const bool hasText = w->agentKeyBuf[0] != 0;
+        ImGui::BeginDisabled(!hasText);
+        ImGui::PushStyleColor(ImGuiCol_Button, V4(COL_IRISDIM));
+        if (ImGui::Button("Save key", ImVec2(-FLT_MIN, 0)) && hasText) w->agentKeySet = true;
+        ImGui::PopStyleColor();
+        ImGui::EndDisabled();
+    } else {
+        // --- ready state (key stored this session) ---
+        std::string k = w->agentKeyBuf;
+        std::string masked = k.size() > 8 ? (k.substr(0, 4) + std::string("....") + k.substr(k.size() - 4))
+                                          : std::string("....");
+        ImGui::TextColored(V4(COL_INK2), "Key");
+        ImGui::SameLine();
+        ImGui::TextColored(V4(COL_IRIS2), "%s", masked.c_str());
+        ImGui::SameLine();
+        ImGui::SetCursorPosX(ImGui::GetWindowWidth() - 72.0f);
+        if (ImGui::SmallButton("Remove")) { w->agentKeySet = false; w->agentKeyBuf[0] = 0; }
+
+        ImGui::Dummy(ImVec2(0, 4));
+        ImGui::PushStyleColor(ImGuiCol_Button, V4(COL_IRISDIM));
+        const float half = (ImGui::GetContentRegionAvail().x - 8.0f) * 0.5f;
+        ImGui::Button("Critique", ImVec2(half, 30));
+        ImGui::SameLine(0, 8);
+        ImGui::Button("Auto-grade", ImVec2(half, 30));
+        ImGui::PopStyleColor();
+
+        // inner tabs
+        const char* tabs[3] = {"Critique", "Reference", "Batch"};
+        for (int i = 0; i < 3; ++i) {
+            const bool on = w->agentTab == i;
+            if (on) ImGui::PushStyleColor(ImGuiCol_Button, V4(COL_IRISPANEL));
+            if (ImGui::Button(tabs[i])) w->agentTab = i;
+            if (on) ImGui::PopStyleColor();
+            if (i < 2) ImGui::SameLine(0, 4);
+        }
+        ImGui::Separator();
+        ImGui::PushStyleColor(ImGuiCol_Text, V4(COL_INK2));
+        if (w->agentTab == 0)
+            ImGui::TextWrapped("No critique yet. The agent runs only when you ask. Editor execution "
+                               "routes through the offline pipeline (npm run auto-grade / src/agent) "
+                               "- the model NAMES defects, the rules decide accept or reject.");
+        else if (w->agentTab == 1)
+            ImGui::TextWrapped("Reference match is pure stat transfer (no model call) - use it from "
+                               "the Correct tab. The agent's only role here is an optional post-match "
+                               "critique of the result.");
+        else
+            ImGui::TextWrapped("Cross-clip consistency compares same-scene clips and flags drift. It "
+                               "runs via the offline check-consistency tool today; a native batch "
+                               "view is planned.");
+        ImGui::PopStyleColor();
+    }
+
+    ImGui::PopStyleColor(5);
+}
+
+void DrawAgentDock(WindowImpl* w) {
+    if (!kAgentDockEnabled) {  // Pro/BYOK seam disabled: keep the free core fully usable.
+        ImGui::TextDisabled("Agent features off");
+        return;
+    }
+    if (w->agentOpen) DrawAgentPanel(w);
+    else DrawAgentRail(w);
+}
+
+// --- footer -----------------------------------------------------------------
+
+void DrawFooter(WindowImpl* w) {
+    ImGui::Separator();
+    ImGui::TextColored(V4(COL_INK3), "Decode-then-grade - V-Log decoded before any look");
+    AnalysisStatus st = w->readStatus();
+    const char* right = st.state == AnalysisStatus::State::Sampling ? "analyzing clip..."
+                        : st.state == AnalysisStatus::State::Analyzed ? "clip analyzed"
+                        : "scrub or Analyze to sample the clip";
+    ImGui::SameLine();
+    const float rw = ImGui::CalcTextSize(right).x;
+    ImGui::SetCursorPosX(ImGui::GetWindowWidth() - rw - ImGui::GetStyle().WindowPadding.x);
+    ImGui::TextColored(V4(COL_INK3), "%s", right);
+}
 
 // Draw one ImGui frame from a working copy of the snapshot; push any change onto
 // the edit queue. Returns nothing - edits flow through w->edits to the effect.
@@ -814,373 +1653,45 @@ void DrawEditorUI(WindowImpl* w, ParamSnapshot& ui) {
                              ImGuiWindowFlags_NoBringToFrontOnFocus;
     ImGui::Begin("ColorGradeEditor", nullptr, flags);
 
-    ImGui::TextUnformatted("Color Grade");
-    ImGui::SameLine();
-    ImGui::TextDisabled("(editor - Correct / Grade)");
-    ImGui::Separator();
+    DrawTitleStrip(w, ui);
 
-    // Two-column layout: controls left, live preview (Phase 4 placeholder) right.
-    const float leftW = 340.0f;
-    ImGui::BeginChild("controls", ImVec2(leftW, 0), true);
+    // Three-column body (mockup): preview + scopes | inspector | collapsible agent dock,
+    // with a slim footer. Widths are computed from the live content region every frame so
+    // windowed / fullscreen / live-resize all track, and collapsing the agent reflows.
+    ImGuiStyle& style = ImGui::GetStyle();
+    const float footerH = ImGui::GetTextLineHeight() + 12.0f;
+    const ImVec2 avail = ImGui::GetContentRegionAvail();
+    const float bodyH = avail.y - footerH - style.ItemSpacing.y;
+    const float inspW = 360.0f;
+    const float agentW = w->agentOpen ? 300.0f : 48.0f;
+    float leftW = avail.x - inspW - agentW - style.ItemSpacing.x * 2.0f;
+    if (leftW < 220.0f) leftW = 220.0f;
 
-    if (ImGui::BeginTabBar("tabs")) {
-        if (ImGui::BeginTabItem("Correct")) {
-            ImGui::TextWrapped("Camera log format. A log profile decodes to Rec.709 before "
-                               "the grade - applied live (this is an effect; no separate "
-                               "Apply step). Standard (Rec.709) = no decode.");
-            ImGui::Spacing();
-            // --- Footage profile as a Camera->Profile cascade (decision doc): both combos
-            //     derive from core/FootageCatalog.h and resolve to the flat 1-based popup
-            //     index the effect stores. Picking a camera auto-selects its Standard so the
-            //     Profile dropdown is never empty; the whole cascade writes the same
-            //     EditField::FootageProfile the AE flat popup does. ---
-            cg::core::FootageCascadePos pos = cg::core::footageCascadePosForFlat(ui.footageProfile);
-            std::vector<std::string> cams = cg::core::footageCameras();
-            std::vector<const char*> camPtrs;
-            camPtrs.reserve(cams.size());
-            for (const auto& c : cams) camPtrs.push_back(c.c_str());
-            int camIdx = pos.cameraIndex;
-            if (ImGui::Combo("Camera", &camIdx, camPtrs.data(), static_cast<int>(camPtrs.size()))) {
-                // New camera -> auto-select that camera's Standard (Rec.709) profile.
-                cg::core::FootageCameraProfiles p = cg::core::footageProfilesForCamera(cams[camIdx]);
-                ui.footageProfile = p.flatIndices.front();
-                w->edits.push({EditField::FootageProfile, static_cast<double>(ui.footageProfile)});
-            }
-            // Profile dropdown, filtered to the selected camera (Standard first).
-            cg::core::FootageCameraProfiles profs = cg::core::footageProfilesForCamera(cams[camIdx]);
-            std::vector<const char*> profPtrs;
-            profPtrs.reserve(profs.labels.size());
-            for (const auto& l : profs.labels) profPtrs.push_back(l.c_str());
-            int optIdx = 0;
-            for (size_t i = 0; i < profs.flatIndices.size(); ++i) {
-                if (profs.flatIndices[i] == ui.footageProfile) {
-                    optIdx = static_cast<int>(i);
-                    break;
-                }
-            }
-            if (ImGui::Combo("Profile", &optIdx, profPtrs.data(), static_cast<int>(profPtrs.size()))) {
-                ui.footageProfile = profs.flatIndices[static_cast<size_t>(optIdx)];
-                w->edits.push({EditField::FootageProfile, static_cast<double>(ui.footageProfile)});
-            }
-            ImGui::Spacing();
-            // In-effect multi-frame analysis (Phase 5): "Analyze" forces a re-run; the
-            // idle hook also auto-analyses when the footage profile changes. The status
-            // reflects the effect's live analysis driver.
-            if (ImGui::Button("Analyze clip")) w->analyzeRequested.store(true);
-            ImGui::SameLine();
-            AnalysisStatus st = w->readStatus();
-            if (st.state == AnalysisStatus::State::Sampling) {
-                ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f), "Analyzing %d/%d...",
-                                   st.sampled, st.total);
-            } else if (st.state == AnalysisStatus::State::Analyzed) {
-                ImGui::TextColored(ImVec4(0.4f, 0.9f, 0.5f, 1.0f),
-                                   st.fromCache ? "Analyzed (cached)" : "Analyzed");
-            } else {
-                ImGui::TextDisabled("Not analyzed");
-            }
-            ImGui::Spacing();
-            ImGui::TextWrapped("Analysis samples several frames across the clip and adapts "
-                               "the Auto grade to the whole shot.");
-            ImGui::EndTabItem();
-        }
-        if (ImGui::BeginTabItem("Basics")) {
-            // Manual primary correction (Phase 6a). Exposure/Look Mix/Temperature are
-            // keyframeable PF scalar params (written as scalar edits); the rest are the
-            // recipe-backed ManualState (pushed as one coalesced Manual edit). Applied
-            // ahead of the theme look; neutral = no change. Requires LUT Source = Auto.
-            auto pushManual = [w](ParamSnapshot& s) {
-                ParamEdit e;
-                e.field = EditField::Manual;
-                e.manual = s.manual;
-                w->edits.push(e);
-            };
-            ImGui::TextWrapped("Manual primary correction, applied before the theme look. "
-                               "Exposure, Look Mix and Temperature are keyframeable in Effect "
-                               "Controls. Uses LUT Source = Auto.");
-            ImGui::Spacing();
-
-            float exposure = static_cast<float>(ui.exposure);
-            if (ImGui::SliderFloat("Exposure", &exposure, -5.0f, 5.0f, "%.2f stops")) {
-                ui.exposure = exposure;
-                w->edits.push({EditField::Exposure, ui.exposure});
-            }
-            float contrast = static_cast<float>(ui.manual.contrast);
-            if (ImGui::SliderFloat("Contrast", &contrast, -100.0f, 100.0f, "%.0f")) {
-                ui.manual.contrast = contrast;
-                pushManual(ui);
-            }
-            float pivot = static_cast<float>(ui.manual.pivot);
-            if (ImGui::SliderFloat("Contrast Pivot", &pivot, 0.05f, 0.95f, "%.3f")) {
-                ui.manual.pivot = pivot;
-                pushManual(ui);
-            }
-            ImGui::Separator();
-            float highlights = static_cast<float>(ui.manual.highlights);
-            if (ImGui::SliderFloat("Highlights", &highlights, -100.0f, 100.0f, "%.0f")) {
-                ui.manual.highlights = highlights;
-                pushManual(ui);
-            }
-            float shadows = static_cast<float>(ui.manual.shadows);
-            if (ImGui::SliderFloat("Shadows", &shadows, -100.0f, 100.0f, "%.0f")) {
-                ui.manual.shadows = shadows;
-                pushManual(ui);
-            }
-            float whites = static_cast<float>(ui.manual.whites);
-            if (ImGui::SliderFloat("Whites", &whites, -100.0f, 100.0f, "%.0f")) {
-                ui.manual.whites = whites;
-                pushManual(ui);
-            }
-            float blacks = static_cast<float>(ui.manual.blacks);
-            if (ImGui::SliderFloat("Blacks", &blacks, -100.0f, 100.0f, "%.0f")) {
-                ui.manual.blacks = blacks;
-                pushManual(ui);
-            }
-            ImGui::Separator();
-            float temperature = static_cast<float>(ui.temperature);
-            if (ImGui::SliderFloat("Temperature", &temperature, -100.0f, 100.0f, "%.0f")) {
-                ui.temperature = temperature;
-                w->edits.push({EditField::Temperature, ui.temperature});
-            }
-            float tint = static_cast<float>(ui.manual.tint);
-            if (ImGui::SliderFloat("Tint", &tint, -100.0f, 100.0f, "%.0f")) {
-                ui.manual.tint = tint;
-                pushManual(ui);
-            }
-            float satPct = static_cast<float>(ui.manual.saturation * 100.0);
-            if (ImGui::SliderFloat("Saturation", &satPct, 0.0f, 200.0f, "%.0f%%")) {
-                ui.manual.saturation = satPct / 100.0;
-                pushManual(ui);
-            }
-            float vibrance = static_cast<float>(ui.manual.vibrance);
-            if (ImGui::SliderFloat("Vibrance", &vibrance, -100.0f, 100.0f, "%.0f")) {
-                ui.manual.vibrance = vibrance;
-                pushManual(ui);
-            }
-            ImGui::Separator();
-            float lookMixPct = static_cast<float>(ui.lookMix * 100.0);
-            if (ImGui::SliderFloat("Look Mix", &lookMixPct, 0.0f, 100.0f, "%.0f%%")) {
-                ui.lookMix = clamp01(lookMixPct / 100.0);
-                w->edits.push({EditField::LookMix, ui.lookMix});
-            }
-            ImGui::EndTabItem();
-        }
-        if (ImGui::BeginTabItem("Grade")) {
-            // --- Theme popup: writes EditField::Theme (1-based to match CG_THEME_*) ---
-            int themeIdx = ui.theme - 1;
-            if (themeIdx < 0) themeIdx = 0;
-            if (themeIdx > kThemeCount - 1) themeIdx = kThemeCount - 1;
-            if (ImGui::Combo("Theme", &themeIdx, kThemeNames, kThemeCount)) {
-                ui.theme = themeIdx + 1;
-                w->edits.push({EditField::Theme, static_cast<double>(ui.theme)});
-            }
-
-            // --- Strength slider (fraction shown as percent) ---
-            float strengthPct = static_cast<float>(fractionToPercent(ui.strength));
-            if (ImGui::SliderFloat("Strength", &strengthPct, 0.0f, 100.0f, "%.0f%%")) {
-                ui.strength = clamp01(percentToFraction(strengthPct));
-                w->edits.push({EditField::Strength, ui.strength});
-            }
-
-            float skinPct = static_cast<float>(fractionToPercent(ui.skinProtection));
-            if (ImGui::SliderFloat("Skin Protection", &skinPct, 0.0f, 100.0f, "%.0f%%")) {
-                ui.skinProtection = clamp01(percentToFraction(skinPct));
-                w->edits.push({EditField::SkinProtection, ui.skinProtection});
-            }
-
-            float chromaPct = static_cast<float>(fractionToPercent(ui.chromaGain));
-            if (ImGui::SliderFloat("Chroma Gain", &chromaPct, 0.0f, 200.0f, "%.0f%%")) {
-                ui.chromaGain = clampChromaFraction(percentToFraction(chromaPct));
-                w->edits.push({EditField::ChromaGain, ui.chromaGain});
-            }
-
-            // --- LUT source popup ---
-            int srcIdx = ui.lutSource - 1;
-            if (srcIdx < 0) srcIdx = 0;
-            if (srcIdx > kLutSourceCount - 1) srcIdx = kLutSourceCount - 1;
-            if (ImGui::Combo("LUT Source", &srcIdx, kLutSourceNames, kLutSourceCount)) {
-                ui.lutSource = srcIdx + 1;
-                w->edits.push({EditField::LutSource, static_cast<double>(ui.lutSource)});
-            }
-            if (ui.lutSource == 4) {
-                ImGui::TextWrapped("Applies the footage decode + Basics (and LGG wheels) under "
-                                   "your external .cube: decode -> correct/basics -> your LUT.");
-            }
-            ImGui::EndTabItem();
-        }
-        if (ImGui::BeginTabItem("Curves")) {
-            // Master + per-channel monotone tone curves (Phase 6b), recipe-backed and
-            // baked with the theme look. Wired into the existing engine curve fields;
-            // no engine math is added. Requires LUT Source = Auto.
-            ImGui::TextWrapped("Tone curves. Left-drag a point to move, left-click to add, "
-                               "right-click to remove. Reset clears the curve. Uses LUT "
-                               "Source = Auto.");
-            ImGui::Spacing();
-            const float plot = 148.0f;
-            struct CurveEntry {
-                const char* label;
-                cg::editor::CurveState* c;
-                int idx;
-                ImU32 col;
-            };
-            const CurveEntry curves[4] = {
-                {"Master", &ui.curves.master, 0, IM_COL32(235, 235, 240, 255)},
-                {"Red", &ui.curves.r, 1, IM_COL32(235, 90, 90, 255)},
-                {"Green", &ui.curves.g, 2, IM_COL32(90, 210, 110, 255)},
-                {"Blue", &ui.curves.b, 3, IM_COL32(105, 150, 240, 255)},
-            };
-            bool curvesChanged = false;
-            for (int i = 0; i < 4; ++i) {
-                ImGui::BeginGroup();
-                ImGui::TextUnformatted(curves[i].label);
-                std::string plotId = std::string("##curve") + std::to_string(i);
-                if (DrawCurveWidget(plotId.c_str(), *curves[i].c, w->curveDrag[curves[i].idx],
-                                    curves[i].col, plot)) {
-                    curvesChanged = true;
-                }
-                std::string resetId = std::string("Reset##curve") + std::to_string(i);
-                if (ImGui::SmallButton(resetId.c_str())) {
-                    *curves[i].c = cg::editor::CurveState{};
-                    w->curveDrag[curves[i].idx] = -1;
-                    curvesChanged = true;
-                }
-                ImGui::EndGroup();
-                if (i % 2 == 0) ImGui::SameLine();
-            }
-            if (curvesChanged) {
-                ParamEdit e;
-                e.field = EditField::Curves;
-                e.curves = ui.curves;
-                w->edits.push(e);
-            }
-            ImGui::EndTabItem();
-        }
-        if (ImGui::BeginTabItem("Wheels")) {
-            // DaVinci Lift/Gamma/Gain wheels (primary) + Adobe-style 3-way (secondary).
-            // LGG is a new engine stage; the 3-way reuses the LGG masters for luminance
-            // and the band LAB tint fields for color - no extra engine math. Uses Auto.
-            bool wheelsChanged = false;
-            int mode = ui.wheels.mode;
-            ImGui::TextUnformatted("Wheels:");
-            ImGui::SameLine();
-            if (ImGui::RadioButton("Lift/Gamma/Gain", mode == 0)) mode = 0;
-            ImGui::SameLine();
-            if (ImGui::RadioButton("3-Way", mode == 1)) mode = 1;
-            if (mode != ui.wheels.mode) {
-                ui.wheels.mode = mode;
-                wheelsChanged = true;
-            }
-            ImGui::Separator();
-
-            const float radius = 46.0f;
-            if (mode == 0) {
-                ImGui::TextWrapped("Lift moves blacks, Gain moves whites, Gamma bends mids. "
-                                   "Drag the disc for color balance; the slider is luminance.");
-                ImGui::Spacing();
-                struct LggWheel {
-                    const char* name;
-                    double* triple;
-                    double neutral;
-                    double colorK;
-                    float mMin, mMax;
-                    const char* fmt;
-                };
-                const LggWheel wheels[3] = {
-                    {"Lift", ui.wheels.lift, 0.0, 0.20, -0.5f, 0.5f, "%.3f"},
-                    {"Gamma", ui.wheels.gamma, 1.0, 0.60, 0.2f, 3.0f, "%.2f"},
-                    {"Gain", ui.wheels.gain, 1.0, 0.40, 0.0f, 2.0f, "%.2f"},
-                };
-                for (int i = 0; i < 3; ++i) {
-                    const LggWheel& wl = wheels[i];
-                    ImGui::BeginGroup();
-                    ImGui::TextUnformatted(wl.name);
-                    std::string discId = std::string("##lgg") + std::to_string(i);
-                    if (DrawWheelDisc(discId.c_str(), wl.triple, wl.colorK, radius))
-                        wheelsChanged = true;
-                    ImGui::SetNextItemWidth(radius * 2.0f);
-                    float m = static_cast<float>(WheelMaster(wl.triple));
-                    std::string mId = std::string("##lggm") + std::to_string(i);
-                    if (ImGui::SliderFloat(mId.c_str(), &m, wl.mMin, wl.mMax, wl.fmt)) {
-                        WheelSetMaster(wl.triple, m);
-                        wheelsChanged = true;
-                    }
-                    std::string rId = std::string("Reset##lgg") + std::to_string(i);
-                    if (ImGui::SmallButton(rId.c_str())) {
-                        wl.triple[0] = wl.triple[1] = wl.triple[2] = wl.neutral;
-                        wheelsChanged = true;
-                    }
-                    ImGui::EndGroup();
-                    if (i < 2) ImGui::SameLine();
-                }
-            } else {
-                ImGui::TextWrapped("Adobe-style 3-way: the disc tints each tonal band; the "
-                                   "slider pushes that band's luminance. Reuses the band tints "
-                                   "and the Lift/Gamma/Gain luminance.");
-                ImGui::Spacing();
-                // Each band: color disc -> LAB tint field; luminance slider -> LGG master.
-                struct ThreeWay {
-                    const char* name;
-                    double* ab;         // the band tint [a,b]
-                    bool* has;          // the tint presence flag
-                    double* triple;     // the LGG triple carrying this band's luminance
-                    double neutral;     // luminance neutral for that triple
-                    float mMin, mMax;
-                    const char* fmt;
-                };
-                ThreeWay bands[3] = {
-                    {"Shadows", ui.wheels.shadowTint, &ui.wheels.hasShadowTint, ui.wheels.lift,
-                     0.0, -0.5f, 0.5f, "%.3f"},
-                    {"Midtones", ui.wheels.midTint, &ui.wheels.hasMidTint, ui.wheels.gamma,
-                     1.0, 0.2f, 3.0f, "%.2f"},
-                    {"Highlights", ui.wheels.highTint, &ui.wheels.hasHighTint, ui.wheels.gain,
-                     1.0, 0.0f, 2.0f, "%.2f"},
-                };
-                for (int i = 0; i < 3; ++i) {
-                    ThreeWay& bd = bands[i];
-                    ImGui::BeginGroup();
-                    ImGui::TextUnformatted(bd.name);
-                    std::string discId = std::string("##tw") + std::to_string(i);
-                    if (DrawTintDisc(discId.c_str(), bd.ab, 25.0, radius)) {
-                        *bd.has = (bd.ab[0] != 0.0 || bd.ab[1] != 0.0);
-                        wheelsChanged = true;
-                    }
-                    ImGui::SetNextItemWidth(radius * 2.0f);
-                    float m = static_cast<float>(WheelMaster(bd.triple));
-                    std::string mId = std::string("##twm") + std::to_string(i);
-                    if (ImGui::SliderFloat(mId.c_str(), &m, bd.mMin, bd.mMax, bd.fmt)) {
-                        WheelSetMaster(bd.triple, m);
-                        wheelsChanged = true;
-                    }
-                    std::string rId = std::string("Reset##tw") + std::to_string(i);
-                    if (ImGui::SmallButton(rId.c_str())) {
-                        bd.ab[0] = bd.ab[1] = 0.0;
-                        *bd.has = false;
-                        bd.triple[0] = bd.triple[1] = bd.triple[2] = bd.neutral;
-                        wheelsChanged = true;
-                    }
-                    ImGui::EndGroup();
-                    if (i < 2) ImGui::SameLine();
-                }
-            }
-            if (wheelsChanged) {
-                ParamEdit e;
-                e.field = EditField::Wheels;
-                e.wheels = ui.wheels;
-                w->edits.push(e);
-            }
-            ImGui::EndTabItem();
-        }
-        ImGui::EndTabBar();
-    }
-    ImGui::EndChild();
-
-    ImGui::SameLine();
-
-    // Right pane: a compare-mode + scopes toolbar, then the live preview, then the scopes.
-    ImGui::BeginChild("viewer", ImVec2(0, 0), true);
+    // LEFT: preview + scopes
+    ImGui::BeginChild("left", ImVec2(leftW, bodyH), true);
     DrawViewerToolbar(w);
     DrawPreviewPane(w);
     if (w->showScopes.load()) DrawScopesStrip(w);
     ImGui::EndChild();
+    ImGui::SameLine();
+
+    // MIDDLE: inspector tabs (Correct / Basics / Grade / Curves / Wheels)
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, V4(COL_BG2));
+    ImGui::BeginChild("insp", ImVec2(inspW, bodyH), true);
+    DrawInspectorTabs(w, ui);
+    ImGui::EndChild();
+    ImGui::PopStyleColor();
+    ImGui::SameLine();
+
+    // RIGHT: agent dock (confined indigo world; collapses to a slim rail)
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, V4(w->agentOpen ? COL_IRISPANEL : COL_IRISBG));
+    ImGui::PushStyleColor(ImGuiCol_Border, V4(COL_IRISLINE));
+    ImGui::BeginChild("agent", ImVec2(agentW, bodyH), true);
+    DrawAgentDock(w);
+    ImGui::EndChild();
+    ImGui::PopStyleColor(2);
+
+    DrawFooter(w);
 
     ImGui::End();
 }
@@ -1190,7 +1701,7 @@ void RunWindowThread(WindowImpl* w, ParamSnapshot seed) {
     EnsureWindowClass();
 
     HWND hwnd = ::CreateWindowExW(0, kWindowClass, L"Color Grade - Editor",
-                                  WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, 900, 560,
+                                  WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, 1240, 720,
                                   nullptr, nullptr, PluginInstance(), nullptr);
     if (!hwnd) { w->finished.store(true); return; }
     // Publish the HWND for the main thread only once it is fully valid.
@@ -1222,7 +1733,7 @@ void RunWindowThread(WindowImpl* w, ParamSnapshot seed) {
     // Default is already true in this ImGui (1.91.5); set explicitly so it never regresses.
     io.ConfigDebugHighlightIdConflicts = true;
 #endif
-    ImGui::StyleColorsDark();
+    ApplyColorGradeStyle();  // cg-ui-polish "Darkroom" style (replaces StyleColorsDark)
     ImGui_ImplWin32_Init(hwnd);
     ImGui_ImplDX11_Init(w->device, w->context);
 

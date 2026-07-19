@@ -301,6 +301,52 @@ static void test_phase6b_curve_drag() {
     CHECK(e.count == 2 && approx(e.y[0], 0.0) && approx(e.y[1], 1.0), "remove interior -> endpoints");
 }
 
+// --- Phase UI-polish: curves per-slot dirty tracking (curves-theme-seed-persist) ------
+// The Curves tab seeds every slot from the picked theme's authored curve for editing. Only
+// the slots the user actually edits (dirty) may be persisted; the rest must revert to absent
+// (count 0) so a later theme switch keeps updating them. curvesForPersist is that reduction.
+static void test_curves_dirty_persist() {
+    // A displayed state: all four slots carry theme-seeded points, none edited yet.
+    CurvesState disp;
+    for (CurveState* c : {&disp.master, &disp.r, &disp.g, &disp.b}) {
+        c->count = 2;
+        c->x[0] = 0.0; c->y[0] = 0.05;  // a theme-authored (non-identity) seed
+        c->x[1] = 1.0; c->y[1] = 0.95;
+        c->dirty = false;
+    }
+
+    // The user edits ONLY the master (drag marks it dirty); R/G/B stay theme-seeded.
+    CurvesState edited = disp;
+    edited.master.y[1] = 0.80;
+    curveMarkDirty(edited.master);
+
+    CurvesState persist = edited;
+    curvesForPersist(persist);
+
+    // Master is user-owned -> kept with its edited points.
+    CHECK(persist.master.dirty && persist.master.count == 2 && approx(persist.master.y[1], 0.80),
+          "edited master persists its points");
+    // R/G/B were never edited -> cleared to absent so the theme keeps driving them.
+    CHECK(persist.r.count == 0 && !persist.r.dirty, "unedited red reverts to absent (follows theme)");
+    CHECK(persist.g.count == 0 && persist.b.count == 0,
+          "unedited green/blue revert to absent (follows theme)");
+
+    // Editing every slot keeps every slot.
+    CurvesState all = disp;
+    for (CurveState* c : {&all.master, &all.r, &all.g, &all.b}) curveMarkDirty(*c);
+    curvesForPersist(all);
+    CHECK(all.master.count == 2 && all.r.count == 2 && all.g.count == 2 && all.b.count == 2,
+          "all-edited state persists every slot");
+
+    // dirty participates in equality (SnapshotChanged must notice a slot becoming user-owned).
+    CurveState a, b;
+    a.count = b.count = 2;
+    a.x[1] = b.x[1] = 1.0; a.y[1] = b.y[1] = 1.0;
+    CHECK(a == b, "same points + same dirty are equal");
+    b.dirty = true;
+    CHECK(a != b, "dirty flag difference is a change");
+}
+
 // --- multi-camera footage catalog + editor Camera->Profile cascade ----------
 static void test_footage_cascade() {
     using namespace cg::core;
@@ -360,6 +406,7 @@ int main() {
     test_phase6a_manual();
     test_phase6bc_curves_wheels();
     test_phase6b_curve_drag();
+    test_curves_dirty_persist();
     test_footage_cascade();
 
     if (g_failures == 0) {
