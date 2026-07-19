@@ -1620,6 +1620,8 @@ static A_Err CG_IdleHook(AEGP_GlobalRefcon, AEGP_IdleRefcon, A_long* max_sleepPL
             try {
                 AEGP_SuiteHandler sh(g_spbasic);
                 cg::editor::ParamSnapshot polled;
+                auto seed = g_lastPolled.find(key);
+                if (seed != g_lastPolled.end()) polled = seed->second;
                 if (PollSnapshotViaAegp(sh, effectH, polled)) {
                     auto it = g_lastPolled.find(key);
                     if (it == g_lastPolled.end() || SnapshotChanged(it->second, polled)) {
