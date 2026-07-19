@@ -60,6 +60,17 @@ struct ParamSnapshot {
     uint64_t revision = 0;
 };
 
+// Effect -> window: the state of the in-effect multi-frame analysis (Phase 5), so the
+// window can show an "Analyzing 3/8..." indicator and an analyzed/stale badge. Published
+// by the idle-hook analysis driver; purely informational (no control flow depends on it).
+struct AnalysisStatus {
+    enum class State : int { Idle = 0, Sampling = 1, Analyzed = 2 };
+    State state = State::Idle;
+    int   sampled = 0;   // frames checked out so far (Sampling)
+    int   total = 0;     // frames in the current schedule
+    bool  fromCache = false;  // the analyzed stats were served from the results cache
+};
+
 // --- percent <-> fraction (the UI shows percents; params are fractions) -----
 
 inline double clamp01(double v) { return v < 0.0 ? 0.0 : (v > 1.0 ? 1.0 : v); }

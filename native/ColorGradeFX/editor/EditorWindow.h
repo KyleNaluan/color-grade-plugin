@@ -57,9 +57,27 @@ public:
     // evict its own copy independently of what the window is displaying.
     void publishPreviewFrame(InstanceKey key, std::shared_ptr<const PreviewFrame> frame);
 
+    // Effect -> window: publish the "before" frame (Phase 5) - the ORIGINAL decoded clip
+    // pixels (V-Log decoded, never raw log), checked out UPSTREAM of this effect. The
+    // window draws it against the graded preview in before/after and split modes. Ignored
+    // if no window is open for `key`.
+    void publishBeforeFrame(InstanceKey key, std::shared_ptr<const PreviewFrame> frame);
+
+    // Effect -> window: publish the current in-effect analysis status (Phase 5) so the
+    // window can show an "Analyzing n/N" indicator + an analyzed badge. Ignored if closed.
+    void publishAnalysisStatus(InstanceKey key, const AnalysisStatus& status);
+
     // Window -> effect: take the edits the user made since the last drain (empty if
     // none / no window). The caller applies them to the effect's params.
     std::vector<ParamEdit> drainEdits(InstanceKey key);
+
+    // Window -> effect: does the window's compare mode need the "before" frame? The idle
+    // hook skips the extra upstream checkout when the window shows only the graded output.
+    bool wantsBeforeFrame(InstanceKey key);
+
+    // Window -> effect: did the user click "Analyze" (force a re-analysis)? Consumes the
+    // one-shot request so the idle hook re-runs the multi-frame analysis for this instance.
+    bool consumeAnalyzeRequest(InstanceKey key);
 
     // The keys of all currently-open windows (for the idle-hook driver to iterate).
     std::vector<InstanceKey> openKeys();
