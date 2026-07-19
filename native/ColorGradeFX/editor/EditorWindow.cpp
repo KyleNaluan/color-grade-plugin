@@ -354,7 +354,13 @@ void DrawViewerToolbar(WindowImpl* w) {
     if (mode == 2) {
         ImGui::SameLine();
         ImGui::SetNextItemWidth(160.0f);
-        ImGui::SliderFloat("Split", &w->splitFraction, 0.0f, 1.0f, "%.2f");
+        // Unique ID: the label must differ from the "Split" radio above, or ImGui flags an
+        // ID conflict. "##splitpos" hides the label text (the adjacent radio names it) while
+        // giving the slider its own id. The leading text keeps context visible.
+        ImGui::TextUnformatted("pos");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(140.0f);
+        ImGui::SliderFloat("##splitpos", &w->splitFraction, 0.0f, 1.0f, "%.2f");
     }
 }
 
@@ -422,35 +428,58 @@ void DrawPreviewPane(WindowImpl* w) {
     }
 }
 
-// The scopes strip below the preview: waveform | histogram | vectorscope, each a GPU
-// texture drawn with AddImage (the same GPU path as the preview).
+// The scopes strip below the preview: waveform | histogram | vectorscope in three EQUAL
+// columns that fill the strip's width at ANY window size. Each plot is a GPU texture drawn
+// with AddImage (same GPU path as the preview) and hard-clipped to its box so it never
+// bleeds outside. Waveform + histogram FILL their box interior (they're resolution-agnostic
+// signal plots, so horizontal stretch is expected); the vectorscope keeps a 1:1 square,
+// centered (letterboxFit). Sizes are recomputed from the live content region every frame,
+// so windowed / fullscreen / live-resize all track correctly.
 void DrawScopesStrip(WindowImpl* w) {
     ImGui::Spacing();
-    ImVec2 avail = ImGui::GetContentRegionAvail();
-    const float h = 140.0f;
+    const ImVec2 avail = ImGui::GetContentRegionAvail();
+    if (avail.x < 30.0f || avail.y < 24.0f) return;  // too small to draw anything sensible
     const float gap = 8.0f;
-    // Vectorscope is square (h x h); the remaining width splits between waveform + histogram.
-    const float squareW = h;
-    float wide = (avail.x - squareW - gap * 2.0f) * 0.5f;
-    if (wide < 40.0f) wide = 40.0f;
+    const float h = avail.y < 150.0f ? avail.y : 150.0f;  // fit even a short window
+    const float colW = (avail.x - gap * 2.0f) / 3.0f;     // three equal columns
+    if (colW < 20.0f) return;
 
     ImDrawList* dl = ImGui::GetWindowDrawList();
-    ImVec2 base = ImGui::GetCursorScreenPos();
+    const ImVec2 base = ImGui::GetCursorScreenPos();
+    const float labelH = ImGui::GetTextLineHeight() + 4.0f;
+    const float pad = 4.0f;
 
-    auto panel = [&](const GpuTex& t, const char* label, float x, float wpx) {
-        ImVec2 a(x, base.y), b(x + wpx, base.y + h);
+    auto panel = [&](const GpuTex& t, const char* label, int idx, bool square) {
+        const float x0 = base.x + static_cast<float>(idx) * (colW + gap);
+        const ImVec2 a(x0, base.y);
+        const ImVec2 b(x0 + colW, base.y + h);
         dl->AddRectFilled(a, b, IM_COL32(16, 16, 20, 255));
         dl->AddRect(a, b, IM_COL32(70, 70, 80, 255));
-        if (t.ready()) {
-            FitRect fit = letterboxFit(wpx, h, t.w, t.h);
-            ImVec2 mn(a.x + fit.x, a.y + fit.y), mx(mn.x + fit.w, mn.y + fit.h);
-            dl->AddImage(reinterpret_cast<ImTextureID>(t.srv), mn, mx);
+        // Interior below the label, inset by pad on every side.
+        const float ix0 = a.x + pad;
+        const float iy0 = a.y + labelH;
+        const float iw = colW - pad * 2.0f;
+        const float ih = (b.y - pad) - iy0;
+        if (t.ready() && iw > 2.0f && ih > 2.0f) {
+            dl->PushClipRect(a, b, true);  // hard clip: nothing draws outside the box
+            if (square) {
+                // Vectorscope: preserve 1:1, centered in the interior.
+                FitRect fit = letterboxFit(iw, ih, t.w, t.h);
+                ImVec2 mn(ix0 + fit.x, iy0 + fit.y);
+                ImVec2 mx(mn.x + fit.w, mn.y + fit.h);
+                dl->AddImage(reinterpret_cast<ImTextureID>(t.srv), mn, mx);
+            } else {
+                // Waveform / histogram: fill the interior.
+                dl->AddImage(reinterpret_cast<ImTextureID>(t.srv), ImVec2(ix0, iy0),
+                             ImVec2(ix0 + iw, iy0 + ih));
+            }
+            dl->PopClipRect();
         }
         dl->AddText(ImVec2(a.x + 4, a.y + 2), IM_COL32(180, 180, 190, 255), label);
     };
-    panel(w->waveTex, "Waveform", base.x, wide);
-    panel(w->histTex, "Histogram", base.x + wide + gap, wide);
-    panel(w->vecTex, "Vectorscope", base.x + wide * 2 + gap * 2, squareW);
+    panel(w->waveTex, "Waveform", 0, false);
+    panel(w->histTex, "Histogram", 1, false);
+    panel(w->vecTex, "Vectorscope", 2, true);
     ImGui::Dummy(ImVec2(avail.x, h));
 }
 
@@ -602,6 +631,12 @@ void RunWindowThread(WindowImpl* w, ParamSnapshot seed) {
     ImGuiIO& io = ImGui::GetIO();
     io.IniFilename = nullptr;  // don't litter the user's disk with imgui.ini
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+#ifdef _DEBUG
+    // Keep ImGui's duplicate-ID detector ON in Debug so any future same-label widget
+    // clash surfaces immediately (captain round-1 finding: Split radio vs split slider).
+    // Default is already true in this ImGui (1.91.5); set explicitly so it never regresses.
+    io.ConfigDebugHighlightIdConflicts = true;
+#endif
     ImGui::StyleColorsDark();
     ImGui_ImplWin32_Init(hwnd);
     ImGui_ImplDX11_Init(w->device, w->context);

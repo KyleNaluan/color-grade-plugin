@@ -346,6 +346,18 @@ persistence); (c) the multi-instance limitation from Phase 4 (two CG effects on 
 carries over; (d) sync upstream checkout, like the Phase 4 preview, could move to the async
 render variant if analysis latency ever needs it.
 
+**Captain round-1 verification (functional PASS)** landed two fixes, both AE-verified next
+round: (1) the Split radio and the split-position slider shared the label "Split" and so
+shared an ImGui ID (debug overlay) - the slider now uses a unique `##splitpos` id, and
+`io.ConfigDebugHighlightIdConflicts` is kept ON in Debug so any future clash surfaces; (2) the
+scopes drew at their source size centered in wide boxes (dead margins) with the vectorscope
+clipped off the window edge - the strip now lays out three EQUAL columns from the live content
+region every frame, waveform/histogram fill their box interior, the vectorscope stays 1:1
+square + centered, and each plot is hard-clipped to its box (correct windowed / fullscreen /
+live-resize). **Deferred - dedicated UI-polish pass:** the captain wants the whole editor
+restyled (prettier/sleeker) once all feature phases land (with/after Phase 6); do NOT restyle
+piecemeal before then - this is a tracked follow-up, not a Phase 5 gap.
+
 ## Consequences
 
 - **Positive:** single-file signed `.aex` stays intact; one UI codebase Win+Mac; the
