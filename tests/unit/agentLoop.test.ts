@@ -34,12 +34,18 @@ function impactFrom(sig: GradeRoundSignal): GradeImpact {
   };
 }
 
-const proposal = (defectCount: number, verdict: 'continue' | 'stop' = 'continue'): CriticProposal =>
+const proposal = (
+  defectCount: number,
+  seed: number,
+  verdict: 'continue' | 'stop' = 'continue',
+): CriticProposal =>
   parseCriticProposal({
     critique: '',
     defects: Array.from({ length: defectCount }, (_, i) => `defect ${i}`),
-    // A non-empty override so the loop always has "a next thing to try".
-    proposedOverrides: { chromaGain: 0.5 },
+    // A distinct override each round so the loop always has a genuinely new
+    // "next thing to try" (a constant override would value-equal the prior
+    // params and correctly short-circuit the loop).
+    proposedOverrides: { chromaGain: 0.5 + seed * 0.05 },
     verdict,
     verdictReasoning: '',
   });
@@ -60,8 +66,9 @@ function driveWith(queue: Array<{ sig: GradeRoundSignal; defects: number; verdic
   const critique = (round: RenderedRound<number>): CriticProposal => {
     const entry = queue[Math.min(idx, queue.length - 1)]!;
     seen.push(idx);
+    const seed = idx;
     idx += 1;
-    return proposal(entry.defects, entry.verdict);
+    return proposal(entry.defects, seed, entry.verdict);
   };
   return runAutoGradeLoop<number>({ render, critique }, {
     baseParams: { strength: 1, skinProtection: 0.5, overrides: {} },
@@ -150,6 +157,34 @@ describe('runAutoGradeLoop - s7 golden rounds', () => {
     expect(result.stopReason).toMatch(/converged|no named defects/);
     // Stopped at round 1, well before the 5-round cap (baseline + 1 tuned round).
     expect(result.rounds.length).toBe(2);
+  });
+
+  it('short-circuits (no burned critic call) when the proposal yields params identical to the best', async () => {
+    let renders = 0;
+    let critiques = 0;
+    const render = (params: AutoGradeParams): RenderedRound<number> => {
+      renders += 1;
+      return { params, impact: impactFrom(expBRounds.baseline), frame: renders };
+    };
+    // Critic keeps naming a defect but proposes the same (empty) override forever.
+    const critique = (): CriticProposal => {
+      critiques += 1;
+      return parseCriticProposal({
+        defects: ['stubborn defect'],
+        proposedOverrides: {},
+        verdict: 'continue',
+        verdictReasoning: '',
+      });
+    };
+    const result = await runAutoGradeLoop<number>({ render, critique }, {
+      baseParams: { strength: 1, skinProtection: 0.5, overrides: {} },
+      maxRounds: 5,
+    });
+    // Only the baseline render+critique run; round 1 short-circuits before render.
+    expect(renders).toBe(1);
+    expect(critiques).toBe(1);
+    expect(result.best.round).toBe(0);
+    expect(result.stopReason).toMatch(/no parameter change/);
   });
 
   it('honors maxRounds as an upper bound', async () => {

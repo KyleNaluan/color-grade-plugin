@@ -88,6 +88,31 @@ export function applyProposal(current: AutoGradeParams, proposal: CriticProposal
   return merged;
 }
 
+/** Value-equality of two parameter sets: strength, skin protection, and the full override tree. */
+export function paramsEqual(a: AutoGradeParams, b: AutoGradeParams): boolean {
+  return (
+    a.strength === b.strength &&
+    a.skinProtection === b.skinProtection &&
+    deepEqual(a.overrides, b.overrides)
+  );
+}
+
+function deepEqual(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  if (typeof a !== typeof b) return false;
+  if (a === null || b === null || typeof a !== 'object') return false;
+  if (Array.isArray(a) || Array.isArray(b)) {
+    if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
+    return a.every((v, i) => deepEqual(v, b[i]));
+  }
+  const ao = a as Record<string, unknown>;
+  const bo = b as Record<string, unknown>;
+  const aKeys = Object.keys(ao).filter((k) => ao[k] !== undefined);
+  const bKeys = Object.keys(bo).filter((k) => bo[k] !== undefined);
+  if (aKeys.length !== bKeys.length) return false;
+  return aKeys.every((k) => deepEqual(ao[k], bo[k]));
+}
+
 function mergeOverrides(cur: ThemeOverrides, next: ThemeOverrides): ThemeOverrides {
   const out: ThemeOverrides = { ...cur, ...next };
   if (cur.chromaShape || next.chromaShape) {
@@ -132,6 +157,10 @@ export async function runAutoGradeLoop<Frame>(
 
   for (let round = 1; round <= config.maxRounds; round++) {
     const candidateParams = applyProposal(best.params, best.proposal);
+    if (paramsEqual(candidateParams, best.params)) {
+      stopReason = `converged: critic proposed no parameter change at round ${round} (kept round ${best.round})`;
+      break;
+    }
     const r = await deps.render(candidateParams);
     const p = await deps.critique(r);
 

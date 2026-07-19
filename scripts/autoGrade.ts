@@ -171,7 +171,7 @@ async function main(): Promise<void> {
     console.log(`validating key ${maskKey(key)} ...`);
     const status = await validateGeminiKey(key, { probe: true, probeModel: model });
     console.log(JSON.stringify({ ...status, availableModels: `${status.availableModels.length} models` }, null, 2));
-    process.exit(status.ok ? 0 : 1);
+    process.exit(status.ok && status.generationConfirmed ? 0 : 1);
   }
 
   if (!framePath) fail('usage: npm run auto-grade -- <frame.tif> <theme|stats-only> [options]');
