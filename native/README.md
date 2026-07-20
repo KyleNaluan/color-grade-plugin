@@ -58,9 +58,12 @@ SDK plugin.
   oracle (`scripts/agentBridge.ts` reusing `src/agent` + `src/core`), talking a tiny line-based
   wire protocol so the C++ side needs no JSON library. The model NAMES defects and the
   rule-based `gradeGuard` is the sole accept/reject authority; the Gemini key rides
-  `GEMINI_API_KEY` on the child only (BYOK). Still gated behind `kAgentDockEnabled`. The pure
-  seam is `editor/AgentBridge.h`; the Win32 subprocess/dialog layer is captain-verified
-  (see `docs/adr-agent-execution.md` and BUILDING.md checklist item 9).
+  `GEMINI_API_KEY` on the child only (BYOK). The bridge path + launcher and the DPAPI-encrypted
+  key persist in `%APPDATA%\ColorGradeFX\agent.cfg` (seed with `npm run native:agent-config`;
+  `CG_AGENT_BRIDGE`/`CG_AGENT_NODE` stay overrides), so it works with no per-session env and the
+  key survives restarts. Still gated behind `kAgentDockEnabled`. The pure seam is
+  `editor/AgentBridge.h`; the Win32 subprocess/dialog/DPAPI + window-close teardown layer is
+  captain-verified (see `docs/adr-agent-execution.md` and BUILDING.md checklist item 9).
 
 ## Layout
 

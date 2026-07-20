@@ -62,15 +62,37 @@ committed, never firstmate's. The bridge reads it only from that env var.
 
 ### Deployment
 
-The plugin resolves the bridge via env, mirroring `CG_LUT_PATH` / `CG_REF_STATS_PATH`:
+The AE panel process AE launches from Explorer **never inherits a shell's environment**, so an
+exported `CG_AGENT_BRIDGE` / `GEMINI_API_KEY` is invisible to it - relying on env alone left the
+feature dead in the real runtime (bridge "not configured", key re-typed every session). The
+plugin therefore resolves the bridge and persists the key from a per-user **settings file**, with
+env kept as an override (cg-agent-fixes-v4):
 
-- `CG_AGENT_BRIDGE` = absolute path to the runnable bridge (the repo's
-  `scripts/agentBridge.ts`, or a prebuilt `.js`/`.mjs`). Unset / not-found → the panel shows
-  "agent bridge not configured", never a silent no-op.
-- `CG_AGENT_NODE` = launcher (default `node`; auto-upgraded to `npx tsx` when the bridge ends
-  in `.ts`). The command runs under `cmd.exe /c` so `npx`/`.cmd` shims and `PATH` resolve, with
-  the working directory set to the bridge's folder (so a repo-relative `tsx` finds
-  `node_modules`).
+    %APPDATA%\ColorGradeFX\agent.cfg   (tiny key=value text; parsed by AgentBridge.h)
+
+**Bridge path** precedence (`AgentBridge.h::chooseBridgePath`, each candidate validated to exist):
+
+1. `CG_AGENT_BRIDGE` env - explicit override (power user / CI).
+2. `bridge=` in the settings file - the normal path.
+3. A bridge discovered next to the `.aex` (`agentBridge.mjs/.js/.cjs`, `scripts\agentBridge.ts`).
+
+Seed the settings file **once** from the Node checkout that will run the bridge (the one with
+`node_modules`):
+
+    npm run native:agent-config                       # bridge= -> this repo's scripts/agentBridge.ts
+    npm run native:agent-config -- --bridge <path> --node "<launcher>"
+
+`scripts/writeAgentConfig.ts` writes `bridge=`/`node=` while **preserving** the stored key, is
+cross-boundary aware (native Windows Node uses `%APPDATA%` directly; under WSL it derives it via
+`cmd.exe` and converts paths with `wslpath`), and stores the bridge as a Windows path so Windows
+Node can launch it. `CG_AGENT_NODE` (or `node=`) overrides the launcher; a `.ts` bridge
+auto-upgrades `node` → `npx tsx`. The command still runs under `cmd.exe /c` with the working
+directory set to the bridge's folder.
+
+**API key** (issue 3): the panel stores the BYOK key **DPAPI-encrypted** (`CryptProtectData`,
+user-scoped) as `apiKeyEnc=` in the same file, so it survives restarts and is never written in the
+clear, never logged, never committed. Remove deletes the stored blob. `GEMINI_API_KEY` still only
+ever reaches the child process (never the request file).
 
 Node + the repo are a **dev-box / pre-release** requirement (BYOK, captain-verified), consistent
 with `data/cg-distribution-decision.md`. A bundled, Node-free runtime is out of scope for this pass.
@@ -123,5 +145,12 @@ with `data/cg-distribution-decision.md`. A bundled, Node-free runtime is out of 
   process tree down at once and the worker join returns promptly - a bare shell kill would orphan
   the real node worker, which could still write the response file and collide.
 - Two editor windows running jobs at once use per-window temp files (keyed on the instance uid).
+- **Window-close teardown** (cg-agent-fixes-v4): `WindowImpl` owns the worker as a `std::thread`
+  member, so EVERY teardown path must terminate the Job Object and JOIN that thread before
+  `delete w` - a joinable `std::thread` destructor calls `std::terminate()`, and the detached
+  worker holds a raw `w`. The user-close reap path (`ReapFinishedLocked`) originally skipped this,
+  so closing the window after using an agent feature crashed AE ("error trying to invoke the effect
+  Color Grade FX"). Both `ReapFinishedLocked` and `DestroyWindowImplLocked` now funnel through the
+  one `StopAgentWorkLocked` helper.
 - The agent dock stays the single Pro/BYOK seam behind `kAgentDockEnabled`; nothing here couples
   a Pro-able feature into the free core (monetization constraint, `data/cg-monetization-decision.md`).

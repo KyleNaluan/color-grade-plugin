@@ -27,6 +27,7 @@
 #include <cstdlib>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "EditorBridge.h"
@@ -308,6 +309,88 @@ struct AgentJobResult {
     AgentResponse response;   // valid when state == Done
     std::string   error;      // set when state == Failed (spawn/read failure etc.)
 };
+
+// --- persisted agent settings (cg-agent-fixes-v4) ---------------------------
+//
+// The editor persists its BYOK key and the resolved bridge location so the agent
+// surfaces work "as installed" - the panel process AE launches never inherits a
+// shell's CG_AGENT_BRIDGE / GEMINI_API_KEY env, so relying on those alone left the
+// feature dead (bridge "not configured", key re-typed every session). This is the
+// pure, host-agnostic model of that config file (a tiny `key=value` text, same
+// spirit as the .cube / reference-stats sidecars); the Win32 file I/O, the
+// %APPDATA% location, and the DPAPI encrypt/decrypt of the key live in
+// EditorWindow.cpp. Keeping parse/format/precedence here lets native:agent-test
+// prove them without AE. Unknown keys are preserved on round-trip (forward compat).
+//
+// Recognised keys: `bridge` (runnable bridge path), `node` (launcher override),
+// `apiKeyEnc` (DPAPI-protected key, hex - never the plaintext key).
+struct AgentConfig {
+    std::vector<std::pair<std::string, std::string> > entries;
+
+    std::string get(const std::string& key) const {
+        for (const auto& kv : entries) if (kv.first == key) return kv.second;
+        return std::string();
+    }
+    // Set (replace) a key; an empty value REMOVES it so a cleared field doesn't
+    // linger in the file (e.g. Remove-key deletes apiKeyEnc entirely).
+    void set(const std::string& key, const std::string& value) {
+        for (auto it = entries.begin(); it != entries.end(); ++it) {
+            if (it->first == key) {
+                if (value.empty()) entries.erase(it);
+                else it->second = value;
+                return;
+            }
+        }
+        if (!value.empty()) entries.push_back(std::make_pair(key, value));
+    }
+};
+
+inline AgentConfig parseAgentConfig(const std::string& text) {
+    AgentConfig cfg;
+    std::istringstream in(text);
+    std::string line;
+    while (std::getline(in, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        std::string t = detail::trim(line);
+        if (t.empty() || t[0] == '#') continue;   // blank / comment
+        size_t eq = t.find('=');
+        if (eq == std::string::npos) continue;      // not key=value: skip
+        std::string key = detail::trim(t.substr(0, eq));
+        std::string val = detail::trim(t.substr(eq + 1));
+        if (key.empty()) continue;
+        cfg.set(key, val);
+    }
+    return cfg;
+}
+
+inline std::string formatAgentConfig(const AgentConfig& cfg) {
+    std::ostringstream o;
+    o << "# ColorGradeFX agent settings (auto-managed). Do not commit; contains a\n"
+         "# DPAPI-protected API key (apiKeyEnc). bridge/node point at the Node bridge.\n";
+    for (const auto& kv : cfg.entries) o << kv.first << "=" << kv.second << "\n";
+    return o.str();
+}
+
+// Choose the runnable bridge path by precedence: an explicit CG_AGENT_BRIDGE env
+// override wins; else the persisted `bridge=` from the settings file; else a path
+// discovered next to the plug-in. Each argument is passed already-validated (the
+// caller only supplies a candidate that exists on disk / is non-empty), so this is
+// a pure first-non-empty pick - the single place the precedence order is defined.
+inline std::string chooseBridgePath(const std::string& envOverride,
+                                    const std::string& configBridge,
+                                    const std::string& discoveredProbe) {
+    if (!envOverride.empty())   return envOverride;
+    if (!configBridge.empty())  return configBridge;
+    return discoveredProbe;     // may be empty -> "not configured"
+}
+
+// Choose the launcher: CG_AGENT_NODE env override, else the persisted `node=`, else
+// the default ("node", which the spawner auto-upgrades to "npx tsx" for a .ts bridge).
+inline std::string chooseLauncher(const std::string& envOverride, const std::string& configNode) {
+    if (!envOverride.empty())  return envOverride;
+    if (!configNode.empty())   return configNode;
+    return "node";
+}
 
 }  // namespace editor
 }  // namespace cg

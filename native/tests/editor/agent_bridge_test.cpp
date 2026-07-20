@@ -207,6 +207,53 @@ static void test_translate_apply() {
     CHECK(translateAgentApply({}, base).empty(), "empty apply -> no edits");
 }
 
+// --- persisted settings + bridge resolution (cg-agent-fixes-v4) -------------
+static void test_agent_config() {
+    // Parse a real settings file with a comment, blank lines, and CRLF.
+    std::string text =
+        "# ColorGradeFX agent settings\r\n"
+        "\r\n"
+        "bridge=C:\\dev\\color-grade-plugin\\scripts\\agentBridge.ts\r\n"
+        "node=npx tsx\r\n"
+        "apiKeyEnc=deadbeef01\r\n";
+    AgentConfig cfg = parseAgentConfig(text);
+    CHECK(cfg.get("bridge") == "C:\\dev\\color-grade-plugin\\scripts\\agentBridge.ts", "cfg bridge");
+    CHECK(cfg.get("node") == "npx tsx", "cfg node (value keeps spaces)");
+    CHECK(cfg.get("apiKeyEnc") == "deadbeef01", "cfg apiKeyEnc");
+    CHECK(cfg.get("missing").empty(), "cfg missing key -> empty");
+
+    // Round-trip preserves all entries.
+    AgentConfig re = parseAgentConfig(formatAgentConfig(cfg));
+    CHECK(re.get("bridge") == cfg.get("bridge"), "round-trip bridge");
+    CHECK(re.get("apiKeyEnc") == cfg.get("apiKeyEnc"), "round-trip apiKeyEnc");
+
+    // set() replaces; empty value REMOVES (so Remove-key deletes the line entirely).
+    cfg.set("apiKeyEnc", "");
+    CHECK(cfg.get("apiKeyEnc").empty(), "cleared apiKeyEnc removed");
+    CHECK(formatAgentConfig(cfg).find("apiKeyEnc=") == std::string::npos, "apiKeyEnc entry absent after clear");
+    CHECK(cfg.get("bridge") == "C:\\dev\\color-grade-plugin\\scripts\\agentBridge.ts",
+          "clearing one key preserves the others");
+    cfg.set("node", "node");  // replace in place
+    CHECK(cfg.get("node") == "node", "set() replaces existing");
+}
+
+static void test_bridge_precedence() {
+    // env override always wins.
+    CHECK(chooseBridgePath("E:\\env.ts", "C:\\cfg.ts", "D:\\probe.mjs") == "E:\\env.ts",
+          "env override wins");
+    // no env -> config next.
+    CHECK(chooseBridgePath("", "C:\\cfg.ts", "D:\\probe.mjs") == "C:\\cfg.ts", "config beats probe");
+    // no env/config -> discovered probe.
+    CHECK(chooseBridgePath("", "", "D:\\probe.mjs") == "D:\\probe.mjs", "probe is last resort");
+    // nothing -> empty ("not configured").
+    CHECK(chooseBridgePath("", "", "").empty(), "nothing configured -> empty");
+
+    // launcher precedence: env -> config -> default "node".
+    CHECK(chooseLauncher("npx tsx", "node") == "npx tsx", "launcher env wins");
+    CHECK(chooseLauncher("", "custom-node") == "custom-node", "launcher config next");
+    CHECK(chooseLauncher("", "") == "node", "launcher defaults to node");
+}
+
 int main(int argc, char** argv) {
     std::string fixDir = argc > 1 ? argv[1] : "native/tests/fixtures/agent";
     test_format_request();
@@ -215,6 +262,8 @@ int main(int argc, char** argv) {
     test_parse_error_response();
     test_fixtures(fixDir);
     test_translate_apply();
+    test_agent_config();
+    test_bridge_precedence();
     if (g_failures) {
         std::printf("agent_bridge_test: %d failure(s)\n", g_failures);
         return 1;

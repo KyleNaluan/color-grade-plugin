@@ -28,8 +28,12 @@
 #include <windows.h>
 #include <commdlg.h>   // cg-agent-wiring: GetOpenFileName for the reference/batch pickers
 #include <d3d11.h>
+#include <shlobj.h>    // cg-agent-fixes-v4: SHGetFolderPath for the %APPDATA% settings dir
+#include <wincrypt.h>  // cg-agent-fixes-v4: DPAPI CryptProtectData for the persisted API key
 
 #pragma comment(lib, "comdlg32.lib")
+#pragma comment(lib, "shell32.lib")   // SHGetFolderPathW
+#pragma comment(lib, "crypt32.lib")   // CryptProtectData / CryptUnprotectData (DPAPI)
 
 #include "../../third_party/imgui/imgui.h"
 #include "../../third_party/imgui/backends/imgui_impl_win32.h"
@@ -1672,23 +1676,174 @@ bool WriteFrameDump(const std::string& path, const PreviewFrame& f) {
     return out.good();
 }
 
-// Resolve the bridge command line. CG_AGENT_BRIDGE = the runnable script (required); the
-// launcher is CG_AGENT_NODE (default "node"). On the dev box the captain sets, e.g.,
-// CG_AGENT_BRIDGE=C:\dev\color-grade-plugin\scripts\agentBridge.ts and CG_AGENT_NODE="npx tsx".
-// Returns "" when the bridge is not configured / not found, so the panel shows a clear error.
-std::string ResolveAgentBridge() {
+// --- persisted agent settings (%APPDATA%\ColorGradeFX\agent.cfg) ------------
+//
+// Why this exists: the AE panel process never inherits a shell's CG_AGENT_BRIDGE /
+// GEMINI_API_KEY, so the agent surfaces only worked when the captain exported env
+// vars before launching AE - which is impossible from Explorer, leaving the feature
+// dead ("bridge not configured") and re-prompting for the key every session. We
+// persist the bridge path + launcher and the BYOK key (DPAPI-encrypted) in a
+// per-user settings file so it works across restarts with NO per-session env. The
+// env vars stay OVERRIDES for power users / CI. Seed the bridge path once with
+// `npm run native:agent-config` (writes bridge=/node= into this same file). The pure
+// parse/format/precedence live in AgentBridge.h (headless-tested).
+
+static std::string EnvNarrow(const wchar_t* name) {
     wchar_t buf[MAX_PATH * 4];
-    DWORD n = ::GetEnvironmentVariableW(L"CG_AGENT_BRIDGE", buf, MAX_PATH * 4);
-    if (n == 0 || n >= MAX_PATH * 4) return "";
-    std::wstring bridge(buf, n);
-    if (::GetFileAttributesW(bridge.c_str()) == INVALID_FILE_ATTRIBUTES) return "";
-    return NarrowUtf8(bridge);
-}
-std::string ResolveAgentLauncher() {
-    wchar_t buf[MAX_PATH * 4];
-    DWORD n = ::GetEnvironmentVariableW(L"CG_AGENT_NODE", buf, MAX_PATH * 4);
-    if (n == 0 || n >= MAX_PATH * 4) return "node";
+    DWORD n = ::GetEnvironmentVariableW(name, buf, sizeof(buf) / sizeof(buf[0]));
+    if (n == 0 || n >= sizeof(buf) / sizeof(buf[0])) return std::string();
     return NarrowUtf8(std::wstring(buf, n));
+}
+static bool FileExistsW(const std::wstring& p) {
+    return !p.empty() && ::GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES;
+}
+
+// Directory of THIS plug-in binary (so a shipped bridge can sit next to the .aex).
+static std::wstring PluginDirW() {
+    HMODULE hm = nullptr;
+    if (!::GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                  GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                              reinterpret_cast<LPCWSTR>(&PluginDirW), &hm)) {
+        return std::wstring();
+    }
+    wchar_t path[MAX_PATH * 4];
+    DWORD n = ::GetModuleFileNameW(hm, path, sizeof(path) / sizeof(path[0]));
+    if (n == 0) return std::wstring();
+    std::wstring full(path, n);
+    size_t slash = full.find_last_of(L"\\/");
+    return slash == std::wstring::npos ? std::wstring() : full.substr(0, slash + 1);
+}
+// Probe next to the plug-in for a shipped bridge (a prebuilt .mjs/.js or the repo
+// script). Empty if none - then only env / the settings file can supply it.
+static std::string DiscoverBridgeNearPlugin() {
+    std::wstring dir = PluginDirW();
+    if (dir.empty()) return std::string();
+    const wchar_t* cands[] = {L"agentBridge.mjs", L"agentBridge.js", L"agentBridge.cjs",
+                              L"scripts\\agentBridge.ts", L"agentBridge.ts"};
+    for (const wchar_t* c : cands) {
+        std::wstring p = dir + c;
+        if (FileExistsW(p)) return NarrowUtf8(p);
+    }
+    return std::string();
+}
+
+// %APPDATA%\ColorGradeFX\agent.cfg (dir created on demand). Empty on failure.
+static std::wstring AgentSettingsPathW() {
+    wchar_t appdata[MAX_PATH];
+    if (FAILED(::SHGetFolderPathW(nullptr, CSIDL_APPDATA, nullptr, SHGFP_TYPE_CURRENT, appdata)))
+        return std::wstring();
+    std::wstring dir = std::wstring(appdata) + L"\\ColorGradeFX";
+    ::CreateDirectoryW(dir.c_str(), nullptr);  // no-op if it already exists
+    return dir + L"\\agent.cfg";
+}
+static AgentConfig ReadAgentSettings() {
+    std::wstring path = AgentSettingsPathW();
+    if (path.empty()) return AgentConfig();
+    std::ifstream f(path.c_str(), std::ios::binary);
+    if (!f) return AgentConfig();
+    std::ostringstream ss;
+    ss << f.rdbuf();
+    return parseAgentConfig(ss.str());
+}
+static bool WriteAgentSettings(const AgentConfig& cfg) {
+    std::wstring path = AgentSettingsPathW();
+    if (path.empty()) return false;
+    std::ofstream f(path.c_str(), std::ios::binary | std::ios::trunc);
+    if (!f) return false;
+    f << formatAgentConfig(cfg);
+    return f.good();
+}
+
+// DPAPI (user-scoped, machine-bound): protect a plaintext key to a hex string and
+// back. Empty on failure - the caller then skips persistence rather than ever
+// writing the key in the clear. The key is never logged.
+static std::string HexEncode(const BYTE* p, DWORD n) {
+    static const char* H = "0123456789abcdef";
+    std::string s;
+    s.reserve(n * 2);
+    for (DWORD i = 0; i < n; ++i) { s.push_back(H[p[i] >> 4]); s.push_back(H[p[i] & 0xF]); }
+    return s;
+}
+static bool HexDecode(const std::string& s, std::vector<BYTE>& out) {
+    if (s.empty() || s.size() % 2) return false;
+    auto nib = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+    };
+    out.clear();
+    out.reserve(s.size() / 2);
+    for (size_t i = 0; i < s.size(); i += 2) {
+        int hi = nib(s[i]), lo = nib(s[i + 1]);
+        if (hi < 0 || lo < 0) return false;
+        out.push_back(static_cast<BYTE>((hi << 4) | lo));
+    }
+    return true;
+}
+static std::string DpapiProtect(const std::string& plain) {
+    if (plain.empty()) return std::string();
+    DATA_BLOB in;
+    in.pbData = reinterpret_cast<BYTE*>(const_cast<char*>(plain.data()));
+    in.cbData = static_cast<DWORD>(plain.size());
+    DATA_BLOB out;
+    ZeroMemory(&out, sizeof(out));
+    if (!::CryptProtectData(&in, L"ColorGradeFX agent key", nullptr, nullptr, nullptr,
+                            CRYPTPROTECT_UI_FORBIDDEN, &out))
+        return std::string();
+    std::string hex = HexEncode(out.pbData, out.cbData);
+    ::LocalFree(out.pbData);
+    return hex;
+}
+static std::string DpapiUnprotect(const std::string& hex) {
+    std::vector<BYTE> blob;
+    if (!HexDecode(hex, blob)) return std::string();
+    DATA_BLOB in;
+    in.pbData = blob.data();
+    in.cbData = static_cast<DWORD>(blob.size());
+    DATA_BLOB out;
+    ZeroMemory(&out, sizeof(out));
+    if (!::CryptUnprotectData(&in, nullptr, nullptr, nullptr, nullptr,
+                              CRYPTPROTECT_UI_FORBIDDEN, &out))
+        return std::string();
+    std::string plain(reinterpret_cast<char*>(out.pbData), out.cbData);
+    ::LocalFree(out.pbData);
+    return plain;
+}
+
+// Load the persisted BYOK key (decrypted) into the window's key buffer, if present.
+// Called once on window open so a saved key survives restarts (DoD item: persist key).
+void LoadPersistedKey(WindowImpl* w) {
+    std::string key = DpapiUnprotect(ReadAgentSettings().get("apiKeyEnc"));
+    if (key.empty() || key.size() >= sizeof(w->agentKeyBuf)) return;
+    std::memcpy(w->agentKeyBuf, key.data(), key.size());
+    w->agentKeyBuf[key.size()] = 0;
+    w->agentKeySet = true;
+}
+// Persist (encrypted) or clear the BYOK key in the settings file, preserving the
+// bridge/node entries. `key` empty => remove the stored key (Remove button).
+void PersistKey(const std::string& key) {
+    AgentConfig cfg = ReadAgentSettings();
+    cfg.set("apiKeyEnc", key.empty() ? std::string() : DpapiProtect(key));
+    WriteAgentSettings(cfg);
+}
+
+// Resolve the runnable bridge path. Precedence (chooseBridgePath): CG_AGENT_BRIDGE
+// env override -> persisted `bridge=` -> a bridge discovered next to the plug-in.
+// Each candidate is validated to exist on disk before it is offered, so a stale
+// path never wins. Empty result => the panel shows "not configured" (never a silent
+// no-op). Seed the settings file once with `npm run native:agent-config`.
+std::string ResolveAgentBridge() {
+    std::string envVal = EnvNarrow(L"CG_AGENT_BRIDGE");
+    if (!envVal.empty() && !FileExistsW(WidenUtf8(envVal))) envVal.clear();
+    std::string cfgBridge = ReadAgentSettings().get("bridge");
+    if (!cfgBridge.empty() && !FileExistsW(WidenUtf8(cfgBridge))) cfgBridge.clear();
+    return chooseBridgePath(envVal, cfgBridge, DiscoverBridgeNearPlugin());
+}
+// Launcher: CG_AGENT_NODE env override -> persisted `node=` -> default "node"
+// (SpawnBridge auto-upgrades to "npx tsx" for a .ts bridge).
+std::string ResolveAgentLauncher() {
+    return chooseLauncher(EnvNarrow(L"CG_AGENT_NODE"), ReadAgentSettings().get("node"));
 }
 
 // Spawn `<launcher> "<bridge>" "<req>" "<resp>"` via cmd.exe (so npx/.cmd shims and PATH
@@ -1800,7 +1955,8 @@ void AgentWorker(WindowImpl* w, AgentRequest req, std::string key, std::string f
     if (bridge.empty()) {
         resp.ok = false;
         FinishAgentJob(w, AgentJobState::Failed, resp,
-                       "agent bridge not configured - set CG_AGENT_BRIDGE to scripts/agentBridge.ts");
+                       "agent bridge not found - run 'npm run native:agent-config' once in your "
+                       "checkout (or set CG_AGENT_BRIDGE), then reopen the editor");
         return;
     }
 
@@ -2141,9 +2297,16 @@ void DrawAgentPanel(WindowImpl* w, ParamSnapshot& ui) {
         const bool hasText = w->agentKeyBuf[0] != 0;
         ImGui::BeginDisabled(!hasText);
         ImGui::PushStyleColor(ImGuiCol_Button, V4(COL_IRISDIM));
-        if (ImGui::Button("Save key", ImVec2(-FLT_MIN, 0)) && hasText) w->agentKeySet = true;
+        if (ImGui::Button("Save key", ImVec2(-FLT_MIN, 0)) && hasText) {
+            w->agentKeySet = true;
+            PersistKey(w->agentKeyBuf);  // DPAPI-encrypted; survives restarts (never plaintext)
+        }
         ImGui::PopStyleColor();
         ImGui::EndDisabled();
+        ImGui::PushStyleColor(ImGuiCol_Text, V4(COL_INK3));
+        ImGui::TextWrapped("Stored encrypted (Windows DPAPI) in %%APPDATA%%\\ColorGradeFX so you "
+                           "enter it once. Removing it deletes the stored copy.");
+        ImGui::PopStyleColor();
     } else {
         std::string k = w->agentKeyBuf;
         std::string masked = k.size() > 8 ? (k.substr(0, 4) + std::string("....") + k.substr(k.size() - 4))
@@ -2153,7 +2316,11 @@ void DrawAgentPanel(WindowImpl* w, ParamSnapshot& ui) {
         ImGui::TextColored(V4(COL_IRIS2), "%s", masked.c_str());
         ImGui::SameLine();
         ImGui::SetCursorPosX(ImGui::GetWindowWidth() - 72.0f);
-        if (ImGui::SmallButton("Remove")) { w->agentKeySet = false; w->agentKeyBuf[0] = 0; }
+        if (ImGui::SmallButton("Remove")) {
+            w->agentKeySet = false;
+            w->agentKeyBuf[0] = 0;
+            PersistKey("");  // delete the stored key
+        }
     }
     ImGui::Dummy(ImVec2(0, 2));
     ImGui::PushStyleColor(ImGuiCol_Text, V4(COL_IRIS2));
@@ -2349,6 +2516,10 @@ void RunWindowThread(WindowImpl* w, ParamSnapshot seed) {
     ParamSnapshot ui = seed;
     { std::lock_guard<std::mutex> lk(w->snapMutex); w->snapshot = seed; }
 
+    // Restore a previously-saved BYOK key (DPAPI-decrypted) so the panel opens with
+    // the key already set instead of re-prompting every session (UI-thread only).
+    LoadPersistedKey(w);
+
     // Enter the UI loop only if a teardown wasn't already requested during startup.
     // A close()/shutdownAll() that raced ahead of us set stopRequested; honor it so
     // we fall straight through to teardown instead of spinning a loop no WM_CLOSE
@@ -2415,6 +2586,22 @@ void RunWindowThread(WindowImpl* w, ParamSnapshot seed) {
 std::mutex                            g_mapMutex;
 std::map<InstanceKey, WindowImpl*>    g_windows;
 
+// Stop any in-flight agent bridge work and JOIN the worker thread so `w` can be
+// deleted safely. This MUST run on EVERY teardown path before `delete w`:
+// WindowImpl holds a std::thread member (agentThread) whose destructor calls
+// std::terminate() if it is still joinable, and the worker holds a raw `w` pointer
+// it would use-after-free. Skipping it in the user-close reap path is what crashed
+// AE ("error trying to invoke the effect Color Grade FX") when the window was
+// closed after using an agent feature - the feature makes agentThread joinable and
+// it outlived (or was destructed under) the WindowImpl. Terminating the Job Object
+// first makes the worker's WaitForSingleObject return at once instead of blocking
+// the join (and g_mapMutex) up to the 120s spawn ceiling. The worker owns
+// CloseHandle(job); a stale/closed handle here just makes TerminateJobObject a no-op.
+void StopAgentWorkLocked(WindowImpl* w) {
+    if (HANDLE job = w->agentChildJob.load()) ::TerminateJobObject(job, 1);
+    if (w->agentThread.joinable()) w->agentThread.join();
+}
+
 // Join + delete any window whose thread has finished (user closed it). Called
 // under g_mapMutex from the frequently-hit effect entry points, so a dismissed
 // window is reaped promptly without a dedicated per-instance teardown command.
@@ -2425,6 +2612,7 @@ void ReapFinishedLocked() {
         // window setup failure). Either way the HWND is already gone; join + delete.
         if (w->finished.load()) {
             if (w->thread.joinable()) w->thread.join();
+            StopAgentWorkLocked(w);  // join the agent worker BEFORE delete (see helper)
             delete w;
             it = g_windows.erase(it);
         } else {
@@ -2442,12 +2630,9 @@ void DestroyWindowImplLocked(WindowImpl* w) {
     HWND hwnd = w->hwnd.load();
     if (hwnd) ::PostMessageW(hwnd, WM_CLOSE, 0, 0);  // nudge a running loop out
     if (w->thread.joinable()) w->thread.join();
-    // Kill any in-flight agent bridge tree so the worker's WaitForSingleObject returns at once,
-    // instead of blocking the join (and g_mapMutex) up to the 120s ceiling on a delete mid-job.
-    // The worker owns CloseHandle; a stale/closed handle here just makes TerminateJobObject a no-op.
-    if (HANDLE job = w->agentChildJob.load()) ::TerminateJobObject(job, 1);
-    // Join any in-flight agent worker so its detach can't outlive the window (it holds `w`).
-    if (w->agentThread.joinable()) w->agentThread.join();
+    // Kill any in-flight agent bridge tree + join the worker so its detach can't
+    // outlive the window (it holds `w`) and ~agentThread never terminates AE.
+    StopAgentWorkLocked(w);
     delete w;
 }
 

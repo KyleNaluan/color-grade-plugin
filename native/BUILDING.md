@@ -97,18 +97,30 @@ file ...aex"**.
 #### Editor agent surfaces (Critique / Auto-grade / Reference / Batch)
 
 The editor's agent buttons execute by spawning a Node subprocess that runs the TS oracle
-(`scripts/agentBridge.ts`) - see `native/docs/adr-agent-execution.md`. To enable them, set (as
-AE-process-visible env, e.g. Windows **user** variables, then restart AE):
+(`scripts/agentBridge.ts`) - see `native/docs/adr-agent-execution.md`. AE launched from Explorer
+does **not** inherit a shell's env, so instead of exporting variables, seed the plug-in's per-user
+settings file **once** from the Node checkout that will run the bridge (the one with
+`node_modules`), then restart AE:
+
+```
+npm run native:agent-config          # writes %APPDATA%\ColorGradeFX\agent.cfg bridge=/node=
+```
+
+That points `bridge=` at this repo's `scripts/agentBridge.ts` (override with `--bridge <path>` /
+`--node "<launcher>"`). The plug-in resolves the bridge as: `CG_AGENT_BRIDGE` env override →
+`bridge=` in the settings file → a bridge shipped next to the `.aex`. Env still works for CI /
+power use:
 
 | Variable | Value | Needed for |
 |---|---|---|
-| `CG_AGENT_BRIDGE` | absolute path to `...\color-grade-plugin\scripts\agentBridge.ts` (or a prebuilt `.js`/`.mjs`) | all agent buttons |
-| `CG_AGENT_NODE` | launcher; default `node`, auto-upgraded to `npx tsx` for a `.ts` bridge | optional |
+| `CG_AGENT_BRIDGE` | override: absolute path to `...\color-grade-plugin\scripts\agentBridge.ts` (or a prebuilt `.js`/`.mjs`) | optional (env override) |
+| `CG_AGENT_NODE` | launcher override; default `node`, auto-upgraded to `npx tsx` for a `.ts` bridge | optional |
 
-The Gemini API key is entered in the editor's agent panel and passed to the child via
-`GEMINI_API_KEY` only (BYOK) - never a file, never committed. Reference match + Batch need no
-key (no model call). If `CG_AGENT_BRIDGE` is unset/not found, the panel shows a clear error
-instead of doing nothing.
+The Gemini API key is entered in the editor's agent panel and **persisted DPAPI-encrypted** in the
+same `agent.cfg` (`apiKeyEnc=`), so you enter it once - it survives restarts, is never stored in
+the clear, never logged, never committed. It reaches the child via `GEMINI_API_KEY` only (BYOK).
+Reference match + Batch need no key (no model call). If no bridge resolves, the panel shows a clear
+error instead of doing nothing.
 
 ---
 
@@ -341,10 +353,10 @@ is ready, verify in AE 2025:
    lives in native/, so the reference image is decoded + measured on the TS side; the sidecar
    is 21 pre-computed stats numbers.)
 
-9. **Editor agent surfaces (cg-agent-wiring):** set `CG_AGENT_BRIDGE` /
-   `CG_AGENT_NODE` (see the env table above), restart AE, open the editor, expand the **Agent**
-   dock, and enter a Gemini key (the free tier works at $0). Verify each button gives immediate
-   feedback and never silently no-ops (`native/docs/adr-agent-execution.md`):
+9. **Editor agent surfaces (cg-agent-wiring / cg-agent-fixes-v4):** run
+   `npm run native:agent-config` once (no env export needed), restart AE, open the editor, expand
+   the **Agent** dock, and enter a Gemini key (the free tier works at $0). Verify each button gives
+   immediate feedback and never silently no-ops (`native/docs/adr-agent-execution.md`):
    - **Grade tab -> Critique frame:** shows "Working…" then names defects on the current frame
      (or "no defects"). A missing/invalid key or unreachable network shows a specific error.
    - **Grade tab -> Auto-grade:** runs a few rounds ("Working…"), then applies the accepted
@@ -356,7 +368,13 @@ is ready, verify in AE 2025:
      override. An undecodable image shows an error.
    - **Batch tab -> Pick clips to compare…:** pick 2+ same-scene stills; the panel lists any
      drift flags (or "clips consistent"). No key needed.
-   - With `CG_AGENT_BRIDGE` unset, every button shows "agent bridge not configured", not silence.
+   - **Key persistence:** enter the key, close + reopen the editor (and restart AE) - the panel
+     reopens with the key already set (masked), no re-entry. **Remove** clears it permanently.
+   - **Clean close (no crash):** after exercising these features, close the editor window - AE must
+     not crash ("error trying to invoke the effect Color Grade FX"). Also close it *mid-job* (while
+     "Working…") - the bridge tree is killed and the window closes cleanly.
+   - With no bridge configured, every button shows the "agent bridge not found - run
+     'npm run native:agent-config'…" error, not silence.
 
 The numerical correctness of the ported engine is proven unattended by the cross-engine
 golden harness (`npm run native:core-parity`), so AE verification here is about the SDK glue
