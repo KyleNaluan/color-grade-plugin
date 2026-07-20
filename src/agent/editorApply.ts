@@ -73,6 +73,7 @@ export function editorApplyFromResult(
   const unmapped: string[] = [];
   const ov: ThemeOverrides = bestParams.overrides ?? {};
   const authored: ThemeOverrides = base.overrides ?? {};
+  const baseline: ThemeOverrides = baseParams.overrides ?? {};
 
   // Absolute scalar params: emit only when the loop moved them off the baseline.
   if (bestParams.strength !== undefined && Math.abs(bestParams.strength - (baseParams.strength ?? bestParams.strength)) > EPS) {
@@ -86,16 +87,19 @@ export function editorApplyFromResult(
   }
 
   // Chroma gain: the slider is a RELATIVE multiplier on the theme's authored gain.
-  // When the theme authors chromaGain:0 (monochrome-bw / sepia) the slider cannot
-  // represent any absolute gain (0 * anything = 0), so disclose it instead of
-  // emitting a bogus edit that would apply as 0.
+  // Emit only when the loop moved it off the baseline the user currently sees (which
+  // already reflects their live slider), not just off the authored gain. When the
+  // theme authors chromaGain:0 (monochrome-bw / sepia) the slider cannot represent
+  // any absolute gain (0 * anything = 0), so disclose it instead of a bogus 0 edit.
   if (ov.chromaGain !== undefined) {
     const authoredGain = authored.chromaGain ?? 1;
-    if (authoredGain > EPS) {
-      const ratio = ov.chromaGain / authoredGain;
-      if (Math.abs(ratio - 1) > EPS) apply.push({ field: 'chromaGain', values: [ratio] });
-    } else if (Math.abs(ov.chromaGain - authoredGain) > EPS) {
-      unmapped.push(`chromaGain=${ov.chromaGain} (theme authors 0; not representable via the relative slider)`);
+    const baselineGain = baseline.chromaGain ?? authoredGain;
+    if (Math.abs(ov.chromaGain - baselineGain) > EPS) {
+      if (authoredGain > EPS) {
+        apply.push({ field: 'chromaGain', values: [ov.chromaGain / authoredGain] });
+      } else {
+        unmapped.push(`chromaGain=${ov.chromaGain} (theme authors 0; not representable via the relative slider)`);
+      }
     }
   }
 

@@ -194,6 +194,40 @@ describe('editorApplyFromResult - native composition mapping', () => {
     expect(unmapped).toHaveLength(0);
   });
 
+  it('does not re-emit chromaGain when the loop leaves it at a non-1 slider baseline', () => {
+    // The user's live slider seeded the baseline to authored 1.2 * 1.5 = 1.8; the loop
+    // never touched chroma, so best keeps 1.8. Even though 1.8/1.2 != 1, no edit should
+    // be emitted - that would rewrite the user's current slider value as a no-op.
+    const sliderBaseParams: AutoGradeParams = {
+      strength: 0.8,
+      skinProtection: 0.75,
+      overrides: { ...base.overrides, chromaGain: 1.8 },
+    };
+    const best: AutoGradeParams = {
+      strength: 0.8,
+      skinProtection: 0.75,
+      overrides: { ...sliderBaseParams.overrides },
+    };
+    const { apply } = editorApplyFromResult(base, best, sliderBaseParams);
+    expect(apply.find((a) => a.field === 'chromaGain')).toBeUndefined();
+  });
+
+  it('emits the ratio when the loop moves chroma off a non-1 slider baseline', () => {
+    const sliderBaseParams: AutoGradeParams = {
+      strength: 0.8,
+      skinProtection: 0.75,
+      overrides: { ...base.overrides, chromaGain: 1.8 },
+    };
+    const best: AutoGradeParams = {
+      strength: 0.8,
+      skinProtection: 0.75,
+      overrides: { chromaGain: 0.6 },
+    };
+    const { apply } = editorApplyFromResult(base, best, sliderBaseParams);
+    // moved off baseline 1.8 -> ratio to authored gain = 0.6 / 1.2 = 0.5
+    expect(apply.find((a) => a.field === 'chromaGain')?.values[0]).toBeCloseTo(0.5);
+  });
+
   it('discloses chromaGain (not a bogus ratio) when the theme authors chromaGain:0', () => {
     const monoBase: Theme = {
       name: 'monochrome-bw',

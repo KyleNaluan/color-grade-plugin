@@ -1815,6 +1815,7 @@ void AgentWorker(WindowImpl* w, AgentRequest req, std::string key, std::string f
             std::this_thread::sleep_for(std::chrono::milliseconds(60));
         }
         if (!frame || !WriteFrameDump(framePath, *frame)) {
+            if (!framePath.empty()) ::DeleteFileW(WidenUtf8(framePath).c_str());
             FinishAgentJob(w, AgentJobState::Failed, resp,
                            "no source frame available - scrub the timeline once, then retry");
             return;
@@ -1825,26 +1826,30 @@ void AgentWorker(WindowImpl* w, AgentRequest req, std::string key, std::string f
     const std::string tag = std::to_string(w->key);
     const std::string reqPath = AgentTempPath("cg-agent-req-" + tag + ".txt");
     const std::string respPath = AgentTempPath("cg-agent-resp-" + tag + ".txt");
+    // Remove the transient request + frame-dump files (the reference sidecar the effect
+    // reads is written to outPath and intentionally left in place).
+    auto cleanupInputs = [&]() {
+        ::DeleteFileW(WidenUtf8(reqPath).c_str());
+        if (needFrame && !framePath.empty()) ::DeleteFileW(WidenUtf8(framePath).c_str());
+    };
     {
         std::ofstream ro(WidenUtf8(reqPath).c_str(), std::ios::binary);
-        if (!ro) { FinishAgentJob(w, AgentJobState::Failed, resp, "could not write the agent request"); return; }
+        if (!ro) { cleanupInputs(); FinishAgentJob(w, AgentJobState::Failed, resp, "could not write the agent request"); return; }
         ro << formatAgentRequest(req);
     }
 
     if (!SpawnBridge(w, bridge, reqPath, respPath, key, err)) {
+        cleanupInputs();
         FinishAgentJob(w, AgentJobState::Failed, resp, err);
         return;
     }
     std::ifstream ri(WidenUtf8(respPath).c_str(), std::ios::binary);
-    if (!ri) { FinishAgentJob(w, AgentJobState::Failed, resp, "the agent bridge produced no response"); return; }
+    if (!ri) { cleanupInputs(); FinishAgentJob(w, AgentJobState::Failed, resp, "the agent bridge produced no response"); return; }
     std::ostringstream ss; ss << ri.rdbuf();
     ri.close();
     resp = parseAgentResponse(ss.str());
-    // Clean up the transient request/response/frame files (the reference sidecar the
-    // effect reads is written to outPath and intentionally left in place).
-    ::DeleteFileW(WidenUtf8(reqPath).c_str());
+    cleanupInputs();
     ::DeleteFileW(WidenUtf8(respPath).c_str());
-    if (needFrame && !framePath.empty()) ::DeleteFileW(WidenUtf8(framePath).c_str());
     FinishAgentJob(w, AgentJobState::Done, resp, resp.ok ? "" : resp.message);
 }
 

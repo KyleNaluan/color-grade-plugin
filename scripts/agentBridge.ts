@@ -273,6 +273,13 @@ async function runAutograde(req: AgentBridgeRequest): Promise<AgentBridgeRespons
     skinProtection: req.skinProtection ?? baseTheme.knobs.skinProtection.default,
     overrides: { ...baseTheme.overrides },
   };
+  // The Chroma Gain slider is a RELATIVE multiplier on the theme's authored gain
+  // (1 = 100%). Seed the optimization baseline from the user's live slider so the
+  // loop optimizes/reports from the grade they currently see, like strength/skin.
+  {
+    const authoredGain = baseTheme.overrides?.chromaGain ?? 1;
+    baseParams.overrides!.chromaGain = authoredGain * (req.chromaGain ?? 1);
+  }
   const rounds = req.rounds ?? 5;
   const model = req.model ?? DEFAULT_MODEL;
   const key = req.mock ? '' : requireKey();
