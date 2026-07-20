@@ -139,6 +139,12 @@ struct WindowImpl {
     // collapsible confined-indigo agent dock's expand + BYOK-key state (session-local); and
     // the agent dock's inner tab. The agent dock is the single Pro/BYOK seam (kAgentDockEnabled).
     int               curveChannel = 0;
+    // Correct tab: the camera the user last picked in the cascade. footageProfile alone can't
+    // drive the Camera combo, because Standard (flat index 1) is camera-ambiguous and always
+    // resolves back to the first camera - so a fresh camera choice whose profile is Standard
+    // would snap the dropdown back to camera 0 (the round-1 "only ARRI selectable" bug). -1 =
+    // derive from footageProfile.
+    int               footageCamera = -1;
     bool              agentOpen = false;      // agent dock expanded (default: out of the way)
     bool              agentKeySet = false;    // a Gemini key was entered this session (BYOK)
     char              agentKeyBuf[160] = {0}; // key entry buffer (never persisted here)
@@ -496,13 +502,26 @@ bool SliderRow(const char* label, float* v, float vmin, float vmax, float def,
     ImGui::InvisibleButton("##trk", ImVec2(trackW, rowH));
     const bool active = ImGui::IsItemActive();
     const bool trkHovered = ImGui::IsItemHovered();
-    if (active) {
+    // A double-click resets to default, but the mouse is usually still held afterwards. Without
+    // guarding, the held pointer re-applies the click position on the following frames and snaps
+    // the value back (round-1 "reset flashes then snaps back"). Suppress drag-follow for the rest
+    // of that activation via per-row state storage (public API; ImGui::ClearActiveID is internal).
+    ImGuiStorage* rowState = ImGui::GetStateStorage();
+    const ImGuiID suppressId = ImGui::GetID("##noDragAfterReset");
+    bool suppressDrag = rowState->GetBool(suppressId, false);
+    if (trkHovered && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+        *v = def;
+        changed = true;
+        suppressDrag = true;
+        rowState->SetBool(suppressId, true);
+    }
+    if (active && !suppressDrag) {
         float p = (io.MousePos.x - tx0) / trackW;
         p = p < 0 ? 0 : (p > 1 ? 1 : p);
         *v = vmin + p * (vmax - vmin);
         changed = true;
     }
-    if (trkHovered && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) { *v = def; changed = true; }
+    if (!active && suppressDrag) rowState->SetBool(suppressId, false);  // activation ended - re-enable drag
 
     // draw rail / fill / bipolar tick / knob
     const float span = (vmax - vmin) != 0.0f ? (vmax - vmin) : 1.0f;
@@ -565,13 +584,24 @@ bool WheelLumSlider(const char* id, float* v, float vmin, float vmax, float def,
     ImGui::InvisibleButton("##wtrk", ImVec2(width, rowH));
     const bool active = ImGui::IsItemActive();
     const bool hovered = ImGui::IsItemHovered();
-    if (active) {
+    // Suppress drag-follow for the rest of the activation after a double-click reset, so the held
+    // mouse can't re-apply the click position and snap it back (public state storage; see SliderRow).
+    ImGuiStorage* rowState = ImGui::GetStateStorage();
+    const ImGuiID suppressId = ImGui::GetID("##noDragAfterReset");
+    bool suppressDrag = rowState->GetBool(suppressId, false);
+    if (hovered && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+        *v = def;
+        changed = true;
+        suppressDrag = true;
+        rowState->SetBool(suppressId, true);
+    }
+    if (active && !suppressDrag) {
         float p = (io.MousePos.x - c0.x) / width;
         p = p < 0 ? 0 : (p > 1 ? 1 : p);
         *v = vmin + p * (vmax - vmin);
         changed = true;
     }
-    if (hovered && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) { *v = def; changed = true; }
+    if (!active && suppressDrag) rowState->SetBool(suppressId, false);
 
     const float span = (vmax - vmin) != 0.0f ? (vmax - vmin) : 1.0f;
     float p = (*v - vmin) / span;
@@ -656,15 +686,26 @@ void DrawPreviewPane(WindowImpl* w) {
         return;
     }
 
-    auto tag = [&](const char* s, float x0, float x1, float y) {
+    // Draw an overlay label centred in [x0,x1], but HIDDEN when that region collapses (divider
+    // at its extreme) and CLAMPED inside the visible image [imgL,imgR] so it never floats off the
+    // frame (round-1: labels left the image at the split extremes).
+    auto tag = [&](const char* s, float x0, float x1, float y, float imgL, float imgR) {
+        const float regionW = x1 - x0;
         ImVec2 ts = ImGui::CalcTextSize(s);
-        dl->AddText(ImVec2((x0 + x1 - ts.x) * 0.5f, y + 4.0f), IM_COL32(210, 210, 220, 255), s);
+        if (regionW < ts.x + 10.0f) return;  // region collapsed - hide the label
+        const float loL = std::max(x0 + 4.0f, imgL + 4.0f);
+        const float hiL = std::min(x1 - ts.x - 4.0f, imgR - ts.x - 4.0f);
+        if (hiL < loL) return;  // no room inside the visible image
+        float tx = (x0 + x1 - ts.x) * 0.5f;
+        tx = tx < loL ? loL : (tx > hiL ? hiL : tx);
+        dl->AddText(ImVec2(tx, y + 4.0f), IM_COL32(210, 210, 220, 255), s);
     };
 
     if (mode == 1) {  // BeforeOnly (fall back to after if the before frame isn't in yet)
         const GpuTex& t = haveBefore ? w->beforeTex : w->previewTex;
-        DrawLetterboxed(dl, t, p0, p1, 0, 0, false);
-        tag(haveBefore ? "Before (original)" : "Before (pending)", p0.x, p1.x, p0.y);
+        FitRect fr = DrawLetterboxed(dl, t, p0, p1, 0, 0, false);
+        const float iL = p0.x + fr.x, iR = iL + fr.w;
+        tag(haveBefore ? "Before (original)" : "Before (pending)", iL, iR, p0.y, iL, iR);
     } else if (mode == 2 && haveBefore && haveAfter) {  // Split
         // Both frames share the clip dimensions -> one letterbox rect; the divider splits it.
         SplitGeometry g = splitViewGeometry(p1.x - p0.x, p1.y - p0.y, w->previewTex.w,
@@ -700,8 +741,8 @@ void DrawPreviewPane(WindowImpl* w) {
                               ImVec2(splitX - 1.5f, ky + 3.5f), IM_COL32(255, 255, 255, 230));
         dl->AddTriangleFilled(ImVec2(splitX + 5.0f, ky), ImVec2(splitX + 1.5f, ky - 3.5f),
                               ImVec2(splitX + 1.5f, ky + 3.5f), IM_COL32(255, 255, 255, 230));
-        tag("Before", dstX0, splitX, p0.y);
-        tag("After", splitX, dstX1, p0.y);
+        tag("Before", dstX0, splitX, p0.y, dstX0, dstX1);
+        tag("After", splitX, dstX1, p0.y, dstX0, dstX1);
     } else {  // AfterOnly (default), or Split before the before frame arrives
         DrawLetterboxed(dl, w->previewTex, p0, p1, 0, 0, false);
     }
@@ -790,6 +831,22 @@ bool DrawCurveWidget(const char* id, cg::editor::CurveState& c, int& dragIdx, Im
                     IM_COL32(40, 40, 48, 255));
         dl->AddLine(ImVec2(p0.x, p0.y + t * size), ImVec2(p1.x, p0.y + t * size),
                     IM_COL32(40, 40, 48, 255));
+    }
+
+    // Static identity reference (slope 1, corner to corner), dashed + subdued gray - Lumetri-style
+    // so the neutral is visible at a glance behind the actual curve (round-1 refinement 5). Gray
+    // is clearly distinct from the master (white) and R/G/B channel curve colors.
+    {
+        const ImVec2 a(p0.x, p1.y);  // (0,0) bottom-left
+        const ImVec2 b(p1.x, p0.y);  // (1,1) top-right
+        const int kDash = 22;        // even count -> on/off dashes
+        for (int i = 0; i < kDash; i += 2) {
+            const float t0 = static_cast<float>(i) / kDash;
+            const float t1 = static_cast<float>(i + 1) / kDash;
+            dl->AddLine(ImVec2(a.x + (b.x - a.x) * t0, a.y + (b.y - a.y) * t0),
+                        ImVec2(a.x + (b.x - a.x) * t1, a.y + (b.y - a.y) * t1),
+                        IM_COL32(92, 88, 82, 205), 1.0f);
+        }
     }
 
     auto toScreen = [&](double nx, double ny) {
@@ -1108,18 +1165,27 @@ void NoteBox(const char* text) {
 void DrawCorrectTab(WindowImpl* w, ParamSnapshot& ui) {
     Eyebrow("FOOTAGE");
     // Camera -> Profile cascade (both combos derive from core/FootageCatalog.h and resolve to
-    // the flat 1-based popup index the effect stores). Unchanged plumbing; restyled surface.
+    // the flat 1-based popup index the effect stores). A LOG profile pins its camera; Standard
+    // (flat 1) is camera-AMBIGUOUS and always resolves to the first camera, so we remember the
+    // user's chosen camera in w->footageCamera to keep the Camera combo from snapping back to
+    // ARRI when its profile is Standard (round-1 bug: "only ARRI selectable").
     cg::core::FootageCascadePos pos = cg::core::footageCascadePosForFlat(ui.footageProfile);
     std::vector<std::string> cams = cg::core::footageCameras();
     std::vector<const char*> camPtrs;
     camPtrs.reserve(cams.size());
     for (const auto& c : cams) camPtrs.push_back(c.c_str());
-    int camIdx = pos.cameraIndex;
+    // A log profile identifies its camera unambiguously - adopt it; Standard keeps the
+    // remembered camera (seeded from the flat resolution on first draw).
+    if (cg::core::footageIndexIsLog(ui.footageProfile)) w->footageCamera = pos.cameraIndex;
+    else if (w->footageCamera < 0) w->footageCamera = pos.cameraIndex;
+    int camIdx = w->footageCamera;
+    if (camIdx < 0 || camIdx >= static_cast<int>(cams.size())) camIdx = 0;
     ImGui::TextColored(V4(COL_INK2), "Camera");
     ImGui::SetNextItemWidth(-FLT_MIN);
     if (ImGui::Combo("##camera", &camIdx, camPtrs.data(), static_cast<int>(camPtrs.size()))) {
+        w->footageCamera = camIdx;  // remember the choice so a Standard profile can't reset it
         cg::core::FootageCameraProfiles p = cg::core::footageProfilesForCamera(cams[camIdx]);
-        ui.footageProfile = p.flatIndices.front();
+        ui.footageProfile = p.flatIndices.front();  // auto-select that camera's Standard
         w->edits.push({EditField::FootageProfile, static_cast<double>(ui.footageProfile)});
     }
     cg::core::FootageCameraProfiles profs = cg::core::footageProfilesForCamera(cams[camIdx]);
@@ -1133,6 +1199,7 @@ void DrawCorrectTab(WindowImpl* w, ParamSnapshot& ui) {
     ImGui::SetNextItemWidth(-FLT_MIN);
     if (ImGui::Combo("##profile", &optIdx, profPtrs.data(), static_cast<int>(profPtrs.size()))) {
         ui.footageProfile = profs.flatIndices[static_cast<size_t>(optIdx)];
+        w->footageCamera = camIdx;  // keep the camera fixed even when selecting Standard
         w->edits.push({EditField::FootageProfile, static_cast<double>(ui.footageProfile)});
     }
     NoteBox("Decode-then-grade. The profile decodes the clip before any grade, so V-Log is "
@@ -1585,15 +1652,23 @@ void DrawAgentPanel(WindowImpl* w) {
         ImGui::SetCursorPosX(ImGui::GetWindowWidth() - 72.0f);
         if (ImGui::SmallButton("Remove")) { w->agentKeySet = false; w->agentKeyBuf[0] = 0; }
 
+        // Status line (round-1 fix): agent EXECUTION is not wired into the native editor -
+        // critique/auto-grade run via the offline pipeline today. The former standalone
+        // Critique/Auto-grade trigger buttons were removed - they did nothing here and their
+        // "Critique" label collided with the tab below (the ImGui conflicting-ID crash + the
+        // visible duplicate). The three tabs below describe each agent capability's status.
         ImGui::Dummy(ImVec2(0, 4));
-        ImGui::PushStyleColor(ImGuiCol_Button, V4(COL_IRISDIM));
-        const float half = (ImGui::GetContentRegionAvail().x - 8.0f) * 0.5f;
-        ImGui::Button("Critique", ImVec2(half, 30));
-        ImGui::SameLine(0, 8);
-        ImGui::Button("Auto-grade", ImVec2(half, 30));
+        ImGui::PushStyleColor(ImGuiCol_Text, V4(COL_IRIS2));
+        ImGui::TextWrapped("Button-triggered - never automatic.");
         ImGui::PopStyleColor();
+        ImGui::PushStyleColor(ImGuiCol_Text, V4(COL_INK3));
+        ImGui::TextWrapped("Critique and auto-grade run via the offline pipeline today "
+                           "(npm run auto-grade / src/agent); in-editor triggers land with the "
+                           "agent wiring, not this UI pass.");
+        ImGui::PopStyleColor();
+        ImGui::Dummy(ImVec2(0, 2));
 
-        // inner tabs
+        // inner tabs - each label is unique (no collision with any button in this panel).
         const char* tabs[3] = {"Critique", "Reference", "Batch"};
         for (int i = 0; i < 3; ++i) {
             const bool on = w->agentTab == i;
