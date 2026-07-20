@@ -164,6 +164,7 @@ struct WindowImpl {
     std::mutex               agentMutex;         // guards agentResult + agentBusy transitions
     AgentJobResult           agentResult;        // Idle/Running/Done/Failed + response/error
     std::thread              agentThread;        // the in-flight worker (joined at teardown)
+    std::atomic<void*>       agentChildProcess{nullptr};  // live bridge child HANDLE, so teardown can TerminateProcess it and not block the join up to 120s
     std::atomic<bool>        agentBusy{false};   // a job is running (blocks a second launch)
     std::atomic<bool>        agentWantsFrame{false};  // ask the idle hook to publish the source frame
     bool                     agentApplied = false;    // UI-thread: accepted result already applied once
@@ -1692,7 +1693,7 @@ std::string ResolveAgentLauncher() {
 
 // Spawn `<launcher> "<bridge>" "<req>" "<resp>"` via cmd.exe (so npx/.cmd shims and PATH
 // resolve), set GEMINI_API_KEY for the child, and wait. Returns true on a clean exit(0).
-bool SpawnBridge(const std::string& bridge, const std::string& reqPath, const std::string& respPath,
+bool SpawnBridge(WindowImpl* w, const std::string& bridge, const std::string& reqPath, const std::string& respPath,
                  const std::string& key, std::string& err) {
     std::string launcher = ResolveAgentLauncher();
     // A .ts bridge needs tsx; if the launcher is the plain default, upgrade it so the repo
@@ -1727,14 +1728,30 @@ bool SpawnBridge(const std::string& bridge, const std::string& reqPath, const st
         err = "could not launch the agent bridge (CreateProcess failed)";
         return false;
     }
-    ::WaitForSingleObject(pi.hProcess, 120000);  // 2 min ceiling for a model round
+    // Publish the live child handle so teardown/close can TerminateProcess it and let this
+    // wait return promptly instead of blocking the join (and g_mapMutex) up to 120s.
+    w->agentChildProcess.store(pi.hProcess);
+    DWORD wait = ::WaitForSingleObject(pi.hProcess, 120000);  // 2 min ceiling for a model round
+    if (wait == WAIT_TIMEOUT) {
+        // Child overran the ceiling: kill it so it isn't orphaned and can't later collide
+        // on the per-window resp/req temp paths.
+        ::TerminateProcess(pi.hProcess, 1);
+        ::WaitForSingleObject(pi.hProcess, 5000);
+    }
     DWORD code = 1;
     ::GetExitCodeProcess(pi.hProcess, &code);
+    // Retire the handle before closing it, so a concurrent teardown can't TerminateProcess a
+    // handle we're about to close (single owner of CloseHandle).
+    w->agentChildProcess.store(nullptr);
     ::CloseHandle(pi.hProcess);
     ::CloseHandle(pi.hThread);
     // The child inherited the key; clear it from this (host) process env so it does
     // not linger for any later child AE spawns.
     if (!key.empty()) ::SetEnvironmentVariableW(L"GEMINI_API_KEY", nullptr);
+    if (wait == WAIT_TIMEOUT) {
+        err = "the agent bridge timed out";
+        return false;
+    }
     if (code != 0) {
         err = "the agent bridge exited with an error";
         return false;
@@ -1797,7 +1814,7 @@ void AgentWorker(WindowImpl* w, AgentRequest req, std::string key, std::string f
         ro << formatAgentRequest(req);
     }
 
-    if (!SpawnBridge(bridge, reqPath, respPath, key, err)) {
+    if (!SpawnBridge(w, bridge, reqPath, respPath, key, err)) {
         FinishAgentJob(w, AgentJobState::Failed, resp, err);
         return;
     }
@@ -1838,7 +1855,10 @@ void LaunchFrameAgent(WindowImpl* w, AgentCommand command, const ParamSnapshot& 
 
     AgentRequest req;
     req.command = command;
-    req.mode = (ui.theme == kThemeReferenceIndex) ? "shot-match" : "correction";
+    // The editor frame agent has no reference IMAGE to pass here (reference matching is the
+    // separate sidecar stat-transfer flow via LaunchReferenceAgent), so never label the job
+    // shot-match - that would send the critic a shot-match prompt with no reference.
+    req.mode = "correction";
     req.profile = cg::core::footageKeyForIndex(ui.footageProfile);
     req.theme = themeKeyForPopup(ui.theme);
     req.hasStrength = true; req.strength = ui.strength;
@@ -2400,6 +2420,10 @@ void DestroyWindowImplLocked(WindowImpl* w) {
     HWND hwnd = w->hwnd.load();
     if (hwnd) ::PostMessageW(hwnd, WM_CLOSE, 0, 0);  // nudge a running loop out
     if (w->thread.joinable()) w->thread.join();
+    // Kill any in-flight agent bridge child so the worker's WaitForSingleObject returns at once,
+    // instead of blocking the join (and g_mapMutex) up to the 120s ceiling on a delete mid-job.
+    // The worker owns CloseHandle; a stale/closed handle here just makes TerminateProcess a no-op.
+    if (HANDLE child = w->agentChildProcess.load()) ::TerminateProcess(child, 1);
     // Join any in-flight agent worker so its detach can't outlive the window (it holds `w`).
     if (w->agentThread.joinable()) w->agentThread.join();
     delete w;
