@@ -164,7 +164,7 @@ struct WindowImpl {
     std::mutex               agentMutex;         // guards agentResult + agentBusy transitions
     AgentJobResult           agentResult;        // Idle/Running/Done/Failed + response/error
     std::thread              agentThread;        // the in-flight worker (joined at teardown)
-    std::atomic<void*>       agentChildProcess{nullptr};  // live bridge child HANDLE, so teardown can TerminateProcess it and not block the join up to 120s
+    std::atomic<void*>       agentChildJob{nullptr};  // live bridge Job Object HANDLE (whole cmd->npx->node tree); teardown TerminateJobObjects it so the join doesn't block up to 120s
     std::atomic<bool>        agentBusy{false};   // a job is running (blocks a second launch)
     std::atomic<bool>        agentWantsFrame{false};  // ask the idle hook to publish the source frame
     bool                     agentApplied = false;    // UI-thread: accepted result already applied once
@@ -1722,27 +1722,44 @@ bool SpawnBridge(WindowImpl* w, const std::string& bridge, const std::string& re
     size_t slash = bridgeDir.find_last_of(L"\\/");
     std::wstring cwd = slash == std::wstring::npos ? std::wstring() : bridgeDir.substr(0, slash);
 
+    // cmd.exe /c launches npx->node grandchildren, so pi.hProcess is only the shell. Put the
+    // whole tree in a Job Object with KILL_ON_JOB_CLOSE and launch suspended: killing/closing the
+    // job then tears the entire cmd->npx->node tree down (a bare TerminateProcess on the shell
+    // would orphan the real node worker, which could still write respPath and collide).
+    HANDLE job = ::CreateJobObjectW(nullptr, nullptr);
+    if (job) {
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION jeli;
+        ZeroMemory(&jeli, sizeof(jeli));
+        jeli.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        ::SetInformationJobObject(job, JobObjectExtendedLimitInformation, &jeli, sizeof(jeli));
+    }
     BOOL ok = ::CreateProcessW(nullptr, mutableCmd.data(), nullptr, nullptr, FALSE,
-                               CREATE_NO_WINDOW, nullptr, cwd.empty() ? nullptr : cwd.c_str(), &si, &pi);
+                               CREATE_NO_WINDOW | CREATE_SUSPENDED, nullptr,
+                               cwd.empty() ? nullptr : cwd.c_str(), &si, &pi);
     if (!ok) {
+        if (job) ::CloseHandle(job);
         err = "could not launch the agent bridge (CreateProcess failed)";
         return false;
     }
-    // Publish the live child handle so teardown/close can TerminateProcess it and let this
-    // wait return promptly instead of blocking the join (and g_mapMutex) up to 120s.
-    w->agentChildProcess.store(pi.hProcess);
+    if (job) ::AssignProcessToJobObject(job, pi.hProcess);
+    // Resume unconditionally, even if job creation/assignment failed, so the suspended shell runs.
+    ::ResumeThread(pi.hThread);
+    // Publish the live job handle so teardown/close can TerminateJobObject the whole tree and let
+    // this wait return promptly instead of blocking the join (and g_mapMutex) up to 120s.
+    w->agentChildJob.store(job);
     DWORD wait = ::WaitForSingleObject(pi.hProcess, 120000);  // 2 min ceiling for a model round
     if (wait == WAIT_TIMEOUT) {
-        // Child overran the ceiling: kill it so it isn't orphaned and can't later collide
-        // on the per-window resp/req temp paths.
-        ::TerminateProcess(pi.hProcess, 1);
+        // Child overran the ceiling: kill the whole tree so no node worker is orphaned and can't
+        // later collide on the per-window resp/req temp paths.
+        if (job) ::TerminateJobObject(job, 1);
         ::WaitForSingleObject(pi.hProcess, 5000);
     }
     DWORD code = 1;
     ::GetExitCodeProcess(pi.hProcess, &code);
-    // Retire the handle before closing it, so a concurrent teardown can't TerminateProcess a
+    // Retire the job handle before closing it, so a concurrent teardown can't TerminateJobObject a
     // handle we're about to close (single owner of CloseHandle).
-    w->agentChildProcess.store(nullptr);
+    w->agentChildJob.store(nullptr);
+    if (job) ::CloseHandle(job);  // KILL_ON_JOB_CLOSE reaps any stragglers as the last ref drops
     ::CloseHandle(pi.hProcess);
     ::CloseHandle(pi.hThread);
     // The child inherited the key; clear it from this (host) process env so it does
@@ -2420,10 +2437,10 @@ void DestroyWindowImplLocked(WindowImpl* w) {
     HWND hwnd = w->hwnd.load();
     if (hwnd) ::PostMessageW(hwnd, WM_CLOSE, 0, 0);  // nudge a running loop out
     if (w->thread.joinable()) w->thread.join();
-    // Kill any in-flight agent bridge child so the worker's WaitForSingleObject returns at once,
+    // Kill any in-flight agent bridge tree so the worker's WaitForSingleObject returns at once,
     // instead of blocking the join (and g_mapMutex) up to the 120s ceiling on a delete mid-job.
-    // The worker owns CloseHandle; a stale/closed handle here just makes TerminateProcess a no-op.
-    if (HANDLE child = w->agentChildProcess.load()) ::TerminateProcess(child, 1);
+    // The worker owns CloseHandle; a stale/closed handle here just makes TerminateJobObject a no-op.
+    if (HANDLE job = w->agentChildJob.load()) ::TerminateJobObject(job, 1);
     // Join any in-flight agent worker so its detach can't outlive the window (it holds `w`).
     if (w->agentThread.joinable()) w->agentThread.join();
     delete w;
