@@ -42,9 +42,10 @@ export interface AgentBridgeRequest {
   rounds?: number;
   /**
    * Path to the frame the command operates on. Critique: the graded preview
-   * frame the user sees. Autograde: the decoded-source frame the loop re-renders.
-   * Carried as a raw RGBA dump (see `readFrameDump`), never a codec file, because
-   * native has no image encoder.
+   * frame the user sees. Autograde: the source frame the loop re-renders, ALREADY
+   * decoded to Rec.709 by the native side (so the bridge must not re-decode it
+   * through the clip's log profile). Carried as a raw RGBA dump (see
+   * `readFrameDump`), never a codec file, because native has no image encoder.
    */
   framePath?: string;
   /**

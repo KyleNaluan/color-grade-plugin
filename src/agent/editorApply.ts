@@ -85,11 +85,18 @@ export function editorApplyFromResult(
     apply.push({ field: 'skinProtection', values: [bestParams.skinProtection] });
   }
 
-  // Chroma gain: the slider is a ratio on the theme's authored gain.
+  // Chroma gain: the slider is a RELATIVE multiplier on the theme's authored gain.
+  // When the theme authors chromaGain:0 (monochrome-bw / sepia) the slider cannot
+  // represent any absolute gain (0 * anything = 0), so disclose it instead of
+  // emitting a bogus edit that would apply as 0.
   if (ov.chromaGain !== undefined) {
     const authoredGain = authored.chromaGain ?? 1;
-    const ratio = authoredGain > EPS ? ov.chromaGain / authoredGain : ov.chromaGain;
-    if (Math.abs(ratio - 1) > EPS) apply.push({ field: 'chromaGain', values: [ratio] });
+    if (authoredGain > EPS) {
+      const ratio = ov.chromaGain / authoredGain;
+      if (Math.abs(ratio - 1) > EPS) apply.push({ field: 'chromaGain', values: [ratio] });
+    } else if (Math.abs(ov.chromaGain - authoredGain) > EPS) {
+      unmapped.push(`chromaGain=${ov.chromaGain} (theme authors 0; not representable via the relative slider)`);
+    }
   }
 
   // Band tints: user fields ADD onto the theme, so emit the delta.

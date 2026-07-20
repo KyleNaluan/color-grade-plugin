@@ -249,7 +249,10 @@ async function runCritique(req: AgentBridgeRequest): Promise<AgentBridgeResponse
 async function runAutograde(req: AgentBridgeRequest): Promise<AgentBridgeResponse> {
   if (!req.framePath) throw new Error('autograde: no frame provided');
   const frame = readFrameDump(req.framePath);
-  const decoded = decodeFrame(frame, req.profile ?? 'rec709');
+  // The editor's frame dump is already decoded to Rec.709 by the native side
+  // (DriveBeforeFrameForKey/DecodeUpstreamPixel), so decode it through identity
+  // Rec.709 - re-applying the clip's log curve would corrupt the analyzed pixels.
+  const decoded = decodeFrame(frame, 'rec709');
   const mode = req.mode ?? 'correction';
 
   let baseTheme: Theme;

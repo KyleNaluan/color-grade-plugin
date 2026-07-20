@@ -1724,6 +1724,9 @@ bool SpawnBridge(const std::string& bridge, const std::string& reqPath, const st
     ::GetExitCodeProcess(pi.hProcess, &code);
     ::CloseHandle(pi.hProcess);
     ::CloseHandle(pi.hThread);
+    // The child inherited the key; clear it from this (host) process env so it does
+    // not linger for any later child AE spawns.
+    if (!key.empty()) ::SetEnvironmentVariableW(L"GEMINI_API_KEY", nullptr);
     if (code != 0) {
         err = "the agent bridge exited with an error";
         return false;
@@ -1793,7 +1796,13 @@ void AgentWorker(WindowImpl* w, AgentRequest req, std::string key, std::string f
     std::ifstream ri(WidenUtf8(respPath).c_str(), std::ios::binary);
     if (!ri) { FinishAgentJob(w, AgentJobState::Failed, resp, "the agent bridge produced no response"); return; }
     std::ostringstream ss; ss << ri.rdbuf();
+    ri.close();
     resp = parseAgentResponse(ss.str());
+    // Clean up the transient request/response/frame files (the reference sidecar the
+    // effect reads is written to outPath and intentionally left in place).
+    ::DeleteFileW(WidenUtf8(reqPath).c_str());
+    ::DeleteFileW(WidenUtf8(respPath).c_str());
+    if (needFrame && !framePath.empty()) ::DeleteFileW(WidenUtf8(framePath).c_str());
     FinishAgentJob(w, AgentJobState::Done, resp, resp.ok ? "" : resp.message);
 }
 

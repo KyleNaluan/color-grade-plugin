@@ -193,4 +193,27 @@ describe('editorApplyFromResult - native composition mapping', () => {
     expect(apply).toHaveLength(0);
     expect(unmapped).toHaveLength(0);
   });
+
+  it('discloses chromaGain (not a bogus ratio) when the theme authors chromaGain:0', () => {
+    const monoBase: Theme = {
+      name: 'monochrome-bw',
+      description: 'm',
+      targetStats: {} as never,
+      knobs: { strength: { default: 1 }, skinProtection: { default: 0 } },
+      overrides: { chromaGain: 0 },
+    };
+    const monoBaseParams: AutoGradeParams = {
+      strength: 1,
+      skinProtection: 0,
+      overrides: { ...monoBase.overrides },
+    };
+    const best: AutoGradeParams = {
+      strength: 1,
+      skinProtection: 0,
+      overrides: { chromaGain: 0.4 },
+    };
+    const { apply, unmapped } = editorApplyFromResult(monoBase, best, monoBaseParams);
+    expect(apply.find((a) => a.field === 'chromaGain')).toBeUndefined();
+    expect(unmapped.some((u) => u.includes('chromaGain=0.4'))).toBe(true);
+  });
 });
