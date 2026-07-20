@@ -1,0 +1,10 @@
+command autograde
+mode correction
+model gemini-flash-latest
+profile vlog
+theme teal-orange
+strength 0.8
+skinProtection 0.75
+chromaGain 1
+rounds 4
+frame /tmp/cg-agent-frame.bin

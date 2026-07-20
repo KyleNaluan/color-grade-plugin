@@ -1,0 +1,4 @@
+status ok
+message 1 of 3 pair(s) diverged
+diverged clipA.tif | clipB.tif | exposure drift 0.42; cast direction 31deg
+pairsCompared 3

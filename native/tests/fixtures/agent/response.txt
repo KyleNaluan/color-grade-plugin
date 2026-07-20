@@ -1,0 +1,15 @@
+status ok
+message applied round 2
+defect residual color cast (6.2 LAB units)
+defect chroma overshoot in highlights
+verdict continue
+bestRound 2
+accepted true
+stopReason guard rejected round 3 as a regression; kept round 2
+apply strength 0.8
+apply skinProtection 0.75
+apply chromaGain 0.3
+apply shadowTint 5 -5
+apply toneCurve 0 0 0.5 0.55 1 1
+unmapped chromaShape.softLimit=22
+cost 0

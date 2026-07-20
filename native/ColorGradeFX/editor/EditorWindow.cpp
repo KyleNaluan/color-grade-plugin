@@ -26,7 +26,10 @@
 #include <thread>
 
 #include <windows.h>
+#include <commdlg.h>   // cg-agent-wiring: GetOpenFileName for the reference/batch pickers
 #include <d3d11.h>
+
+#pragma comment(lib, "comdlg32.lib")
 
 #include "../../third_party/imgui/imgui.h"
 #include "../../third_party/imgui/backends/imgui_impl_win32.h"
@@ -35,9 +38,13 @@
 #include <cmath>
 #include <cfloat>
 #include <cstdio>
+#include <cstring>
+#include <chrono>
+#include <fstream>
 
 #include <vector>
 
+#include "AgentBridge.h"  // cg-agent-wiring: pure agent-bridge protocol + apply translation
 #include "Scopes.h"  // Phase 5: waveform / histogram / vectorscope image synthesis
 #include "../core/FootageCatalog.h"  // multi-camera footage-profile catalog (Camera->Profile cascade)
 #include "../core/MonotoneCurve.h"  // Phase 6b: shape-preserving PCHIP for the curve preview
@@ -149,6 +156,18 @@ struct WindowImpl {
     bool              agentKeySet = false;    // a Gemini key was entered this session (BYOK)
     char              agentKeyBuf[160] = {0}; // key entry buffer (never persisted here)
     int               agentTab = 0;           // 0 = Critique, 1 = Reference, 2 = Batch
+
+    // cg-agent-wiring: the agent EXECUTES from the editor by spawning a short-lived Node
+    // subprocess (scripts/agentBridge.ts) on a worker thread; the pure protocol + apply
+    // translation live in AgentBridge.h. This state is the UI-visible job status the worker
+    // fills and the panel polls. Exactly one job at a time (agentBusy guards launch).
+    std::mutex               agentMutex;         // guards agentResult + agentBusy transitions
+    AgentJobResult           agentResult;        // Idle/Running/Done/Failed + response/error
+    std::thread              agentThread;        // the in-flight worker (joined at teardown)
+    std::atomic<bool>        agentBusy{false};   // a job is running (blocks a second launch)
+    std::atomic<bool>        agentWantsFrame{false};  // ask the idle hook to publish the source frame
+    bool                     agentApplied = false;    // UI-thread: accepted result already applied once
+    std::string              agentRefSidecar;         // where the last reference measurement was written
 
     ParamSnapshot readSnapshot() {
         std::lock_guard<std::mutex> lk(snapMutex);
@@ -383,6 +402,7 @@ constexpr ImU32 COL_BRASS    = IM_COL32(0xc7, 0x9a, 0x5a, 255);
 constexpr ImU32 COL_BRASS2   = IM_COL32(0xe0, 0xbd, 0x7f, 255);
 constexpr ImU32 COL_BRASSDIM = IM_COL32(0x7a, 0x5f, 0x38, 255);
 constexpr ImU32 COL_OK       = IM_COL32(0x5a, 0xa0, 0x66, 255);
+constexpr ImU32 COL_ERR      = IM_COL32(0xd0, 0x6a, 0x5a, 255);  // muted terracotta for error text
 // Confined agent-world palette (indigo signal; never touches a grading surface).
 constexpr ImU32 COL_IRIS     = IM_COL32(0x81, 0x80, 0xf2, 255);
 constexpr ImU32 COL_IRIS2    = IM_COL32(0xb7, 0xb6, 0xfb, 255);
@@ -1124,6 +1144,24 @@ const char* const kThemeNames[] = {
     "Cinematic Green", "Desaturated Doc", "Punchy Social", "Cross Process", "Rose Romance"};
 constexpr int kThemeCount = 25;
 constexpr int kThemeReferenceIndex = 5;  // 1-based CG_THEME_REFERENCE (kThemeNames[4])
+
+// Registry keys parallel to kThemeNames (1-based popup index -> THEMES key), so the agent
+// bridge can seed auto-grade against the same look the popup selects (matches each
+// core/Themes.h builder's t.name). Index 5 (Reference Match) and 1 (None/Manual) have no
+// stat-match look, so the auto-grade base falls back to a self stats-only target (empty key).
+const char* const kThemeKeys[] = {
+    "none-manual", "teal-orange", "warm-film", "cool-noir", "",  // "" = Reference Match
+    "golden-hour", "bleach-bypass", "vintage-fade", "high-key-clean", "low-key-moody",
+    "winter-blue", "warm-portrait", "pastel-dream", "neon-cyberpunk", "day-for-night",
+    "autumn", "summer-blockbuster", "muted-teal-orange", "monochrome-bw", "sepia",
+    "cinematic-green", "desaturated-doc", "punchy-social", "cross-process", "rose-romance"};
+
+// The auto-grade base theme key for a 1-based popup index (empty for None/Reference).
+inline std::string themeKeyForPopup(int oneBased) {
+    if (oneBased < 1 || oneBased > kThemeCount) return "";
+    if (oneBased == 1 || oneBased == kThemeReferenceIndex) return "";  // no stat-match look
+    return kThemeKeys[oneBased - 1];
+}
 // LUT-Source choices are data-driven from this array (count = size), so the in-flight
 // External-cube+Correct/Basics mode (fm/cg-lut-correct-stack, PR #39) can extend/relabel
 // this list on rebase with no layout change. External mode reads a .cube next to the .aex
@@ -1217,15 +1255,27 @@ void DrawCorrectTab(WindowImpl* w, ParamSnapshot& ui) {
         ImGui::TextDisabled("Not analyzed");
 
     Eyebrow("REFERENCE MATCH");
-    NoteBox("Match this clip to a still - pure stat transfer, no agent needed. Native reads a "
-            "precomputed .stats sidecar (env CG_REF_STATS_PATH, or ColorGrade_Reference.stats "
-            "next to the plug-in); the image is measured on the TS side.");
-    if (ImGui::Button("Use Reference Match", ImVec2(-FLT_MIN, 0))) {
+    NoteBox("Match this clip to a still. Pick an image and it is measured for you (TIFF/PNG, on "
+            "the TS side) into the sidecar the effect reads - no file to hand-produce. Pure stat "
+            "transfer, no model call.");
+    ImGui::BeginDisabled(w->agentBusy.load());
+    if (ImGui::Button("Pick reference image...", ImVec2(-FLT_MIN, 0))) {
+        std::vector<std::string> picked = PickFiles(w, /*multi=*/false);
+        if (!picked.empty()) {
+            w->agentApplied = false;
+            w->agentOpen = true;   // surface the result/progress in the agent dock
+            const std::string sidecar = AgentTempPath("ColorGrade_Reference.stats");
+            LaunchReferenceAgent(w, ui, picked[0], sidecar);
+        }
+    }
+    ImGui::EndDisabled();
+    if (ImGui::Button("Use existing sidecar", ImVec2(-FLT_MIN, 0))) {
+        // Power-user path: env CG_REF_STATS_PATH or ColorGrade_Reference.stats next to the .aex.
         ui.theme = kThemeReferenceIndex;
         w->edits.push({EditField::Theme, static_cast<double>(ui.theme)});
     }
-    NoteBox("Sets Theme -> Reference and rides your Basics / Curves / Wheels edits on top. "
-            "The agent's only role here is an optional post-match critique.");
+    NoteBox("Sets Theme -> Reference and rides your Basics / Curves / Wheels edits on top. Override: "
+            "env CG_REF_STATS_PATH, or ColorGrade_Reference.stats next to the plug-in.");
 }
 
 void DrawBasicsTab(WindowImpl* w, ParamSnapshot& ui) {
@@ -1565,6 +1615,306 @@ void DrawTitleStrip(WindowImpl* w, ParamSnapshot& ui) {
     ImGui::Separator();
 }
 
+// --- agent execution (cg-agent-wiring) --------------------------------------
+//
+// The editor buttons run the real agent pipeline by spawning a short-lived Node
+// subprocess (scripts/agentBridge.ts) that reuses src/agent + src/core (the TS
+// oracle). The pure protocol + apply translation are in AgentBridge.h and are
+// headless-tested (native:agent-test); everything below is the Win32 glue
+// (frame dump, file dialogs, CreateProcess) that AE-verification covers. All of
+// it is isolated so a spawn/read failure surfaces as a specific panel error and
+// never a silent no-op (DoD item 5). BYOK: the Gemini key rides GEMINI_API_KEY
+// on the child only, never the request file.
+
+std::wstring WidenUtf8(const std::string& s) {
+    if (s.empty()) return std::wstring();
+    int n = ::MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0);
+    std::wstring w(n, L'\0');
+    ::MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), &w[0], n);
+    return w;
+}
+std::string NarrowUtf8(const std::wstring& w) {
+    if (w.empty()) return std::string();
+    int n = ::WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), nullptr, 0, nullptr, nullptr);
+    std::string s(n, '\0');
+    ::WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), &s[0], n, nullptr, nullptr);
+    return s;
+}
+
+// A per-session temp file path (native OS path) under %TEMP%.
+std::string AgentTempPath(const std::string& leaf) {
+    wchar_t dir[MAX_PATH];
+    DWORD n = ::GetTempPathW(MAX_PATH, dir);
+    std::wstring p = (n > 0 && n < MAX_PATH) ? std::wstring(dir, n) : std::wstring(L".\\");
+    p += WidenUtf8(leaf);
+    return NarrowUtf8(p);
+}
+
+// Write a PreviewFrame (RGBA8) as the bridge's raw dump: "CGF1" + int32 w/h/channels + bytes.
+bool WriteFrameDump(const std::string& path, const PreviewFrame& f) {
+    if (!f.valid()) return false;
+    std::ofstream out(WidenUtf8(path).c_str(), std::ios::binary);
+    if (!out) return false;
+    int32_t hdr[4] = {0, f.width, f.height, 4};
+    std::memcpy(hdr, "CGF1", 4);
+    out.write(reinterpret_cast<const char*>(hdr), sizeof(hdr));
+    out.write(reinterpret_cast<const char*>(f.rgba.data()),
+              static_cast<std::streamsize>(f.rgba.size()));
+    return out.good();
+}
+
+// Resolve the bridge command line. CG_AGENT_BRIDGE = the runnable script (required); the
+// launcher is CG_AGENT_NODE (default "node"). On the dev box the captain sets, e.g.,
+// CG_AGENT_BRIDGE=C:\dev\color-grade-plugin\scripts\agentBridge.ts and CG_AGENT_NODE="npx tsx".
+// Returns "" when the bridge is not configured / not found, so the panel shows a clear error.
+std::string ResolveAgentBridge() {
+    wchar_t buf[MAX_PATH * 4];
+    DWORD n = ::GetEnvironmentVariableW(L"CG_AGENT_BRIDGE", buf, MAX_PATH * 4);
+    if (n == 0 || n >= MAX_PATH * 4) return "";
+    std::wstring bridge(buf, n);
+    if (::GetFileAttributesW(bridge.c_str()) == INVALID_FILE_ATTRIBUTES) return "";
+    return NarrowUtf8(bridge);
+}
+std::string ResolveAgentLauncher() {
+    wchar_t buf[MAX_PATH * 4];
+    DWORD n = ::GetEnvironmentVariableW(L"CG_AGENT_NODE", buf, MAX_PATH * 4);
+    if (n == 0 || n >= MAX_PATH * 4) return "node";
+    return NarrowUtf8(std::wstring(buf, n));
+}
+
+// Spawn `<launcher> "<bridge>" "<req>" "<resp>"` via cmd.exe (so npx/.cmd shims and PATH
+// resolve), set GEMINI_API_KEY for the child, and wait. Returns true on a clean exit(0).
+bool SpawnBridge(const std::string& bridge, const std::string& reqPath, const std::string& respPath,
+                 const std::string& key, std::string& err) {
+    std::string launcher = ResolveAgentLauncher();
+    // A .ts bridge needs tsx; if the launcher is the plain default, upgrade it so the repo
+    // script runs out of the box (CG_AGENT_NODE still overrides for a prebuilt .js/.mjs).
+    if (launcher == "node" && bridge.size() > 3 && bridge.compare(bridge.size() - 3, 3, ".ts") == 0)
+        launcher = "npx tsx";
+    // Build the command run under cmd.exe /c. Quote paths defensively.
+    std::string cmd = "cmd.exe /c " + launcher + " \"" + bridge + "\" \"" + reqPath + "\" \"" + respPath + "\"";
+    std::wstring wcmd = WidenUtf8(cmd);
+    std::vector<wchar_t> mutableCmd(wcmd.begin(), wcmd.end());
+    mutableCmd.push_back(L'\0');
+
+    // The key is set on THIS process's env right before spawn so the child inherits it (a
+    // single job runs at a time). Empty key = leave whatever is set (mock/free paths still run).
+    if (!key.empty()) ::SetEnvironmentVariableW(L"GEMINI_API_KEY", WidenUtf8(key).c_str());
+
+    STARTUPINFOW si;
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    PROCESS_INFORMATION pi;
+    ZeroMemory(&pi, sizeof(pi));
+    // Run in the bridge's directory so a repo-relative tsx resolves node_modules.
+    std::wstring bridgeDir = WidenUtf8(bridge);
+    size_t slash = bridgeDir.find_last_of(L"\\/");
+    std::wstring cwd = slash == std::wstring::npos ? std::wstring() : bridgeDir.substr(0, slash);
+
+    BOOL ok = ::CreateProcessW(nullptr, mutableCmd.data(), nullptr, nullptr, FALSE,
+                               CREATE_NO_WINDOW, nullptr, cwd.empty() ? nullptr : cwd.c_str(), &si, &pi);
+    if (!ok) {
+        err = "could not launch the agent bridge (CreateProcess failed)";
+        return false;
+    }
+    ::WaitForSingleObject(pi.hProcess, 120000);  // 2 min ceiling for a model round
+    DWORD code = 1;
+    ::GetExitCodeProcess(pi.hProcess, &code);
+    ::CloseHandle(pi.hProcess);
+    ::CloseHandle(pi.hThread);
+    if (code != 0) {
+        err = "the agent bridge exited with an error";
+        return false;
+    }
+    return true;
+}
+
+// Store a finished/failed job result and clear the busy flag (worker thread).
+void FinishAgentJob(WindowImpl* w, AgentJobState state, const AgentResponse& resp, const std::string& error) {
+    {
+        std::lock_guard<std::mutex> lk(w->agentMutex);
+        w->agentResult.state = state;
+        w->agentResult.response = resp;
+        w->agentResult.error = error;
+    }
+    w->agentWantsFrame.store(false);
+    w->agentBusy.store(false);
+}
+
+// The worker: write inputs, spawn the bridge, parse the result. For critique/autograde a frame
+// dump path is required; the worker POLLS the window for the frame (the idle hook may only
+// publish the decoded-source "before" frame a tick after agentWantsFrame is set). needFrame
+// picks whether a frame is required; wantSource picks the decoded-source vs graded preview.
+void AgentWorker(WindowImpl* w, AgentRequest req, std::string key, std::string framePath,
+                 bool needFrame, bool wantSource) {
+    AgentResponse resp;
+    std::string err;
+    const std::string bridge = ResolveAgentBridge();
+    if (bridge.empty()) {
+        resp.ok = false;
+        FinishAgentJob(w, AgentJobState::Failed, resp,
+                       "agent bridge not configured - set CG_AGENT_BRIDGE to scripts/agentBridge.ts");
+        return;
+    }
+
+    // Dump the frame for critique/autograde, polling up to ~4s for it to be published.
+    if (needFrame) {
+        std::shared_ptr<const PreviewFrame> frame;
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(4);
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (wantSource) { std::lock_guard<std::mutex> lk(w->beforeMutex); frame = w->pendingBefore; }
+            else            { std::lock_guard<std::mutex> lk(w->previewMutex); frame = w->pendingPreview; }
+            if (frame && frame->valid()) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(60));
+        }
+        if (!frame || !WriteFrameDump(framePath, *frame)) {
+            FinishAgentJob(w, AgentJobState::Failed, resp,
+                           "no source frame available - scrub the timeline once, then retry");
+            return;
+        }
+        req.framePath = framePath;
+    }
+
+    const std::string tag = std::to_string(w->key);
+    const std::string reqPath = AgentTempPath("cg-agent-req-" + tag + ".txt");
+    const std::string respPath = AgentTempPath("cg-agent-resp-" + tag + ".txt");
+    {
+        std::ofstream ro(WidenUtf8(reqPath).c_str(), std::ios::binary);
+        if (!ro) { FinishAgentJob(w, AgentJobState::Failed, resp, "could not write the agent request"); return; }
+        ro << formatAgentRequest(req);
+    }
+
+    if (!SpawnBridge(bridge, reqPath, respPath, key, err)) {
+        FinishAgentJob(w, AgentJobState::Failed, resp, err);
+        return;
+    }
+    std::ifstream ri(WidenUtf8(respPath).c_str(), std::ios::binary);
+    if (!ri) { FinishAgentJob(w, AgentJobState::Failed, resp, "the agent bridge produced no response"); return; }
+    std::ostringstream ss; ss << ri.rdbuf();
+    resp = parseAgentResponse(ss.str());
+    FinishAgentJob(w, AgentJobState::Done, resp, resp.ok ? "" : resp.message);
+}
+
+// Join any previous worker so we never leak/overlap threads, then reset it.
+void JoinAgentThread(WindowImpl* w) {
+    if (w->agentThread.joinable()) w->agentThread.join();
+}
+
+// Launch a critique / auto-grade job. Captures inputs on the UI thread (frame, params, key),
+// then hands off to a worker. `wantSource` picks the decoded-source (before) frame for
+// auto-grade vs the graded preview for critique.
+void LaunchFrameAgent(WindowImpl* w, AgentCommand command, const ParamSnapshot& ui, bool wantSource) {
+    if (w->agentBusy.exchange(true)) return;  // one job at a time
+    JoinAgentThread(w);
+    {
+        std::lock_guard<std::mutex> lk(w->agentMutex);
+        w->agentResult = AgentJobResult{};
+        w->agentResult.state = AgentJobState::Running;
+        w->agentResult.command = command;
+    }
+
+    // Auto-grade needs the decoded source frame; ask the idle hook to publish it (it may not be
+    // available in After-only mode). The worker polls for it. Critique uses the graded preview.
+    if (wantSource) w->agentWantsFrame.store(true);
+
+    AgentRequest req;
+    req.command = command;
+    req.mode = (ui.theme == kThemeReferenceIndex) ? "shot-match" : "correction";
+    req.profile = cg::core::footageKeyForIndex(ui.footageProfile);
+    req.theme = themeKeyForPopup(ui.theme);
+    req.hasStrength = true; req.strength = ui.strength;
+    req.hasSkinProtection = true; req.skinProtection = ui.skinProtection;
+    req.hasChromaGain = true; req.chromaGain = ui.chromaGain;
+    if (command == AgentCommand::Autograde) { req.hasRounds = true; req.rounds = 4; }
+    const std::string key = w->agentKeyBuf;
+    const std::string framePath = AgentTempPath("cg-agent-frame-" + std::to_string(w->key) + ".bin");
+
+    w->agentThread = std::thread(AgentWorker, w, req, key, framePath, /*needFrame=*/true, wantSource);
+}
+
+// Launch the reference-measurement job: measure a picked still into the sidecar the effect's
+// LoadReferenceStats already reads, then (on success) the panel switches Theme -> Reference.
+void LaunchReferenceAgent(WindowImpl* w, const ParamSnapshot& ui, const std::string& imagePath,
+                          const std::string& sidecarPath) {
+    if (w->agentBusy.exchange(true)) return;
+    JoinAgentThread(w);
+    {
+        std::lock_guard<std::mutex> lk(w->agentMutex);
+        w->agentResult = AgentJobResult{};
+        w->agentResult.state = AgentJobState::Running;
+        w->agentResult.command = AgentCommand::Reference;
+    }
+    w->agentRefSidecar = sidecarPath;  // where the effect will read the measured stats from
+    AgentRequest req;
+    req.command = AgentCommand::Reference;
+    req.profile = cg::core::footageKeyForIndex(ui.footageProfile);
+    req.referencePath = imagePath;
+    req.outPath = sidecarPath;
+    w->agentThread = std::thread(AgentWorker, w, req, std::string(), std::string(),
+                                 /*needFrame=*/false, /*wantSource=*/false);
+}
+
+// Launch the batch consistency job over the picked clips (no model call).
+void LaunchBatchAgent(WindowImpl* w, const ParamSnapshot& ui, const std::vector<std::string>& clips) {
+    if (w->agentBusy.exchange(true)) return;
+    JoinAgentThread(w);
+    {
+        std::lock_guard<std::mutex> lk(w->agentMutex);
+        w->agentResult = AgentJobResult{};
+        w->agentResult.state = AgentJobState::Running;
+        w->agentResult.command = AgentCommand::Batch;
+    }
+    AgentRequest req;
+    req.command = AgentCommand::Batch;
+    req.profile = cg::core::footageKeyForIndex(ui.footageProfile);
+    // Batch needs a stat-match theme; None/Reference have none, so fall back to teal-orange.
+    std::string tk = themeKeyForPopup(ui.theme);
+    req.theme = tk.empty() ? "teal-orange" : tk;
+    req.hasStrength = true; req.strength = ui.strength;
+    req.clipPaths = clips;
+    w->agentThread = std::thread(AgentWorker, w, req, std::string(), std::string(),
+                                 /*needFrame=*/false, /*wantSource=*/false);
+}
+
+// Apply an accepted auto-grade result by translating it into ParamEdits and pushing them onto
+// the same edit queue every control uses, so the idle hook writes them to the recipe.
+void ApplyAgentAutograde(WindowImpl* w, const ParamSnapshot& ui, const AgentResponse& resp) {
+    std::vector<ParamEdit> edits = translateAgentApply(resp.apply, ui);
+    for (const auto& e : edits) w->edits.push(e);
+}
+
+// A Win32 multi-select open dialog. Returns picked native paths (empty on cancel). `image`
+// restricts the filter to TIFF/PNG (what the TS decoders support).
+std::vector<std::string> PickFiles(WindowImpl* w, bool multi) {
+    wchar_t buf[8192] = {0};
+    OPENFILENAMEW ofn;
+    ZeroMemory(&ofn, sizeof(ofn));
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = w->hwnd.load();
+    ofn.lpstrFilter = L"Images (TIFF, PNG)\0*.tif;*.tiff;*.png\0All files\0*.*\0";
+    ofn.lpstrFile = buf;
+    ofn.nMaxFile = 8192;
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_EXPLORER;
+    if (multi) ofn.Flags |= OFN_ALLOWMULTISELECT;
+    std::vector<std::string> out;
+    if (!::GetOpenFileNameW(&ofn)) return out;
+    // Multi-select returns dir\0file1\0file2\0\0; single returns the full path.
+    std::wstring dir = buf;
+    const wchar_t* p = buf + dir.size() + 1;
+    if (!multi || *p == L'\0') {
+        out.push_back(NarrowUtf8(dir));
+        return out;
+    }
+    while (*p) {
+        std::wstring name = p;
+        out.push_back(NarrowUtf8(dir + L"\\" + name));
+        p += name.size() + 1;
+    }
+    return out;
+}
+
 // --- agent dock (confined indigo world; the single Pro/BYOK seam) -----------
 
 // Draw the collapsed rail: a slim indigo strip with an expand affordance.
@@ -1595,11 +1945,108 @@ void DrawAgentRail(WindowImpl* w) {
     ImGui::PopStyleColor(2);
 }
 
-// Draw the expanded agent panel with its BYOK states (setup / ready). Agent EXECUTION is not
-// wired into the native editor yet (it lives in the offline pipeline, src/agent + npm run
-// auto-grade, per AGENTS.md); this presents the key management + informational tabs truthfully
-// (no standalone trigger buttons) rather than fabricating results.
-void DrawAgentPanel(WindowImpl* w) {
+// Render the last agent job's status/result, and apply an accepted result exactly once. This
+// is the immediate-feedback surface (DoD item 5): every job shows Running / a specific result /
+// a specific error, never a silent no-op. Auto-grade edits are pushed onto the shared edit
+// queue; a finished Reference measurement flips Theme -> Reference.
+void DrawAgentResult(WindowImpl* w, ParamSnapshot& ui) {
+    AgentJobResult r;
+    { std::lock_guard<std::mutex> lk(w->agentMutex); r = w->agentResult; }
+
+    if (r.state == AgentJobState::Idle) return;
+    ImGui::Separator();
+    if (r.state == AgentJobState::Running) {
+        const int dots = 1 + (static_cast<int>(ImGui::GetTime() * 2.0) % 3);
+        ImGui::TextColored(V4(COL_BRASS2), "Working%.*s", dots, "...");
+        ImGui::PushStyleColor(ImGuiCol_Text, V4(COL_INK3));
+        ImGui::TextWrapped(r.command == AgentCommand::Autograde
+                               ? "Rendering + critiquing rounds; the rules decide accept/reject."
+                               : r.command == AgentCommand::Critique ? "Sending the frame to Gemini..."
+                               : r.command == AgentCommand::Reference ? "Measuring the reference still..."
+                                                                       : "Comparing clips...");
+        ImGui::PopStyleColor();
+        return;
+    }
+    if (r.state == AgentJobState::Failed || !r.response.ok) {
+        ImGui::TextColored(V4(COL_ERR), "Error");
+        ImGui::PushStyleColor(ImGuiCol_Text, V4(COL_INK2));
+        ImGui::TextWrapped("%s", (!r.error.empty() ? r.error : r.response.message).c_str());
+        ImGui::PopStyleColor();
+        return;
+    }
+
+    // Done + ok. Apply an accepted result once.
+    const AgentResponse& resp = r.response;
+    if (!w->agentApplied) {
+        if (r.command == AgentCommand::Autograde && !resp.apply.empty()) {
+            ApplyAgentAutograde(w, ui, resp);
+        } else if (r.command == AgentCommand::Reference) {
+            // Point the effect's reference loader at the freshly-measured sidecar (LoadReferenceStats
+            // reads CG_REF_STATS_PATH first), then switch the theme so the next bake matches it.
+            if (!w->agentRefSidecar.empty())
+                ::SetEnvironmentVariableW(L"CG_REF_STATS_PATH", WidenUtf8(w->agentRefSidecar).c_str());
+            ui.theme = kThemeReferenceIndex;
+            w->edits.push({EditField::Theme, static_cast<double>(ui.theme)});
+        }
+        w->agentApplied = true;
+    }
+
+    switch (r.command) {
+        case AgentCommand::Critique: {
+            ImGui::TextColored(V4(COL_OK), "Critique");
+            ImGui::PushStyleColor(ImGuiCol_Text, V4(COL_INK2));
+            if (resp.defects.empty()) ImGui::TextWrapped("No defects named - the grade looks clean.");
+            for (const auto& d : resp.defects) ImGui::BulletText("%s", d.c_str());
+            ImGui::PopStyleColor();
+            ImGui::TextColored(V4(COL_INK3), "Model names defects; the rules decide across rounds.");
+            break;
+        }
+        case AgentCommand::Autograde: {
+            ImGui::TextColored(V4(COL_OK), resp.accepted ? "Auto-grade applied" : "Auto-grade: baseline kept");
+            ImGui::PushStyleColor(ImGuiCol_Text, V4(COL_INK2));
+            ImGui::TextWrapped("%s", resp.message.c_str());
+            if (!resp.stopReason.empty()) ImGui::TextColored(V4(COL_INK3), "%s", resp.stopReason.c_str());
+            if (!resp.apply.empty()) {
+                ImGui::Dummy(ImVec2(0, 2));
+                ImGui::TextColored(V4(COL_INK3), "Applied to recipe:");
+                for (const auto& a : resp.apply) ImGui::BulletText("%s", a.field.c_str());
+            }
+            if (!resp.unmapped.empty()) {
+                ImGui::TextColored(V4(COL_BRASS2), "Proposed, no editor control:");
+                for (const auto& u : resp.unmapped) ImGui::BulletText("%s", u.c_str());
+            }
+            ImGui::PopStyleColor();
+            break;
+        }
+        case AgentCommand::Reference: {
+            ImGui::TextColored(V4(COL_OK), "Reference measured");
+            ImGui::PushStyleColor(ImGuiCol_Text, V4(COL_INK2));
+            ImGui::TextWrapped("%s", resp.message.c_str());
+            ImGui::TextColored(V4(COL_INK3), "Theme set to Reference Match; your Basics/Curves/Wheels ride on top.");
+            ImGui::PopStyleColor();
+            break;
+        }
+        case AgentCommand::Batch: {
+            ImGui::TextColored(resp.diverged.empty() ? V4(COL_OK) : V4(COL_BRASS2),
+                               resp.diverged.empty() ? "Clips consistent" : "Drift found");
+            ImGui::PushStyleColor(ImGuiCol_Text, V4(COL_INK2));
+            ImGui::TextWrapped("%s", resp.message.c_str());
+            for (const auto& d : resp.diverged) {
+                ImGui::BulletText("%s vs %s", d.clipA.c_str(), d.clipB.c_str());
+                ImGui::PushStyleColor(ImGuiCol_Text, V4(COL_INK3));
+                ImGui::TextWrapped("  %s", d.reason.c_str());
+                ImGui::PopStyleColor();
+            }
+            ImGui::PopStyleColor();
+            break;
+        }
+    }
+}
+
+// Draw the expanded agent panel with its BYOK states (setup / ready). Agent EXECUTION runs
+// from here (cg-agent-wiring): each action spawns the Node bridge (scripts/agentBridge.ts)
+// on a worker thread; DrawAgentResult shows Running/result/error and applies accepted results.
+void DrawAgentPanel(WindowImpl* w, ParamSnapshot& ui) {
     // Push the confined indigo world onto the button/frame colours for this panel only.
     ImGui::PushStyleColor(ImGuiCol_Button, V4(COL_IRISRAISE));
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, V4(COL_IRISLINE));
@@ -1621,19 +2068,17 @@ void DrawAgentPanel(WindowImpl* w) {
     ImGui::PopStyleColor();
     ImGui::Separator();
 
+    const bool busy = w->agentBusy.load();
+
+    // --- BYOK key row (always present). Critique/Auto-grade need a key; Reference/Batch don't. ---
     if (!w->agentKeySet) {
-        // --- BYOK setup state (no key) ---
-        ImGui::TextColored(V4(COL_IRIS2), "Bring your own Gemini key");
         ImGui::PushStyleColor(ImGuiCol_Text, V4(COL_INK2));
-        ImGui::TextWrapped("Agent critique and auto-grade run on your own Gemini API key. The free "
-                           "tier works at no cost. Frames are sent to Google only when you press "
-                           "Critique - with this panel unused, nothing leaves your machine.");
+        ImGui::TextWrapped("Critique / Auto-grade use your own Gemini API key (free tier = $0). Frames "
+                           "go to Google only when you press one of those. Reference / Batch use no key.");
         ImGui::PopStyleColor();
-        ImGui::Dummy(ImVec2(0, 4));
         ImGui::TextColored(V4(COL_INK2), "API key");
         ImGui::SetNextItemWidth(-FLT_MIN);
-        ImGui::InputText("##agentkey", w->agentKeyBuf, sizeof(w->agentKeyBuf),
-                         ImGuiInputTextFlags_Password);
+        ImGui::InputText("##agentkey", w->agentKeyBuf, sizeof(w->agentKeyBuf), ImGuiInputTextFlags_Password);
         const bool hasText = w->agentKeyBuf[0] != 0;
         ImGui::BeginDisabled(!hasText);
         ImGui::PushStyleColor(ImGuiCol_Button, V4(COL_IRISDIM));
@@ -1641,7 +2086,6 @@ void DrawAgentPanel(WindowImpl* w) {
         ImGui::PopStyleColor();
         ImGui::EndDisabled();
     } else {
-        // --- ready state (key stored this session) ---
         std::string k = w->agentKeyBuf;
         std::string masked = k.size() > 8 ? (k.substr(0, 4) + std::string("....") + k.substr(k.size() - 4))
                                           : std::string("....");
@@ -1651,58 +2095,84 @@ void DrawAgentPanel(WindowImpl* w) {
         ImGui::SameLine();
         ImGui::SetCursorPosX(ImGui::GetWindowWidth() - 72.0f);
         if (ImGui::SmallButton("Remove")) { w->agentKeySet = false; w->agentKeyBuf[0] = 0; }
-
-        // Status line (round-1 fix): agent EXECUTION is not wired into the native editor -
-        // critique/auto-grade run via the offline pipeline today. The former standalone
-        // Critique/Auto-grade trigger buttons were removed - they did nothing here and their
-        // "Critique" label collided with the tab below (the ImGui conflicting-ID crash + the
-        // visible duplicate). The three tabs below describe each agent capability's status.
-        ImGui::Dummy(ImVec2(0, 4));
-        ImGui::PushStyleColor(ImGuiCol_Text, V4(COL_IRIS2));
-        ImGui::TextWrapped("Button-triggered - never automatic.");
-        ImGui::PopStyleColor();
-        ImGui::PushStyleColor(ImGuiCol_Text, V4(COL_INK3));
-        ImGui::TextWrapped("Critique and auto-grade run via the offline pipeline today "
-                           "(npm run auto-grade / src/agent); in-editor triggers land with the "
-                           "agent wiring, not this UI pass.");
-        ImGui::PopStyleColor();
-        ImGui::Dummy(ImVec2(0, 2));
-
-        // inner tabs - each label is unique (no collision with any button in this panel).
-        const char* tabs[3] = {"Critique", "Reference", "Batch"};
-        for (int i = 0; i < 3; ++i) {
-            const bool on = w->agentTab == i;
-            if (on) ImGui::PushStyleColor(ImGuiCol_Button, V4(COL_IRISPANEL));
-            if (ImGui::Button(tabs[i])) w->agentTab = i;
-            if (on) ImGui::PopStyleColor();
-            if (i < 2) ImGui::SameLine(0, 4);
-        }
-        ImGui::Separator();
-        ImGui::PushStyleColor(ImGuiCol_Text, V4(COL_INK2));
-        if (w->agentTab == 0)
-            ImGui::TextWrapped("No critique yet. The agent runs only when you ask. Editor execution "
-                               "routes through the offline pipeline (npm run auto-grade / src/agent) "
-                               "- the model NAMES defects, the rules decide accept or reject.");
-        else if (w->agentTab == 1)
-            ImGui::TextWrapped("Reference match is pure stat transfer (no model call) - use it from "
-                               "the Correct tab. The agent's only role here is an optional post-match "
-                               "critique of the result.");
-        else
-            ImGui::TextWrapped("Cross-clip consistency compares same-scene clips and flags drift. It "
-                               "runs via the offline check-consistency tool today; a native batch "
-                               "view is planned.");
-        ImGui::PopStyleColor();
     }
+    ImGui::Dummy(ImVec2(0, 2));
+    ImGui::PushStyleColor(ImGuiCol_Text, V4(COL_IRIS2));
+    ImGui::TextWrapped("Button-triggered - never automatic. Model NAMES defects, rules decide.");
+    ImGui::PopStyleColor();
+    ImGui::Dummy(ImVec2(0, 2));
+
+    // inner tabs (each label unique, no ID collision with the action buttons below).
+    const char* tabs[3] = {"Grade", "Reference", "Batch"};
+    for (int i = 0; i < 3; ++i) {
+        const bool on = w->agentTab == i;
+        if (on) ImGui::PushStyleColor(ImGuiCol_Button, V4(COL_IRISPANEL));
+        if (ImGui::Button(tabs[i])) w->agentTab = i;
+        if (on) ImGui::PopStyleColor();
+        if (i < 2) ImGui::SameLine(0, 4);
+    }
+    ImGui::Separator();
+
+    ImGui::BeginDisabled(busy);
+    if (w->agentTab == 0) {
+        ImGui::PushStyleColor(ImGuiCol_Text, V4(COL_INK3));
+        ImGui::TextWrapped("Critique names defects on the current frame. Auto-grade tunes the grade over "
+                           "a few rounds (rules accept/reject) and applies the result to your recipe.");
+        ImGui::PopStyleColor();
+        ImGui::BeginDisabled(!w->agentKeySet);
+        if (ImGui::Button("Critique frame", ImVec2(-FLT_MIN, 0))) {
+            w->agentApplied = false;
+            LaunchFrameAgent(w, AgentCommand::Critique, ui, /*wantSource=*/false);
+        }
+        if (ImGui::Button("Auto-grade", ImVec2(-FLT_MIN, 0))) {
+            w->agentApplied = false;
+            LaunchFrameAgent(w, AgentCommand::Autograde, ui, /*wantSource=*/true);
+        }
+        ImGui::EndDisabled();
+        if (!w->agentKeySet) ImGui::TextColored(V4(COL_INK3), "Enter a key above to enable these.");
+    } else if (w->agentTab == 1) {
+        ImGui::PushStyleColor(ImGuiCol_Text, V4(COL_INK3));
+        ImGui::TextWrapped("Pick a reference still (TIFF/PNG); it is measured on the TS side and the clip "
+                           "is matched to it - no sidecar to hand-produce. No model call.");
+        ImGui::PopStyleColor();
+        if (ImGui::Button("Pick reference image...", ImVec2(-FLT_MIN, 0))) {
+            std::vector<std::string> picked = PickFiles(w, /*multi=*/false);
+            if (!picked.empty()) {
+                w->agentApplied = false;
+                const std::string sidecar = AgentTempPath("ColorGrade_Reference.stats");
+                LaunchReferenceAgent(w, ui, picked[0], sidecar);
+            }
+        }
+        ImGui::PushStyleColor(ImGuiCol_Text, V4(COL_INK3));
+        ImGui::TextWrapped("Power-user override: set CG_REF_STATS_PATH or drop ColorGrade_Reference.stats "
+                           "next to the plug-in.");
+        ImGui::PopStyleColor();
+    } else {
+        ImGui::PushStyleColor(ImGuiCol_Text, V4(COL_INK3));
+        ImGui::TextWrapped("Pick 2+ same-scene clips (TIFF/PNG); each is graded with the current theme and "
+                           "compared for drift. No model call. Native comp harvest is deferred.");
+        ImGui::PopStyleColor();
+        if (ImGui::Button("Pick clips to compare...", ImVec2(-FLT_MIN, 0))) {
+            std::vector<std::string> picked = PickFiles(w, /*multi=*/true);
+            if (picked.size() >= 2) {
+                w->agentApplied = false;
+                LaunchBatchAgent(w, ui, picked);
+            }
+        }
+    }
+    ImGui::EndDisabled();
+
+    DrawAgentResult(w, ui);
 
     ImGui::PopStyleColor(5);
 }
 
-void DrawAgentDock(WindowImpl* w) {
+void DrawAgentDock(WindowImpl* w, ParamSnapshot& ui) {
     if (!kAgentDockEnabled) {  // Pro/BYOK seam disabled: keep the free core fully usable.
         ImGui::TextDisabled("Agent features off");
         return;
     }
-    if (w->agentOpen) DrawAgentPanel(w);
+    if (w->agentOpen) DrawAgentPanel(w, ui);
     else DrawAgentRail(w);
 }
 
@@ -1766,7 +2236,7 @@ void DrawEditorUI(WindowImpl* w, ParamSnapshot& ui) {
     ImGui::PushStyleColor(ImGuiCol_ChildBg, V4(w->agentOpen ? COL_IRISPANEL : COL_IRISBG));
     ImGui::PushStyleColor(ImGuiCol_Border, V4(COL_IRISLINE));
     ImGui::BeginChild("agent", ImVec2(agentW, bodyH), true);
-    DrawAgentDock(w);
+    DrawAgentDock(w, ui);
     ImGui::EndChild();
     ImGui::PopStyleColor(2);
 
@@ -1913,6 +2383,8 @@ void DestroyWindowImplLocked(WindowImpl* w) {
     HWND hwnd = w->hwnd.load();
     if (hwnd) ::PostMessageW(hwnd, WM_CLOSE, 0, 0);  // nudge a running loop out
     if (w->thread.joinable()) w->thread.join();
+    // Join any in-flight agent worker so its detach can't outlive the window (it holds `w`).
+    if (w->agentThread.joinable()) w->agentThread.join();
     delete w;
 }
 
@@ -1985,7 +2457,10 @@ std::vector<ParamEdit> EditorHost::drainEdits(InstanceKey key) {
 bool EditorHost::wantsBeforeFrame(InstanceKey key) {
     std::lock_guard<std::mutex> lk(g_mapMutex);
     auto it = g_windows.find(key);
-    return it != g_windows.end() && it->second->compareMode.load() != 0;
+    if (it == g_windows.end()) return false;
+    // The before frame is the ORIGINAL decoded source, which auto-grade needs to re-render
+    // candidate params - so a pending agent job forces the checkout even in After-only mode.
+    return it->second->compareMode.load() != 0 || it->second->agentWantsFrame.load();
 }
 
 bool EditorHost::consumeAnalyzeRequest(InstanceKey key) {
