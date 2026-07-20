@@ -1200,6 +1200,14 @@ void NoteBox(const char* text) {
 
 // --- inspector tabs (the Correct / Basics / Grade / Curves / Wheels control set) --------
 
+// Forward declarations: the agent-execution helpers are defined below (just before the agent
+// dock), but the Correct tab's reference picker above them calls these three. C++ needs the
+// declaration visible at the call site (cg-agent-wiring; fixes the Win C3861 build errors).
+std::string AgentTempPath(const std::string& leaf);
+std::vector<std::string> PickFiles(WindowImpl* w, bool multi);
+void LaunchReferenceAgent(WindowImpl* w, const ParamSnapshot& ui, const std::string& imagePath,
+                          const std::string& sidecarPath);
+
 void DrawCorrectTab(WindowImpl* w, ParamSnapshot& ui) {
     Eyebrow("FOOTAGE");
     // Camera -> Profile cascade (both combos derive from core/FootageCatalog.h and resolve to
