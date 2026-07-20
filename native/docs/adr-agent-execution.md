@@ -118,7 +118,10 @@ with `data/cg-distribution-decision.md`. A bundled, Node-free runtime is out of 
 ## Consequences
 
 - One in-flight agent job per editor window (`agentBusy`); a second click no-ops until it
-  finishes. Closing a window mid-job joins the worker (can block up to the 2-min spawn ceiling).
+  finishes. The bridge child (`cmd.exe` → `npx` → `node`) runs inside a `KILL_ON_JOB_CLOSE`
+  Job Object, so closing a window mid-job (or the 2-min spawn ceiling elapsing) tears the whole
+  process tree down at once and the worker join returns promptly - a bare shell kill would orphan
+  the real node worker, which could still write the response file and collide.
 - Two editor windows running jobs at once use per-window temp files (keyed on the instance uid).
 - The agent dock stays the single Pro/BYOK seam behind `kAgentDockEnabled`; nothing here couples
   a Pro-able feature into the free core (monetization constraint, `data/cg-monetization-decision.md`).
