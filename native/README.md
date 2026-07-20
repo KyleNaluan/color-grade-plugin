@@ -53,6 +53,15 @@ SDK plugin.
   `cg::core::applyEditorOverrides`; no new keyframeable params; the recipe migration grew a
   v3->v4 arm so old grades survive (see `docs/adr-editor-ui.md`, "Phase 6b/6c" section).
 
+- **Agent wiring** (landed): the editor's four agent surfaces (Critique / Auto-grade /
+  Reference / Batch) EXECUTE by spawning a short-lived Node subprocess that runs the TS agent
+  oracle (`scripts/agentBridge.ts` reusing `src/agent` + `src/core`), talking a tiny line-based
+  wire protocol so the C++ side needs no JSON library. The model NAMES defects and the
+  rule-based `gradeGuard` is the sole accept/reject authority; the Gemini key rides
+  `GEMINI_API_KEY` on the child only (BYOK). Still gated behind `kAgentDockEnabled`. The pure
+  seam is `editor/AgentBridge.h`; the Win32 subprocess/dialog layer is captain-verified
+  (see `docs/adr-agent-execution.md` and BUILDING.md checklist item 9).
+
 ## Layout
 
 ```
@@ -82,6 +91,7 @@ native/
     embedded/EmbeddedLut.h          GENERATED default LUT (teal-orange grade, 17^3)
     editor/                         Phase 3-6c editor window (see docs/adr-editor-ui.md)
       EditorBridge.h                  pure effect<->window seam (edit queue + mapping + curve/wheel point logic); headless-tested
+      AgentBridge.h                   pure agent-subprocess seam (line-based wire protocol parse/emit + translateAgentApply -> ParamEdit); headless-tested (see docs/adr-agent-execution.md)
       PreviewCache.h                  Phase 4-5 pure preview core (cache/keying/fit/checkin + split geometry); headless-tested
       Analysis.h                      Phase 5 pure analysis core (frame-sampling schedule + incremental job + fingerprint/debounce); headless-tested
       Scopes.h                        Phase 5 pure scope synthesis (waveform/histogram/vectorscope binning -> RGBA8); headless-tested
@@ -89,6 +99,7 @@ native/
     Win/ColorGradeFX.vcxproj/.sln   MSBuild project (CPU default; /p:CG_GPU=true builds DirectX + CUDA)
   third_party/imgui/                vendored Dear ImGui v1.91.5 (MIT) + Win32/D3D11 backends
   docs/adr-editor-ui.md             Phase 3 toolkit decision (ImGui vs webview) + bridge design + Phase 4 preview + Phase 5 analysis/scopes + Phase 6a manual grade + Phase 6b/6c curves + wheels
+  docs/adr-agent-execution.md       editor agent surfaces via a Node subprocess running the TS oracle (wire protocol, BYOK, per-command flow)
   tests/parity/
     parity_test.cpp                 Phase 1: sampleLut vs TS oracle
     core_parity.cpp                 Phase 2-6c: computeStats / bakeGradeLut / bakeDecodeLut / recipe / manual grade + Look Mix / LGG + editor-override render path / v2/v3->v4 migrate replay / reference-match theme + stats-sidecar round-trip
@@ -97,6 +108,8 @@ native/
     preview_test.cpp                Phase 4: live-preview core (cache/keying/fit/checkin; headless, self-asserting)
     analysis_test.cpp               Phase 5: analysis schedule/job/debounce (headless, self-asserting)
     scopes_test.cpp                 Phase 5: scope binning + image synthesis (headless, self-asserting)
+    agent_bridge_test.cpp           cg-agent-wiring: agent wire-protocol parse/emit + translateAgentApply against the committed fixtures (headless, self-asserting)
+  tests/fixtures/agent/             cross-language wire-protocol fixtures (request / response / batch-response), parsed by both engines
   scripts/
     build.sh                        WSL -> NTFS mirror -> MSBuild interop build (CG_OUT_DIR override for link-verify)
     gen-embedded-lut.ts             bake the embedded LUT header from the TS engine
@@ -106,6 +119,7 @@ native/
     preview-test.ts                 Phase 4 live-preview core test (local, not in CI)
     analysis-test.ts                Phase 5 analysis-core test (local, not in CI)
     scopes-test.ts                  Phase 5 scope-synthesis test (local, not in CI)
+    agent-bridge-test.ts            cg-agent-wiring agent wire-protocol/translate test (local, not in CI)
 ```
 
 ## Commands
@@ -118,6 +132,7 @@ npm run native:editor-test   # Phase 3 headless editor<->effect bridge logic (g+
 npm run native:preview-test  # Phase 4 headless live-preview core (g++/clang; not in CI)
 npm run native:analysis-test # Phase 5 headless analysis core (g++/clang; not in CI)
 npm run native:scopes-test   # Phase 5 headless scope synthesis (g++/clang; not in CI)
+npm run native:agent-test    # cg-agent-wiring headless agent wire-protocol/translate (g++/clang; not in CI)
 native/scripts/build.sh Debug          # CPU-only build
 native/scripts/build.sh Release --gpu  # CPU + GPU (DirectX + CUDA) build
 CG_OUT_DIR='C:\dev\cg-verify-out' native/scripts/build.sh Debug  # link-verify without closing AE
