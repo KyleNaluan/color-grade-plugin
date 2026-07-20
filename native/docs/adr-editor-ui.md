@@ -518,21 +518,37 @@ direction + decisions `data/cg-ui-direction-decision.md`).
   in the preview (a hit-strip over the split line writes `splitFraction`) with a chevron knob;
   the old `##splitpos` toolbar slider is gone.
 - **Surfaces covered:** tabs, None-first theme selector, camera/profile cascade, LUT-Source
-  (data-driven from `kLutSourceNames`/`kLutSourceCount` so the External-cube+Correct mode
-  (`fm/cg-lut-correct-stack`, PR #39) extends it on rebase with no layout change), Curves (now
-  channel-tabs M/R/G/B + one plot), Wheels (LGG / 3-way), and the collapsible agent dock.
+  (data-driven from `kLutSourceNames`/`kLutSourceCount`, so after the rebase onto merged
+  PR #39 it already surfaces the 4th "External .cube + Correct/Basics" mode
+  (`fm/cg-lut-correct-stack`) with no layout change), Curves (now channel-tabs M/R/G/B + one
+  plot), Wheels (LGG / 3-way), and the collapsible agent dock.
 - **Agent dock = the single Pro/BYOK seam (`kAgentDockEnabled`):** collapsed rail <-> expanded
   panel with BYOK setup (key entry + privacy note + disabled actions) / ready (masked key +
-  Remove + button-triggered Critique/Auto-grade) states. Agent EXECUTION deliberately stays
-  the offline pipeline (`src/agent`) and is NOT wired into the editor - the panel says so and
-  fabricates no results (intentional honesty). This is the concrete Pro-split seam of
+  Remove + informational Critique/Reference/Batch tabs) states. Agent EXECUTION deliberately
+  stays the offline pipeline (`src/agent`) and is NOT wired into the editor - the panel has NO
+  in-editor trigger buttons, says so explicitly, and fabricates no results (intentional
+  honesty). The round-1 fix removed the former standalone Critique/Auto-grade buttons, which
+  did nothing here and whose "Critique" label collided with the tab below (an ImGui
+  conflicting-ID crash). This is the concrete Pro-split seam of
   `data/cg-monetization-decision.md`.
 - **Curves per-slot dirty tracking (engine-adjacent, `curves-theme-seed-persist` fix):**
   `CurveState.dirty` (`EditorBridge.h`) marks a slot USER-owned; the pure `curvesForPersist`
   clears unedited slots so `ApplyCurvesStateToRecipe`/`CurvesStateForDisplay` (`ColorGrade.cpp`)
   persist ONLY edited channels and a later theme switch keeps updating the untouched ones.
   Headless-tested by `test_curves_dirty_persist` in `native:editor-test`.
-- **GOTCHA:** `ImFormatString` is ImGui-INTERNAL (not the public header) - use `std::snprintf`.
+- **GOTCHA:** `ImFormatString` AND `ImGui::ClearActiveID` are ImGui-INTERNAL (not the public
+  header) - use `std::snprintf`, and suppress a drag after a reset via per-widget
+  `GetStateStorage()` rather than `ClearActiveID`.
+- **Round-1 AE captain-verify fixes (`ae-round1-findings.md`):** (1) the Camera combo remembers
+  `w->footageCamera` because Standard (flat index 1) is camera-AMBIGUOUS and
+  `footageCascadePosForFlat` always resolves it to the first camera - without the remembered
+  camera, picking any non-ARRI camera (whose auto-selected profile is Standard) snapped the
+  dropdown back to ARRI; a log profile still pins its own camera. (2) `SliderRow`/`WheelLumSlider`
+  double-click reset suppresses drag-follow for the rest of that mouse-down (state storage), else
+  the still-held pointer re-applied the click position and snapped the value back. (3)
+  before/after overlay labels clamp inside the visible image and hide when their side collapses
+  at a split extreme. (4) Curves draw a static dashed gray identity reference (slope 1) behind
+  every channel curve.
 - **Constraint met:** parity/editor tests + all 4 native configs (Debug/Release x CPU/`--gpu`)
   stay green. Native builds + AE runtime are captain-verified only, deliberately NOT in CI;
   verify without closing AE via `CG_OUT_DIR='C:\dev\cg-verify-out' native/scripts/build.sh
@@ -732,5 +748,7 @@ presentation, so old projects load unchanged.
     while Master/Green/Blue update to the new theme's authored curves; a theme with all curves
     unedited bakes exactly the theme.
 29. **Agent dock:** the collapsible dock (indigo palette, only here) shows the BYOK setup /
-    ready states with a masked key and disabled/enabled actions; it states that agent execution
-    stays the offline pipeline and produces no in-editor results.
+    ready states with a masked key and informational Critique/Reference/Batch tabs (no
+    standalone trigger buttons - the former Critique/Auto-grade buttons are gone, so there is
+    no duplicate "Critique" label); it states that agent execution stays the offline pipeline
+    and produces no in-editor results.

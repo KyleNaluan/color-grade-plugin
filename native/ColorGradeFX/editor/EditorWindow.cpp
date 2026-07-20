@@ -1597,8 +1597,8 @@ void DrawAgentRail(WindowImpl* w) {
 
 // Draw the expanded agent panel with its BYOK states (setup / ready). Agent EXECUTION is not
 // wired into the native editor yet (it lives in the offline pipeline, src/agent + npm run
-// auto-grade, per AGENTS.md); this presents the button-triggered surface + key management
-// truthfully rather than fabricating results.
+// auto-grade, per AGENTS.md); this presents the key management + informational tabs truthfully
+// (no standalone trigger buttons) rather than fabricating results.
 void DrawAgentPanel(WindowImpl* w) {
     // Push the confined indigo world onto the button/frame colours for this panel only.
     ImGui::PushStyleColor(ImGuiCol_Button, V4(COL_IRISRAISE));
