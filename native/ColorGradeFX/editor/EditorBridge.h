@@ -64,9 +64,15 @@ struct CurveState {
     int    count = 0;
     double x[CG_EDIT_MAX_CURVE_POINTS] = {};
     double y[CG_EDIT_MAX_CURVE_POINTS] = {};
+    // Per-slot dirty tracking (cg-ui-polish, approved finding curves-theme-seed-persist):
+    // true iff the USER edited this slot, so only user-owned slots get persisted. The
+    // Curves tab seeds an unedited slot from the picked theme's authored curve for display;
+    // without this flag the whole seeded state was persisted, freezing R/G/B against later
+    // theme switches. See curvesForPersist below and CurvesStateForDisplay in ColorGrade.cpp.
+    bool   dirty = false;
 
     bool operator==(const CurveState& o) const {
-        if (count != o.count) return false;
+        if (count != o.count || dirty != o.dirty) return false;
         for (int i = 0; i < count; ++i)
             if (x[i] != o.x[i] || y[i] != o.y[i]) return false;
         return true;
@@ -133,6 +139,25 @@ inline void curveRemovePoint(CurveState& c, int idx) {
     if (idx <= 0 || idx >= c.count - 1) return;
     for (int i = idx; i < c.count - 1; ++i) { c.x[i] = c.x[i + 1]; c.y[i] = c.y[i + 1]; }
     --c.count;
+}
+
+// Mark a slot user-owned (call on any user edit to a curve). curvesForPersist keeps only
+// the slots so marked, so persistence stores exactly what the user touched.
+inline void curveMarkDirty(CurveState& c) { c.dirty = true; }
+
+// Reduce a DISPLAYED CurvesState (all slots seeded from the theme for editing) to what should
+// be persisted: clear every slot the user did NOT edit so it reverts to "absent" (count 0 =
+// follow the theme). The effect writes the resulting per-slot state into the recipe's user
+// curve fields, so a later theme switch keeps updating the untouched channels. This is the
+// pure core of the curves-theme-seed-persist fix (headless-tested in native:editor-test).
+inline void curvesForPersist(CurvesState& s) {
+    auto clean = [](CurveState& c) {
+        if (!c.dirty) { c = CurveState{}; }  // absent + not dirty -> theme drives this slot
+    };
+    clean(s.master);
+    clean(s.r);
+    clean(s.g);
+    clean(s.b);
 }
 
 // True if the curve is a valid monotone function: x strictly ascending, y non-decreasing.

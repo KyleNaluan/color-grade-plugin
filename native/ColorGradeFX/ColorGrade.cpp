@@ -769,10 +769,21 @@ static cg::editor::CurvesState CurvesStateForDisplay(const RecipeData& r, A_long
     cg::core::Theme theme = ThemeFromPopup(themePopup);
     cg::core::ThemeOverrides ov = theme.overrides.value_or(cg::core::ThemeOverrides{});
     cg::core::ChannelCurves cc = ov.channelCurves.value_or(cg::core::ChannelCurves{});
+    // Seed each slot from the user's curve if it owns one (dirty=true), else the picked
+    // theme's authored curve (dirty=false). The dirty flag is what curvesForPersist uses to
+    // persist ONLY user-owned slots, so a later theme switch keeps updating the untouched
+    // channels (curves-theme-seed-persist fix, cg-ui-polish).
     auto pick = [](const cg::core::CurveData& user,
                    const std::optional<std::vector<cg::core::CurvePoint>>& authored) {
-        if (user.count > 0) return CurveStateFromData(user);
-        return CurveStateFromData(cg::core::curveToData(authored));
+        cg::editor::CurveState c;
+        if (user.count > 0) {
+            c = CurveStateFromData(user);
+            c.dirty = true;   // user owns this slot
+        } else {
+            c = CurveStateFromData(cg::core::curveToData(authored));
+            c.dirty = false;  // theme drives this slot
+        }
+        return c;
     };
     cg::editor::CurvesState s;
     s.master = pick(r.userToneCurve, ov.toneCurve);
@@ -782,10 +793,14 @@ static cg::editor::CurvesState CurvesStateForDisplay(const RecipeData& r, A_long
     return s;
 }
 static void ApplyCurvesStateToRecipe(const cg::editor::CurvesState& s, RecipeData& r) {
-    CurveStateToData(s.master, r.userToneCurve);
-    CurveStateToData(s.r, r.userChannelR);
-    CurveStateToData(s.g, r.userChannelG);
-    CurveStateToData(s.b, r.userChannelB);
+    // Persist only the slots the user actually edited; unedited slots revert to absent
+    // (count 0) so applyEditorOverrides lets the theme keep driving them.
+    cg::editor::CurvesState persist = s;
+    cg::editor::curvesForPersist(persist);
+    CurveStateToData(persist.master, r.userToneCurve);
+    CurveStateToData(persist.r, r.userChannelR);
+    CurveStateToData(persist.g, r.userChannelG);
+    CurveStateToData(persist.b, r.userChannelB);
 }
 
 // --- Wheels (Phase 6c): recipe LGG triples + additive 3-way user tints <-> WheelsState.

@@ -374,9 +374,10 @@ scopes drew at their source size centered in wide boxes (dead margins) with the 
 clipped off the window edge - the strip now lays out three EQUAL columns from the live content
 region every frame, waveform/histogram fill their box interior, the vectorscope stays 1:1
 square + centered, and each plot is hard-clipped to its box (correct windowed / fullscreen /
-live-resize). **Deferred - dedicated UI-polish pass:** the captain wants the whole editor
-restyled (prettier/sleeker) once all feature phases land (with/after Phase 6); do NOT restyle
-piecemeal before then - this is a tracked follow-up, not a Phase 5 gap.
+live-resize). **Deferred - dedicated UI-polish pass:** the captain wanted the whole editor
+restyled (prettier/sleeker) once all feature phases land (with/after Phase 6), not piecemeal
+before then. That pass has since landed (`fm/cg-ui-polish`) - see the "UI-polish overhaul"
+section below.
 
 ## Phase 6a: manual grade suite - Basics (built on this toolkit)
 
@@ -418,8 +419,9 @@ decisions: `firstmate/data/grade-suite-design/{report.md,decisions.md}`.
   for the keyframeable params that re-bake per animated frame. 33-point banding on extreme
   manual grades (~3% worst case on a smooth ramp) matches the regime the shipping themes
   already bake at. An adaptive grid (65 only for static aggressive grades) is a follow-up.
-- **Out of scope (separately tracked):** secondary hue curves (6d), the AI agent loop, the
-  UI-polish overhaul. (Curves (6b) and wheels (6c) landed - see below.)
+- **Out of scope (separately tracked):** secondary hue curves (6d), the AI agent loop.
+  (Curves (6b) and wheels (6c) landed - see below; the UI-polish overhaul landed - see the
+  UI-polish overhaul section below.)
 
 ## Phase 6b/6c: curves + wheels (built on this toolkit)
 
@@ -490,8 +492,67 @@ wheels operate on the decoded signal, ahead of / within the theme stages).
   and wheels bust the preview cache for free via the whole-blob `RecipeHash` already folded
   into `previewParamFingerprint`. Round-trip is headless-tested by `native:editor-test`; the
   ImGui widgets + AEGP runtime are captain-verified.
-- **Out of scope (separately tracked):** secondary hue curves (6d), the AI agent loop, the
-  UI-polish overhaul, packaging.
+- **Out of scope (separately tracked):** secondary hue curves (6d), the AI agent loop,
+  packaging. (The UI-polish overhaul landed - see the next section.)
+
+## UI-polish overhaul: the "Darkroom" restyle (presentation layer only)
+
+The dedicated UI-polish pass deferred through Phases 5-6 (see the Phase 5 round-1 note above)
+landed here (`fm/cg-ui-polish`). It is a **presentation-layer overhaul only**: the
+`EditorBridge.h` edit/snapshot seam and the color engine are untouched; the one
+engine-adjacent change is minimal curves per-slot dirty tracking (below). `EditorWindow.cpp`
+ports the captain-approved **"Darkroom" mockup** (`firstmate/data/cg-ui-mockup-final/mockup-final.html`;
+direction + decisions `data/cg-ui-direction-decision.md`).
+
+- **Style (`ApplyColorGradeStyle`):** replaces `StyleColorsDark` with a warm near-black
+  palette + ONE brass "safelight" accent for the grading world, plus a confined cooler-indigo
+  palette used ONLY inside the agent dock (the signal hue never touches a grading surface).
+- **Layout:** title strip + 3 columns (preview+scopes | inspector tabs | collapsible agent
+  dock) + footer, with column widths recomputed from the content region every frame.
+- **Custom widgets replace ImGui defaults:** `SliderRow` (a Lumetri/DaVinci-style line with a
+  draggable knob, a hover-reveal reset arrow via `DrawResetGlyph`, double-click-to-reset on
+  track or value, and a typed value box = `InputFloat` clamped to the legal range) replaces
+  EVERY `ImGui::SliderFloat`; `WheelLumSlider` is the full-width wheel-luminance slider with
+  its value shown centered beneath.
+- **Draggable split divider:** the before/after split divider is now directly mouse-draggable
+  in the preview (a hit-strip over the split line writes `splitFraction`) with a chevron knob;
+  the old `##splitpos` toolbar slider is gone.
+- **Surfaces covered:** tabs, None-first theme selector, camera/profile cascade, LUT-Source
+  (data-driven from `kLutSourceNames`/`kLutSourceCount`, so after the rebase onto merged
+  PR #39 it already surfaces the 4th "External .cube + Correct/Basics" mode
+  (`fm/cg-lut-correct-stack`) with no layout change), Curves (now channel-tabs M/R/G/B + one
+  plot), Wheels (LGG / 3-way), and the collapsible agent dock.
+- **Agent dock = the single Pro/BYOK seam (`kAgentDockEnabled`):** collapsed rail <-> expanded
+  panel with BYOK setup (key entry + privacy note + disabled actions) / ready (masked key +
+  Remove + informational Critique/Reference/Batch tabs) states. Agent EXECUTION deliberately
+  stays the offline pipeline (`src/agent`) and is NOT wired into the editor - the panel has NO
+  in-editor trigger buttons, says so explicitly, and fabricates no results (intentional
+  honesty). The round-1 fix removed the former standalone Critique/Auto-grade buttons, which
+  did nothing here and whose "Critique" label collided with the tab below (an ImGui
+  conflicting-ID crash). This is the concrete Pro-split seam of
+  `data/cg-monetization-decision.md`.
+- **Curves per-slot dirty tracking (engine-adjacent, `curves-theme-seed-persist` fix):**
+  `CurveState.dirty` (`EditorBridge.h`) marks a slot USER-owned; the pure `curvesForPersist`
+  clears unedited slots so `ApplyCurvesStateToRecipe`/`CurvesStateForDisplay` (`ColorGrade.cpp`)
+  persist ONLY edited channels and a later theme switch keeps updating the untouched ones.
+  Headless-tested by `test_curves_dirty_persist` in `native:editor-test`.
+- **GOTCHA:** `ImFormatString` AND `ImGui::ClearActiveID` are ImGui-INTERNAL (not the public
+  header) - use `std::snprintf`, and suppress a drag after a reset via per-widget
+  `GetStateStorage()` rather than `ClearActiveID`.
+- **Round-1 AE captain-verify fixes (`ae-round1-findings.md`):** (1) the Camera combo remembers
+  `w->footageCamera` because Standard (flat index 1) is camera-AMBIGUOUS and
+  `footageCascadePosForFlat` always resolves it to the first camera - without the remembered
+  camera, picking any non-ARRI camera (whose auto-selected profile is Standard) snapped the
+  dropdown back to ARRI; a log profile still pins its own camera. (2) `SliderRow`/`WheelLumSlider`
+  double-click reset suppresses drag-follow for the rest of that mouse-down (state storage), else
+  the still-held pointer re-applied the click position and snapped the value back. (3)
+  before/after overlay labels clamp inside the visible image and hide when their side collapses
+  at a split extreme. (4) Curves draw a static dashed gray identity reference (slope 1) behind
+  every channel curve.
+- **Constraint met:** parity/editor tests + all 4 native configs (Debug/Release x CPU/`--gpu`)
+  stay green. Native builds + AE runtime are captain-verified only, deliberately NOT in CI;
+  verify without closing AE via `CG_OUT_DIR='C:\dev\cg-verify-out' native/scripts/build.sh
+  [Debug|Release] [--gpu]`. Editor UI + AEGP runtime remain captain-verified.
 
 ## Consequences
 
@@ -667,3 +728,27 @@ neutral wheels.
     Basics + Curves + Wheels neutral is still an identity grade; a project saved with the
     Phase 6a (v3) build loads with its grade intact and neutral wheels; on a V-Log clip the
     curves/wheels act on the decoded image (never raw log).
+
+### UI-polish overhaul ("Darkroom" restyle)
+
+Rebuild from THIS worktree with AE closed, then load the fresh `.aex` (all 4 configs build
+clean). No new params, no arb-data / `RECIPE_VERSION` / `AE_Effect_Version` change - purely
+presentation, so old projects load unchanged.
+
+25. **Style + layout:** the editor opens with the warm near-black "Darkroom" palette and a
+    single brass accent; the layout is title strip + preview/scopes | inspector tabs | agent
+    dock + footer, and resizing the window re-flows the columns cleanly (no clipping).
+26. **SliderRow widgets:** every knob is the custom `SliderRow` - drag the knob to change the
+    value, hover to reveal the reset arrow, double-click the track or value to reset, and type
+    into the value box (out-of-range entries clamp to the legal range). Wheel-luminance sliders
+    are full-width with the value centered beneath.
+27. **Draggable split divider:** in Split before/after mode, drag the chevron divider directly
+    in the preview to move the split; there is no `##splitpos` toolbar slider.
+28. **Curves dirty persistence:** edit only the Red curve, switch themes - Red stays your edit
+    while Master/Green/Blue update to the new theme's authored curves; a theme with all curves
+    unedited bakes exactly the theme.
+29. **Agent dock:** the collapsible dock (indigo palette, only here) shows the BYOK setup /
+    ready states with a masked key and informational Critique/Reference/Batch tabs (no
+    standalone trigger buttons - the former Critique/Auto-grade buttons are gone, so there is
+    no duplicate "Critique" label); it states that agent execution stays the offline pipeline
+    and produces no in-editor results.
