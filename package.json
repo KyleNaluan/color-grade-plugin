@@ -13,6 +13,7 @@
     "author": "tsx scripts/authorTheme.ts",
     "auto-grade": "tsx scripts/autoGrade.ts",
     "check-consistency": "tsx scripts/checkSceneConsistency.ts",
+    "agent-bridge": "tsx scripts/agentBridge.ts",
     "gallery": "tsx scripts/genThemeGallery.ts",
     "theme:health": "tsx scripts/themeLibraryReport.ts",
     "dev": "vite",
@@ -26,6 +27,8 @@
     "native:preview-test": "tsx native/scripts/preview-test.ts",
     "native:analysis-test": "tsx native/scripts/analysis-test.ts",
     "native:scopes-test": "tsx native/scripts/scopes-test.ts",
+    "native:agent-test": "tsx native/scripts/agent-bridge-test.ts",
+    "native:agent-config": "tsx scripts/writeAgentConfig.ts",
     "native:build": "native/scripts/build.sh"
   },
   "devDependencies": {

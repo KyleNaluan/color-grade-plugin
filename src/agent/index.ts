@@ -9,3 +9,5 @@ export * from './pricing.js';
 export * from './apiKey.js';
 export * from './critic.js';
 export * from './loop.js';
+export * from './bridgeProtocol.js';
+export * from './editorApply.js';

@@ -523,14 +523,11 @@ direction + decisions `data/cg-ui-direction-decision.md`).
   (`fm/cg-lut-correct-stack`) with no layout change), Curves (now channel-tabs M/R/G/B + one
   plot), Wheels (LGG / 3-way), and the collapsible agent dock.
 - **Agent dock = the single Pro/BYOK seam (`kAgentDockEnabled`):** collapsed rail <-> expanded
-  panel with BYOK setup (key entry + privacy note + disabled actions) / ready (masked key +
-  Remove + informational Critique/Reference/Batch tabs) states. Agent EXECUTION deliberately
-  stays the offline pipeline (`src/agent`) and is NOT wired into the editor - the panel has NO
-  in-editor trigger buttons, says so explicitly, and fabricates no results (intentional
-  honesty). The round-1 fix removed the former standalone Critique/Auto-grade buttons, which
-  did nothing here and whose "Critique" label collided with the tab below (an ImGui
-  conflicting-ID crash). This is the concrete Pro-split seam of
-  `data/cg-monetization-decision.md`.
+  panel with BYOK setup (key entry + privacy note) / ready (masked key + Remove +
+  Grade/Reference/Batch action tabs) states. This is the concrete Pro-split seam of
+  `data/cg-monetization-decision.md`. Agent EXECUTION is now WIRED into the editor (superseding
+  the earlier informational-only state described here): the four surfaces spawn a Node
+  subprocess running the TS oracle - full design in `adr-agent-execution.md`.
 - **Curves per-slot dirty tracking (engine-adjacent, `curves-theme-seed-persist` fix):**
   `CurveState.dirty` (`EditorBridge.h`) marks a slot USER-owned; the pure `curvesForPersist`
   clears unedited slots so `ApplyCurvesStateToRecipe`/`CurvesStateForDisplay` (`ColorGrade.cpp`)
@@ -748,7 +745,6 @@ presentation, so old projects load unchanged.
     while Master/Green/Blue update to the new theme's authored curves; a theme with all curves
     unedited bakes exactly the theme.
 29. **Agent dock:** the collapsible dock (indigo palette, only here) shows the BYOK setup /
-    ready states with a masked key and informational Critique/Reference/Batch tabs (no
-    standalone trigger buttons - the former Critique/Auto-grade buttons are gone, so there is
-    no duplicate "Critique" label); it states that agent execution stays the offline pipeline
-    and produces no in-editor results.
+    ready states with a masked key and Grade/Reference/Batch action tabs. Agent execution is
+    now wired in-editor (Critique / Auto-grade / Reference / Batch) via a Node subprocess -
+    see `adr-agent-execution.md` for the verification checklist (and BUILDING.md item 9).
