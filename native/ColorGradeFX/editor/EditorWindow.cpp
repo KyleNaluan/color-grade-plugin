@@ -170,6 +170,7 @@ struct WindowImpl {
     std::thread              agentThread;        // the in-flight worker (joined at teardown)
     std::atomic<void*>       agentChildJob{nullptr};  // live bridge Job Object HANDLE (whole cmd->npx->node tree); teardown TerminateJobObjects it so the join doesn't block up to 120s
     std::atomic<bool>        agentBusy{false};   // a job is running (blocks a second launch)
+    std::atomic<bool>        agentAbort{false};  // teardown requested: make the spawn wait return at once even before the job handle is published
     std::atomic<bool>        agentWantsFrame{false};  // ask the idle hook to publish the source frame
     bool                     agentApplied = false;    // UI-thread: accepted result already applied once
     std::string              agentRefSidecar;         // where the last reference measurement was written
@@ -1902,7 +1903,21 @@ bool SpawnBridge(WindowImpl* w, const std::string& bridge, const std::string& re
     // Publish the live job handle so teardown/close can TerminateJobObject the whole tree and let
     // this wait return promptly instead of blocking the join (and g_mapMutex) up to 120s.
     w->agentChildJob.store(job);
-    DWORD wait = ::WaitForSingleObject(pi.hProcess, 120000);  // 2 min ceiling for a model round
+    // Poll in short slices instead of one 120s block so a teardown that fires in the window between
+    // agentChildJob.store and this wait (agentAbort already set) still tears the tree down at once.
+    if (w->agentAbort.load() && job) ::TerminateJobObject(job, 1);
+    DWORD wait = WAIT_TIMEOUT;
+    for (DWORD elapsed = 0; elapsed < 120000; elapsed += 200) {  // 2 min ceiling for a model round
+        wait = ::WaitForSingleObject(pi.hProcess, 200);
+        if (wait != WAIT_TIMEOUT) break;
+        if (w->agentAbort.load()) {
+            // Teardown requested mid-run: kill the whole tree, drain, and stop waiting.
+            if (job) ::TerminateJobObject(job, 1);
+            ::WaitForSingleObject(pi.hProcess, 5000);
+            wait = WAIT_OBJECT_0;
+            break;
+        }
+    }
     if (wait == WAIT_TIMEOUT) {
         // Child overran the ceiling: kill the whole tree so no node worker is orphaned and can't
         // later collide on the per-window resp/req temp paths.
@@ -1965,6 +1980,7 @@ void AgentWorker(WindowImpl* w, AgentRequest req, std::string key, std::string f
         std::shared_ptr<const PreviewFrame> frame;
         auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(4);
         while (std::chrono::steady_clock::now() < deadline) {
+            if (w->agentAbort.load()) break;  // teardown fired before the spawn - stop polling at once
             if (wantSource) { std::lock_guard<std::mutex> lk(w->beforeMutex); frame = w->pendingBefore; }
             else            { std::lock_guard<std::mutex> lk(w->previewMutex); frame = w->pendingPreview; }
             if (frame && frame->valid()) break;
@@ -2009,9 +2025,11 @@ void AgentWorker(WindowImpl* w, AgentRequest req, std::string key, std::string f
     FinishAgentJob(w, AgentJobState::Done, resp, resp.ok ? "" : resp.message);
 }
 
-// Join any previous worker so we never leak/overlap threads, then reset it.
+// Join any previous worker so we never leak/overlap threads, then reset it. Clears any abort left
+// by a prior teardown so a fresh worker never kills itself on a stale flag (called before launch).
 void JoinAgentThread(WindowImpl* w) {
     if (w->agentThread.joinable()) w->agentThread.join();
+    w->agentAbort.store(false);
 }
 
 // Launch a critique / auto-grade job. Captures inputs on the UI thread (frame, params, key),
@@ -2598,6 +2616,10 @@ std::map<InstanceKey, WindowImpl*>    g_windows;
 // the join (and g_mapMutex) up to the 120s spawn ceiling. The worker owns
 // CloseHandle(job); a stale/closed handle here just makes TerminateJobObject a no-op.
 void StopAgentWorkLocked(WindowImpl* w) {
+    // Signal abort FIRST so a worker still in the pre-spawn window (frame poll / CreateProcess,
+    // before agentChildJob is published) sees it and its wait returns at once - the load below can
+    // miss the job handle, but the flag never does. Then kill any live tree and join.
+    w->agentAbort.store(true);
     if (HANDLE job = w->agentChildJob.load()) ::TerminateJobObject(job, 1);
     if (w->agentThread.joinable()) w->agentThread.join();
 }
