@@ -60,6 +60,19 @@ The Gemini API key rides `GEMINI_API_KEY` on the child process only (set right b
 `CreateProcess`, single job at a time) - **never** written to the request file, never
 committed, never firstmate's. The bridge reads it only from that env var.
 
+**Known limitation - multi-window key race (cg-agent-fixes-v4, captain-accepted):** `SpawnBridge`
+sets `GEMINI_API_KEY` on the *shared* AE process environment right before `CreateProcess` and
+clears it after the wait. The "single job at a time" guard (`agentBusy`) is **per-window**, so
+with two Color Grade effects each showing an editor and both triggering a keyed job at once, one
+window can overwrite/clear the process-global `GEMINI_API_KEY` between the other's
+`SetEnvironmentVariableW` and its own `CreateProcess` (spawning it with a missing/wrong key), and
+the clear also wipes any pre-existing `GEMINI_API_KEY` a power user set in AE's launch environment.
+This mirrors the existing single-instance limitation (the idle hook has no per-instance id; two CG
+effects on one layer match the first). It is **accepted as-is** for this pass - the spawn path is
+captain-verified in AE single-window and was left untouched deliberately. The clean fix, deferred
+to a follow-up, is to pass the key via a per-process environment block (`CREATE_UNICODE_ENVIRONMENT`
++ `lpEnvironment` to `CreateProcessW`) so nothing mutates the shared process env.
+
 ### Deployment
 
 The AE panel process AE launches from Explorer **never inherits a shell's environment**, so an
