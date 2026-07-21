@@ -164,6 +164,11 @@ with `data/cg-distribution-decision.md`. A bundled, Node-free runtime is out of 
   worker holds a raw `w`. The user-close reap path (`ReapFinishedLocked`) originally skipped this,
   so closing the window after using an agent feature crashed AE ("error trying to invoke the effect
   Color Grade FX"). Both `ReapFinishedLocked` and `DestroyWindowImplLocked` now funnel through the
-  one `StopAgentWorkLocked` helper.
+  one `StopAgentWorkLocked` helper. `StopAgentWorkLocked` also sets an `agentAbort` atomic BEFORE
+  reading the job handle, and the worker's frame-poll loop and `SpawnBridge` wait (now a 200ms-sliced
+  poll, not one 120s block) check it: this covers the pre-spawn window between `CreateProcess` and
+  publishing the Job Object handle, where terminating the (not-yet-stored) handle alone would let the
+  join - and `g_mapMutex` - freeze AE for up to the 120s ceiling. `JoinAgentThread` clears the flag
+  before each launch so a fresh worker never self-aborts on a stale abort.
 - The agent dock stays the single Pro/BYOK seam behind `kAgentDockEnabled`; nothing here couples
   a Pro-able feature into the free core (monetization constraint, `data/cg-monetization-decision.md`).
